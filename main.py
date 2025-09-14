@@ -1,5 +1,6 @@
-# main.py - Phase 4.8
-# Multiframe analysis + OpenAI + Confidence scoring (includes OI jump & L/S trend) + Strong-alerts only + charts + Entry/SL/TP + cooldowns
+# main.py - Phase 4.9
+# Strong alerts send chart + Entry/SL/TP when confidence >= CONFIDENCE_MIN and potential rule true.
+# Optionally also sends info charts for all symbols each cycle (toggle SEND_INFO_CHARTS).
 
 import os, asyncio, aiohttp, time
 from datetime import datetime
@@ -20,6 +21,7 @@ SYMBOLS = [
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", 1800))   # seconds
 COOLDOWN_SEC = int(os.getenv("COOLDOWN_SEC", 3600))     # seconds
 CONFIDENCE_MIN = int(os.getenv("CONFIDENCE_MIN", 60))   # require >=60% for STRONG alerts
+SEND_INFO_CHARTS = os.getenv("SEND_INFO_CHARTS", "true").lower() in ("1","true","yes")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -249,15 +251,8 @@ async def openai_analysis(market_map):
         print("[WARN] openai_analysis failed:", e)
         return None
 
-# ---------- OI/LR feature helper ----------
+# ---------- OI/LR helper ----------
 def oi_ls_features(oi_now, oi_prev, ls_now, ls_prev):
-    """
-    returns dict with:
-      - oi_change_pct
-      - oi_spike_level: "none"/"medium"/"big"
-      - ls_change
-      - ls_note: "crowded_long"/"crowded_short"/"balanced"
-    """
     out = {"oi_change_pct": None, "oi_spike_level": "none", "ls_change": None, "ls_note": "unknown"}
     try:
         if oi_prev and oi_now:
@@ -284,68 +279,42 @@ def oi_ls_features(oi_now, oi_prev, ls_now, ls_prev):
         out["ls_note"] = "unknown"
     return out
 
-# ---------- CONFIDENCE logic (updated to include OI & L/S trend) ----------
+# ---------- CONFIDENCE ----------
 def compute_confidence(local_biases, openai_bias, history, price, volume, long_short_ratio, prev_volume=None, prev_oi=None, prev_ls=None, prev_price=None, oi=None, symbol=None):
-    """
-    Returns (score:int 0-100, breakdown:dict)
-    Weights:
-      - local agreement (0-40)
-      - openai confirmation (0-25)
-      - long/short ratio directional strength (0-15)
-      - recent volume spike (0-10)
-      - history consistency (0-10)
-      - OI spike gives additional bonus if aligning with price+bias
-    """
-    # candidate bias selection: prefer openai if present else local majority
     candidate = None
     if openai_bias in ("BUY","SELL"):
         candidate = openai_bias
     else:
-        # pick majority among the three local tfs
         if local_biases:
             vals = list(local_biases.values())
-            # fallback: if tie -> NEUTRAL
-            candidate_counts = {}
-            for v in vals:
-                candidate_counts[v] = candidate_counts.get(v,0) + 1
-            # remove NEUTRAL when possible
-            sorted_items = sorted(candidate_counts.items(), key=lambda x: (-x[1], x[0]))
+            counts = {}
+            for v in vals: counts[v] = counts.get(v,0) + 1
+            sorted_items = sorted(counts.items(), key=lambda x: (-x[1], x[0]))
             candidate = sorted_items[0][0] if sorted_items else None
             if candidate == "NEUTRAL":
-                # prefer any BUY/SELL if present in vals
                 for v in vals:
                     if v in ("BUY","SELL"):
                         candidate = v
                         break
-
     if not candidate or candidate == "NEUTRAL":
         return 0, {"note":"no candidate bias"}
 
-    # local agreement
     agrees = sum(1 for v in local_biases.values() if v == candidate)
-    local_score = int((agrees/3.0) * 40)  # scale to 0..40
-
-    # openai score
+    local_score = int((agrees/3.0) * 40)
     openai_score = 25 if openai_bias == candidate else 0
 
-    # long/short ratio contribution
     ls_score = 0
     if long_short_ratio is not None:
         diff = abs(long_short_ratio - 1.0)
-        # if candidate BUY and ratio>1 => supportive
         if candidate == "BUY" and long_short_ratio > 1.0:
-            # scale: diff 0..1 -> 0..15
             ls_score = min(15, int(diff * 15))
         if candidate == "SELL" and long_short_ratio < 1.0:
             ls_score = min(15, int(diff * 15))
-        # penalize crowded same-side extremes slightly (encourage caution)
         if long_short_ratio > 2.0 and candidate == "BUY":
-            # crowded long: reduce effective ls_score (risky)
             ls_score = max(0, ls_score - 5)
         if long_short_ratio < 0.5 and candidate == "SELL":
             ls_score = max(0, ls_score - 5)
 
-    # volume spike
     vol_score = 0
     try:
         if prev_volume and volume and volume > 1.2 * prev_volume:
@@ -355,18 +324,14 @@ def compute_confidence(local_biases, openai_bias, history, price, volume, long_s
     except:
         vol_score = 0
 
-    # history consistency
     hist_score = 0
     if len(history) >= 3 and history[-3:] == [history[-1]]*3 and history[-1] == candidate:
         hist_score = 10
 
-    # OI spike and L/S trend features
     oi_bonus = 0
     oi_feats = oi_ls_features(oi, prev_oi, long_short_ratio, prev_ls)
-    # if OI spike is big/medium and price moves in candidate direction -> bonus
     try:
         if oi_feats.get("oi_spike_level") == "big":
-            # need price movement direction: if prev_price exists, compare
             if prev_price is not None and price is not None:
                 if candidate == "BUY" and price > prev_price:
                     oi_bonus += 10
@@ -382,7 +347,6 @@ def compute_confidence(local_biases, openai_bias, history, price, volume, long_s
                     oi_bonus += 5
             else:
                 oi_bonus += 2
-        # L/S change positive in direction of candidate adds small bonus
         if oi_feats.get("ls_change") is not None:
             lsch = oi_feats.get("ls_change")
             if candidate == "BUY" and lsch > 0.05:
@@ -392,7 +356,6 @@ def compute_confidence(local_biases, openai_bias, history, price, volume, long_s
     except:
         oi_bonus = 0
 
-    # sum scores
     score = local_score + openai_score + ls_score + vol_score + hist_score + oi_bonus
     if score > 100: score = 100
     breakdown = {
@@ -408,7 +371,7 @@ def compute_confidence(local_biases, openai_bias, history, price, volume, long_s
     }
     return score, breakdown
 
-# ---------- decide_strong (same rule, but final gating by confidence) ----------
+# ---------- decide_strong ----------
 def decide_strong(local_biases, openai_bias, history):
     if len(history) >= 3 and history[-3:] == [history[-1]]*3 and history[-1] in ("BUY","SELL"):
         return True, history[-1], "3-cycle confirmation"
@@ -421,7 +384,7 @@ def decide_strong(local_biases, openai_bias, history):
 # ---------- main loop ----------
 async def main_loop():
     async with aiohttp.ClientSession() as session:
-        await send_text(session, "*Bot online — Phase 4.8 (OI+L/S integrated confidence)*")
+        await send_text(session, "*Bot online — Phase 4.9 (Strong alert chart+entry) + OptionC charts toggle*")
         history = {s: [] for s in SYMBOLS}
         prev_vol = {s: None for s in SYMBOLS}
         prev_oi = {s: None for s in SYMBOLS}
@@ -435,7 +398,6 @@ async def main_loop():
             results = await asyncio.gather(*tasks)
             market = {s:r for s,r in zip(SYMBOLS, results)}
 
-            # compute local biases
             local = {}
             for s,d in market.items():
                 local[s] = {
@@ -444,17 +406,14 @@ async def main_loop():
                     "4h": simple_tf_bias(d.get("candles_4h", []))
                 }
 
-            # openai analysis (optional)
             openai_out = await openai_analysis(market) if client else None
 
-            # cycle summary
             summary_lines = [f"Snapshot (UTC {datetime.utcnow().strftime('%H:%M')})"]
             for s in SYMBOLS:
                 d = market.get(s, {})
                 summary_lines.append(f"{s}: {d.get('price','NA')} vol={d.get('volume','NA')}")
             await send_text(session, "🧠 " + "\n".join(summary_lines))
 
-            # evaluate each symbol
             for s in SYMBOLS:
                 d = market.get(s, {})
                 loc = local.get(s, {})
@@ -462,7 +421,6 @@ async def main_loop():
                 vals = list(loc.values()) if loc else []
                 majority = "NEUTRAL"
                 if vals:
-                    # pick most common, tie breaks by pref BUY/SELL presence
                     counts = {}
                     for v in vals: counts[v] = counts.get(v,0) + 1
                     sorted_items = sorted(counts.items(), key=lambda x:(-x[1], x[0]))
@@ -482,10 +440,8 @@ async def main_loop():
                     openai_bias = openai_out[s]["bias"]
                     openai_reason = openai_out[s].get("reason","")
 
-                # basic potential strong rule
                 potential, pot_bias, pot_note = decide_strong(loc, openai_bias, history[s])
 
-                # compute confidence (pass prev values)
                 conf_score, conf_breakdown = compute_confidence(
                     local_biases=loc,
                     openai_bias=openai_bias,
@@ -501,50 +457,56 @@ async def main_loop():
                     symbol=s
                 )
 
-                # update prev trackers for next cycle
+                # update prev trackers
                 prev_vol[s] = d.get("volume")
                 prev_oi[s] = d.get("oi")
                 prev_ls[s] = d.get("long_short_ratio")
                 prev_price[s] = d.get("price")
 
-                # final decision: need potential True AND conf >= threshold
-                if potential and pot_bias:
-                    if conf_score >= CONFIDENCE_MIN:
-                        now_ts = time.time()
-                        if now_ts < cooldowns[s]:
-                            print(f"[DEBUG] cooldown active for {s}")
-                        else:
-                            levels = calc_levels_impl(d.get("candles_30m", []))
-                            tl = compute_trade_levels(d.get("price"), levels, pot_bias)
-                            caption = f"🚨 STRONG {pot_bias}: {s}\nTFs(local): 30m={loc.get('30m')},1h={loc.get('1h')},4h={loc.get('4h')}\nReason(openai): {openai_reason or 'N/A'}\nConfirm: {pot_note}\nConfidence: {conf_score}%"
-                            # add a short numeric breakdown
-                            caption += f"\nBreakdown: local={conf_breakdown['local_agree']}/40 openai={conf_breakdown['openai']}/25 ls={conf_breakdown['ls']}/15 vol={conf_breakdown['vol']}/10 hist={conf_breakdown['history']}/10 oi_bonus={conf_breakdown['oi_bonus']}"
-                            if tl:
-                                caption += f"\nEntry:{tl['entry']:.6f} SL:{tl['sl']:.6f} TP1:{tl['tp1']:.6f} TP2:{tl['tp2']:.6f}"
-                            chart_path = plot_candles(d.get("times_30m", None), d.get("candles_30m", []), levels, s)
-                            if chart_path:
-                                ok = await send_photo(session, caption, chart_path)
-                                print(f"[DEBUG] sent STRONG alert for {s}, ok={ok}, conf={conf_score}")
-                            else:
-                                await send_text(session, caption)
-                            cooldowns[s] = now_ts + COOLDOWN_SEC
-                    else:
-                        print(f"[DEBUG] potential strong for {s} but confidence too low ({conf_score} < {CONFIDENCE_MIN})")
-                        # optional: send small low-conf note (commented)
-                        # await send_text(session, f"⚠️ {s} potential {pot_bias} but low confidence {conf_score}%")
-                else:
-                    # send informative chart for top symbols
-                    if s in ("BTCUSDT","ETHUSDT","SOLUSDT"):
+                # STRONG alert -> send chart + Entry/SL/TP (only when both rules satisfied)
+                if potential and pot_bias and conf_score >= CONFIDENCE_MIN:
+                    now_ts = time.time()
+                    if now_ts >= cooldowns[s]:
                         levels = calc_levels_impl(d.get("candles_30m", []))
-                        tl = compute_trade_levels(d.get("price"), levels, majority if majority in ("BUY","SELL") else None)
-                        caption = f"ℹ️ {s} {majority} (local majority) · OpenAI:{openai_bias or 'N/A'} · Conf:{conf_score}%"
+                        tl = compute_trade_levels(d.get("price"), levels, pot_bias)
+                        caption = (
+                            f"🚨 STRONG {pot_bias}: {s}\n"
+                            f"TFs(local): 30m={loc.get('30m')},1h={loc.get('1h')},4h={loc.get('4h')}\n"
+                            f"Reason(openai): {openai_reason or 'N/A'}\n"
+                            f"Confirm: {pot_note}\n"
+                            f"Confidence: {conf_score}%\n"
+                        )
+                        caption += f"Breakdown: local={conf_breakdown['local_agree']}/40 openai={conf_breakdown['openai']}/25 ls={conf_breakdown['ls']}/15 vol={conf_breakdown['vol']}/10 hist={conf_breakdown['history']}/10 oi_bonus={conf_breakdown['oi_bonus']}"
                         if tl:
-                            caption += f"\nEntry:{tl['entry']:.6f} SL:{tl['sl']:.6f} TP1:{tl['tp1']:.6f}"
+                            caption += f"\n\nEntry: {tl['entry']:.6f}\nSL: {tl['sl']:.6f}\nTP1: {tl['tp1']:.6f}\nTP2: {tl['tp2']:.6f}"
                         chart_path = plot_candles(d.get("times_30m", None), d.get("candles_30m", []), levels, s)
                         if chart_path:
-                            await send_photo(session, caption, chart_path)
+                            ok = await send_photo(session, caption, chart_path)
+                            print(f"[DEBUG] sent STRONG alert for {s}, ok={ok}, conf={conf_score}")
                         else:
                             await send_text(session, caption)
+                        cooldowns[s] = now_ts + COOLDOWN_SEC
+                    else:
+                        print(f"[DEBUG] cooldown active for {s}, skipping STRONG alert.")
+                else:
+                    if potential and pot_bias:
+                        print(f"[DEBUG] {s} potential but low confidence ({conf_score} < {CONFIDENCE_MIN})")
+
+                # Optionally send info chart for all symbols every cycle
+                if SEND_INFO_CHARTS:
+                    try:
+                        levels_info = calc_levels_impl(d.get("candles_30m", []))
+                        tl_info = compute_trade_levels(d.get("price"), levels_info, majority if majority in ("BUY","SELL") else None)
+                        caption_info = f"📊 {s} · Price:{d.get('price')} · Local:{majority} · OpenAI:{openai_bias or 'N/A'} · Conf:{conf_score}%"
+                        if tl_info:
+                            caption_info += f"\nEntry:{tl_info['entry']:.6f} SL:{tl_info['sl']:.6f} TP1:{tl_info['tp1']:.6f}"
+                        chart_path_info = plot_candles(d.get("times_30m", None), d.get("candles_30m", []), levels_info, s)
+                        if chart_path_info:
+                            await send_photo(session, caption_info, chart_path_info)
+                        else:
+                            await send_text(session, caption_info)
+                    except Exception as e:
+                        print("[WARN] failed sending chart/info for", s, e)
 
             elapsed = time.time() - start
             to_sleep = max(0, POLL_INTERVAL - elapsed)

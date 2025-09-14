@@ -1,7 +1,4 @@
-# main.py - Phase 4.9
-# Strong alerts send chart + Entry/SL/TP when confidence >= CONFIDENCE_MIN and potential rule true.
-# Optionally also sends info charts for all symbols each cycle (toggle SEND_INFO_CHARTS).
-
+# main.py - Phase 4.4 (Charts + Entry/SL/TP) with signal filter (threshold + local+openai agreement)
 import os, asyncio, aiohttp, time
 from datetime import datetime
 from dotenv import load_dotenv
@@ -9,51 +6,55 @@ from openai import OpenAI
 import matplotlib.pyplot as plt
 from matplotlib.dates import date2num
 from tempfile import NamedTemporaryFile
-import math
 
 load_dotenv()
 
-# ---------- CONFIG ----------
-SYMBOLS = [
-    "BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","AAVEUSDT",
-    "TRXUSDT","DOGEUSDT","BNBUSDT","ADAUSDT","LTCUSDT","LINKUSDT"
-]
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", 1800))   # seconds
-COOLDOWN_SEC = int(os.getenv("COOLDOWN_SEC", 3600))     # seconds
-CONFIDENCE_MIN = int(os.getenv("CONFIDENCE_MIN", 60))   # require >=60% for STRONG alerts
-SEND_INFO_CHARTS = os.getenv("SEND_INFO_CHARTS", "true").lower() in ("1","true","yes")
-
+# --- Config ---
+SYMBOLS = ["BTCUSDT","ETHUSDT","SOLUSDT"]  # add more as needed
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", 1800))
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")             # optional
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL","gpt-4o-mini")
+SIGNAL_CONF_THRESHOLD = float(os.getenv("SIGNAL_CONF_THRESHOLD", 65.0))
 
-client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+client = None
+if OPENAI_API_KEY:
+    try:
+        client = OpenAI(api_key=OPENAI_API_KEY)
+    except Exception as e:
+        print("[WARN] OpenAI init failed:", e)
+        client = None
+else:
+    print("[WARN] OPENAI_API_KEY not set. OpenAI analysis disabled.")
 
 TICKER_URL = "https://api.binance.com/api/v3/ticker/24hr?symbol={symbol}"
 CANDLE_URL = "https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit=50"
-OI_URL = "https://fapi.binance.com/fapi/v1/openInterest?symbol={symbol}"
-LONGSHORT_URL = "https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol={symbol}&period=30m&limit=1"
 
-# ---------- Telegram helpers ----------
+# ---------------- Telegram helpers ----------------
 async def send_text(session, text):
+    print(f"[TRACE] send_text -> {text[:120]}")
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[ERROR] Missing TELEGRAM_BOT_TOKEN/CHAT_ID")
+        print("[ERROR] Telegram credentials missing")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
         async with session.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode":"Markdown"}, timeout=15) as r:
             txt = await r.text()
-            print(f"[DEBUG] sendMessage status={r.status}")
+            print(f"[TRACE] sendMessage status={r.status}")
+            # don't print whole resp to avoid token leaks; useful for debugging
+            if r.status != 200:
+                print("[WARN] sendMessage response:", txt[:800])
     except Exception as e:
-        print("[ERROR] send_text exception:", repr(e))
+        print("[ERROR] send_text exception:", e)
 
 async def send_photo(session, caption, path):
+    print(f"[TRACE] send_photo path={path} caption_len={len(caption)}")
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[ERROR] Missing TELEGRAM_BOT_TOKEN/CHAT_ID")
+        print("[ERROR] Telegram creds missing")
         return False
     if not path or not os.path.exists(path):
-        print("[ERROR] image missing:", path)
+        print("[ERROR] Image not found:", path)
         return False
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
     try:
@@ -65,456 +66,304 @@ async def send_photo(session, caption, path):
             data.add_field("photo", f, filename=os.path.basename(path), content_type="image/png")
             async with session.post(url, data=data, timeout=30) as resp:
                 txt = await resp.text()
-                print(f"[DEBUG] sendPhoto status={resp.status}")
-                return resp.status == 200
+                print(f"[TRACE] sendPhoto status={resp.status}")
+                if resp.status != 200:
+                    print("[WARN] sendPhoto resp:", txt[:800])
+                    return False
+                return True
     except Exception as e:
-        print("[ERROR] send_photo exception:", repr(e))
+        print("[ERROR] send_photo exception:", e)
         return False
     finally:
         try:
-            if os.path.exists(path):
+            if path and os.path.exists(path):
                 os.remove(path)
-        except:
-            pass
+                print("[TRACE] removed temp image:", path)
+        except Exception as e:
+            print("[WARN] failed to remove temp image:", e)
 
-# ---------- Fetch helpers ----------
+# ---------------- Fetching ----------------
 async def fetch_json(session, url):
     try:
-        async with session.get(url, timeout=20) as r:
+        async with session.get(url, timeout=15) as r:
             if r.status != 200:
                 txt = await r.text()
                 print(f"[WARN] HTTP {r.status} for {url} -> {txt[:200]}")
                 return None
             return await r.json()
     except Exception as e:
-        print("[WARN] fetch_json exception:", e, url)
+        print("[WARN] fetch_json exception for", url, ":", e)
         return None
 
-async def fetch_symbol(session, symbol):
-    t = await fetch_json(session, TICKER_URL.format(symbol=symbol))
-    raw30 = await fetch_json(session, CANDLE_URL.format(symbol=symbol, interval="30m"))
-    raw1  = await fetch_json(session, CANDLE_URL.format(symbol=symbol, interval="1h"))
-    raw4  = await fetch_json(session, CANDLE_URL.format(symbol=symbol, interval="4h"))
-    oi = await fetch_json(session, OI_URL.format(symbol=symbol))
-    ls = await fetch_json(session, LONGSHORT_URL.format(symbol=symbol))
+async def fetch_data(session, symbol):
+    ticker = await fetch_json(session, TICKER_URL.format(symbol=symbol))
+    c30 = await fetch_json(session, CANDLE_URL.format(symbol=symbol, interval="30m"))
     out = {}
-    if t:
+    if ticker:
         try:
-            out["price"] = float(t.get("lastPrice", 0))
-            out["volume"] = float(t.get("volume", 0))
+            out["price"] = float(ticker.get("lastPrice", 0))
+            out["volume"] = float(ticker.get("volume", 0))
         except:
             out["price"] = None
             out["volume"] = None
-
-    def to_candles_and_times(raw):
-        if not isinstance(raw, list):
-            return [], []
-        candles = [[float(x[1]), float(x[2]), float(x[3]), float(x[4])] for x in raw]
-        times = [int(x[0]) // 1000 for x in raw]  # openTime ms -> s
-        return candles, times
-
-    c30, t30 = to_candles_and_times(raw30)
-    c1,  t1  = to_candles_and_times(raw1)
-    c4,  t4  = to_candles_and_times(raw4)
-
-    out["candles_30m"] = c30; out["times_30m"] = t30
-    out["candles_1h"]  = c1;  out["times_1h"]  = t1
-    out["candles_4h"]  = c4;  out["times_4h"]  = t4
-
-    out["oi"] = float(oi.get("openInterest")) if isinstance(oi, dict) and oi.get("openInterest") else None
-    if isinstance(ls, list) and ls:
-        try:
-            out["long_short_ratio"] = float(ls[0].get("longShortRatio", 1))
-        except:
-            out["long_short_ratio"] = None
+    if isinstance(c30, list):
+        out["candles"] = [[float(x[1]), float(x[2]), float(x[3]), float(x[4])] for x in c30]
+        out["times"] = [int(x[0])//1000 for x in c30]
     return out
 
-# ---------- Local bias ----------
-def simple_tf_bias(candles, lookback=10, threshold_pct=0.002):
+# ---------------- Local simple bias detector ----------------
+def local_bias_from_candles(candles):
+    # Very lightweight heuristic:
+    # If last 3 closes are strictly increasing => BUY
+    # If last 3 closes are strictly decreasing => SELL
+    # Else NEUTRAL
     if not candles or len(candles) < 3:
         return "NEUTRAL"
-    arr = candles[-lookback:] if len(candles) >= lookback else candles[:]
-    closes = [c[3] for c in arr]
-    last = closes[-1]
-    mean = sum(closes)/len(closes)
-    if mean == 0: return "NEUTRAL"
-    pct = (last - mean) / mean
-    if pct > threshold_pct:
+    closes = [c[3] for c in candles[-5:]]  # use last up to 5 closes
+    # take last 3
+    last3 = closes[-3:]
+    if last3[0] < last3[1] < last3[2]:
         return "BUY"
-    if pct < -threshold_pct:
+    if last3[0] > last3[1] > last3[2]:
         return "SELL"
     return "NEUTRAL"
 
-# ---------- plot & trade ----------
-def calc_levels_impl(candles, lookback=24):
-    if not candles: return (None,None,None)
-    arr = candles[-lookback:] if len(candles)>=lookback else candles[:]
+# ---------------- Levels / chart / trade helpers ----------------
+def calc_levels(candles, lookback=24):
+    if not candles:
+        return (None, None, None)
+    arr = candles[-lookback:] if len(candles) >= lookback else candles[:]
     highs = sorted([c[1] for c in arr], reverse=True)
-    lows  = sorted([c[2] for c in arr])
-    k = min(3, len(arr))
+    lows = sorted([c[2] for c in arr])
+    k = min(3, max(1, len(arr)))
     res = sum(highs[:k]) / k
     sup = sum(lows[:k]) / k
     mid = (res + sup) / 2
-    return sup, res, mid
+    return (sup, res, mid)
 
-def plot_candles(times, candles, levels, symbol):
+def plot_chart(times, candles, symbol, levels):
     try:
-        if times and len(times) == len(candles):
-            dates = [datetime.utcfromtimestamp(t) for t in times]
-        else:
-            dates = [datetime.utcfromtimestamp(int(time.time()) - (len(candles)-i)*60*30) for i in range(len(candles))]
-        o = [c[0] for c in candles]; h = [c[1] for c in candles]; l = [c[2] for c in candles]; cclose = [c[3] for c in candles]
+        dates = [datetime.utcfromtimestamp(t) for t in times]
+        o = [c[0] for c in candles]; h = [c[1] for c in candles]; l = [c[2] for c in candles]; cvals = [c[3] for c in candles]
         x = date2num(dates)
         fig, ax = plt.subplots(figsize=(8,4), dpi=100)
-        for xi, oi, hi, li, ci in zip(x, o, h, l, cclose):
+        for xi, oi, hi, li, ci in zip(x, o, h, l, cvals):
             col = "green" if ci >= oi else "red"
             ax.vlines(xi, li, hi, color="black", linewidth=0.6)
-            ax.add_patch(plt.Rectangle((xi-0.3, min(oi,ci)), 0.6, abs(ci-oi), color=col, alpha=0.9))
+            ax.add_patch(plt.Rectangle((xi-0.2, min(oi, ci)), 0.4, abs(ci-oi), color=col, alpha=0.9))
         sup, res, mid = levels
-        if res: ax.axhline(res, color="orange", linestyle="--", linewidth=1)
-        if sup: ax.axhline(sup, color="purple", linestyle="--", linewidth=1)
-        if mid: ax.axhline(mid, color="gray", linestyle=":")
+        if res is not None: ax.axhline(res, color="orange", linestyle="--", linewidth=0.9, label=f"res {res:.2f}")
+        if sup is not None: ax.axhline(sup, color="purple", linestyle="--", linewidth=0.9, label=f"sup {sup:.2f}")
+        if mid is not None: ax.axhline(mid, color="gray", linestyle=":", linewidth=0.7, label=f"mid {mid:.2f}")
         ax.set_title(symbol)
+        ax.legend(loc="upper left", fontsize="small")
         fig.autofmt_xdate()
         tmp = NamedTemporaryFile(delete=False, suffix=".png")
         fig.savefig(tmp.name, bbox_inches="tight")
         plt.close(fig)
+        print("[TRACE] chart saved to", tmp.name)
         return tmp.name
     except Exception as e:
-        print("[ERROR] plot_candles exception:", e)
+        print("[ERROR] plot_chart failed:", e)
         return None
 
 def compute_trade_levels(price, levels, bias):
+    if not price:
+        return None
     sup, res, mid = levels
-    if not price: return None
     buf = 0.003
     if bias == "BUY":
-        sl = (sup * (1 - buf)) if sup else price * 0.99
+        sl = sup * (1 - buf) if sup else price * 0.99
         risk = price - sl if price > sl else max(price*0.01, 1.0)
-        tp1 = price + risk
-        tp2 = price + 2*risk
+        tp1 = price + 1 * risk
+        tp2 = price + 2 * risk
         return {"entry": price, "sl": sl, "tp1": tp1, "tp2": tp2}
     if bias == "SELL":
-        sl = (res * (1 + buf)) if res else price * 1.01
+        sl = res * (1 + buf) if res else price * 1.01
         risk = sl - price if sl > price else max(price*0.01, 1.0)
-        tp1 = price - risk
-        tp2 = price - 2*risk
+        tp1 = price - 1 * risk
+        tp2 = price - 2 * risk
         return {"entry": price, "sl": sl, "tp1": tp1, "tp2": tp2}
     return None
 
-# ---------- OpenAI analysis (optional) ----------
-async def openai_analysis(market_map):
+# ---------------- OpenAI analysis (structured with CONF) ----------------
+async def analyze_openai(market_map: dict):
     if not client:
+        print("[WARN] OpenAI not configured")
         return None
-    parts = []
-    for s in SYMBOLS:
-        d = market_map.get(s, {})
-        parts.append(f"{s}: price={d.get('price','NA')} vol={d.get('volume','NA')} oi={d.get('oi','NA')} ls={d.get('long_short_ratio','NA')}")
-        for tf in ("candles_30m","candles_1h","candles_4h"):
-            if d.get(tf):
-                last10 = d[tf][-10:]
-                ct = ",".join([f"[{c[0]},{c[1]},{c[2]},{c[3]}]" for c in last10])
-                parts.append(f"{s} {tf} last10: {ct}")
-    prompt = (
-        "You are a concise crypto technical analyst. For each symbol output one line:\n"
-        "SYMBOL - BIAS - TIMEFRAMES - REASON\n"
-        "Now analyze:\n" + "\n".join(parts)
-    )
     try:
+        parts = []
+        for s in SYMBOLS:
+            d = market_map.get(s) or {}
+            parts.append(f"{s}: price={d.get('price','NA')} vol={d.get('volume','NA')}")
+            if d.get("candles"):
+                last10 = d["candles"][-10:]
+                ct = ",".join([f"[{c[0]},{c[1]},{c[2]},{c[3]}]" for c in last10])
+                parts.append(f"{s} 30m last10: {ct}")
+        prompt = (
+            "You are a concise crypto technical analyst. For each symbol provide exactly ONE LINE in the format:\n"
+            "SYMBOL - BIAS - TF - REASON - CONF: <NN>%\n"
+            "Where BIAS should be one of: BUY / SELL / NEUTRAL (but synonyms ok), TF is timeframe tokens like '30m' or '30m,1h'.\n"
+            "CONF should be an integer percent representing your confidence in the bias (0-100).\n\nAnalyze the data below and output one line per symbol only.\n\n"
+            + "\n".join(parts)
+        )
+        print("[TRACE] OpenAI prompt length:", len(prompt))
         resp = await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: client.chat.completions.create(
                 model=OPENAI_MODEL,
                 messages=[{"role":"user","content":prompt}],
-                max_tokens=800, temperature=0.15
-            )
+                max_tokens=800, temperature=0.15,
+            ),
         )
         text = resp.choices[0].message.content.strip()
-        parsed = {}
-        for ln in text.splitlines():
-            if " - " in ln:
-                p = [x.strip() for x in ln.split(" - ")]
-                if len(p) >= 3:
-                    sym = p[0].upper()
-                    bias_raw = p[1].upper()
-                    tfs = p[2]
-                    reason = p[3] if len(p) > 3 else ""
-                    if "BULL" in bias_raw or "BUY" in bias_raw or "LONG" in bias_raw:
-                        bias = "BUY"
-                    elif "BEAR" in bias_raw or "SELL" in bias_raw or "SHORT" in bias_raw:
-                        bias = "SELL"
-                    else:
-                        bias = "NEUTRAL"
-                    parsed[sym] = {"bias": bias, "tfs": tfs, "reason": reason}
-        return parsed
+        print("[TRACE] OpenAI returned (truncated):", text[:800])
+        return text
     except Exception as e:
-        print("[WARN] openai_analysis failed:", e)
+        print("[ERROR] analyze_openai failed:", e)
         return None
 
-# ---------- OI/LR helper ----------
-def oi_ls_features(oi_now, oi_prev, ls_now, ls_prev):
-    out = {"oi_change_pct": None, "oi_spike_level": "none", "ls_change": None, "ls_note": "unknown"}
-    try:
-        if oi_prev and oi_now:
-            pct = (oi_now - oi_prev) / oi_prev * 100.0
-            out["oi_change_pct"] = pct
-            if pct >= 20:
-                out["oi_spike_level"] = "big"
-            elif pct >= 10:
-                out["oi_spike_level"] = "medium"
-    except:
-        pass
-    try:
-        if ls_prev is not None and ls_now is not None:
-            out["ls_change"] = ls_now - ls_prev
-            if ls_now > 2.0:
-                out["ls_note"] = "crowded_long"
-            elif ls_now < 0.5:
-                out["ls_note"] = "crowded_short"
+def parse_openai_structured(text: str):
+    out = {}
+    if not text:
+        return out
+    for ln in text.splitlines():
+        if not ln.strip():
+            continue
+        # expected format: SYMBOL - BIAS - TF - REASON - CONF: NN%
+        parts = [p.strip() for p in ln.split(" - ")]
+        if len(parts) < 3:
+            continue
+        sym = parts[0].upper()
+        raw_bias = parts[1]
+        bias = normalize_bias(raw_bias)
+        tfs = parts[2]
+        reason = ""
+        conf = None
+        # reason may be in parts[3] and conf may be appended like " ... - CONF: 72%"
+        if len(parts) >= 4:
+            # join remaining parts except final if it contains CONF:
+            tail = " - ".join(parts[3:])
+            # try extract CONF: NN%
+            import re
+            m = re.search(r"CONF[: ]+([0-9]{1,3})%?", tail, re.IGNORECASE)
+            if m:
+                try:
+                    conf = float(m.group(1))
+                except:
+                    conf = None
+                # remove CONF segment from reason
+                reason = re.sub(r"CONF[: ]+[0-9]{1,3}%?", "", tail, flags=re.IGNORECASE).strip(" -;")
             else:
-                out["ls_note"] = "balanced"
-        else:
-            out["ls_note"] = "unknown"
-    except:
-        out["ls_note"] = "unknown"
+                reason = tail
+        out[sym] = {"bias": bias, "raw_bias": raw_bias, "tfs": tfs, "reason": reason, "conf": conf}
     return out
 
-# ---------- CONFIDENCE ----------
-def compute_confidence(local_biases, openai_bias, history, price, volume, long_short_ratio, prev_volume=None, prev_oi=None, prev_ls=None, prev_price=None, oi=None, symbol=None):
-    candidate = None
-    if openai_bias in ("BUY","SELL"):
-        candidate = openai_bias
-    else:
-        if local_biases:
-            vals = list(local_biases.values())
-            counts = {}
-            for v in vals: counts[v] = counts.get(v,0) + 1
-            sorted_items = sorted(counts.items(), key=lambda x: (-x[1], x[0]))
-            candidate = sorted_items[0][0] if sorted_items else None
-            if candidate == "NEUTRAL":
-                for v in vals:
-                    if v in ("BUY","SELL"):
-                        candidate = v
-                        break
-    if not candidate or candidate == "NEUTRAL":
-        return 0, {"note":"no candidate bias"}
+# normalize synonyms
+def normalize_bias(raw_bias: str) -> str:
+    if not raw_bias:
+        return "NEUTRAL"
+    b = raw_bias.strip().upper()
+    if b in ("BUY", "LONG", "BULLISH", "BULL", "ACCUMULATE", "GO LONG"):
+        return "BUY"
+    if b in ("SELL", "SHORT", "BEARISH", "BEAR", "LIQUIDATE", "GO SHORT"):
+        return "SELL"
+    if b in ("NEUTRAL", "HOLD", "WAIT", "NO ACTION"):
+        return "NEUTRAL"
+    if "BULL" in b or "BUY" in b:
+        return "BUY"
+    if "BEAR" in b or "SELL" in b or "SHORT" in b:
+        return "SELL"
+    return "NEUTRAL"
 
-    agrees = sum(1 for v in local_biases.values() if v == candidate)
-    local_score = int((agrees/3.0) * 40)
-    openai_score = 25 if openai_bias == candidate else 0
-
-    ls_score = 0
-    if long_short_ratio is not None:
-        diff = abs(long_short_ratio - 1.0)
-        if candidate == "BUY" and long_short_ratio > 1.0:
-            ls_score = min(15, int(diff * 15))
-        if candidate == "SELL" and long_short_ratio < 1.0:
-            ls_score = min(15, int(diff * 15))
-        if long_short_ratio > 2.0 and candidate == "BUY":
-            ls_score = max(0, ls_score - 5)
-        if long_short_ratio < 0.5 and candidate == "SELL":
-            ls_score = max(0, ls_score - 5)
-
-    vol_score = 0
-    try:
-        if prev_volume and volume and volume > 1.2 * prev_volume:
-            vol_score = 10
-        elif prev_volume and volume and volume > 1.05 * prev_volume:
-            vol_score = 4
-    except:
-        vol_score = 0
-
-    hist_score = 0
-    if len(history) >= 3 and history[-3:] == [history[-1]]*3 and history[-1] == candidate:
-        hist_score = 10
-
-    oi_bonus = 0
-    oi_feats = oi_ls_features(oi, prev_oi, long_short_ratio, prev_ls)
-    try:
-        if oi_feats.get("oi_spike_level") == "big":
-            if prev_price is not None and price is not None:
-                if candidate == "BUY" and price > prev_price:
-                    oi_bonus += 10
-                if candidate == "SELL" and price < prev_price:
-                    oi_bonus += 10
-            else:
-                oi_bonus += 6
-        elif oi_feats.get("oi_spike_level") == "medium":
-            if prev_price is not None and price is not None:
-                if candidate == "BUY" and price > prev_price:
-                    oi_bonus += 5
-                if candidate == "SELL" and price < prev_price:
-                    oi_bonus += 5
-            else:
-                oi_bonus += 2
-        if oi_feats.get("ls_change") is not None:
-            lsch = oi_feats.get("ls_change")
-            if candidate == "BUY" and lsch > 0.05:
-                oi_bonus += 3
-            if candidate == "SELL" and lsch < -0.05:
-                oi_bonus += 3
-    except:
-        oi_bonus = 0
-
-    score = local_score + openai_score + ls_score + vol_score + hist_score + oi_bonus
-    if score > 100: score = 100
-    breakdown = {
-        "candidate": candidate,
-        "local_agree": local_score,
-        "openai": openai_score,
-        "ls": ls_score,
-        "vol": vol_score,
-        "history": hist_score,
-        "oi_bonus": oi_bonus,
-        "total": score,
-        "oi_feats": oi_feats
-    }
-    return score, breakdown
-
-# ---------- decide_strong ----------
-def decide_strong(local_biases, openai_bias, history):
-    if len(history) >= 3 and history[-3:] == [history[-1]]*3 and history[-1] in ("BUY","SELL"):
-        return True, history[-1], "3-cycle confirmation"
-    if openai_bias in ("BUY","SELL"):
-        agrees = sum(1 for v in local_biases.values() if v == openai_bias)
-        if agrees >= 2:
-            return True, openai_bias, f"openai+local majority ({agrees}/3)"
-    return False, None, ""
-
-# ---------- main loop ----------
-async def main_loop():
+# ---------------- Main loop ----------------
+async def task_loop():
     async with aiohttp.ClientSession() as session:
-        await send_text(session, "*Bot online — Phase 4.9 (Strong alert chart+entry) + OptionC charts toggle*")
-        history = {s: [] for s in SYMBOLS}
-        prev_vol = {s: None for s in SYMBOLS}
-        prev_oi = {s: None for s in SYMBOLS}
-        prev_ls = {s: None for s in SYMBOLS}
-        prev_price = {s: None for s in SYMBOLS}
-        cooldowns = {s: 0 for s in SYMBOLS}
-
+        await send_text(session, f"Bot online — Phase-4.4 (threshold {SIGNAL_CONF_THRESHOLD}%)")
+        prev_market = {}
         while True:
             start = time.time()
-            tasks = [fetch_symbol(session, s) for s in SYMBOLS]
-            results = await asyncio.gather(*tasks)
-            market = {s:r for s,r in zip(SYMBOLS, results)}
-
-            local = {}
-            for s,d in market.items():
-                local[s] = {
-                    "30m": simple_tf_bias(d.get("candles_30m", [])),
-                    "1h": simple_tf_bias(d.get("candles_1h", [])),
-                    "4h": simple_tf_bias(d.get("candles_4h", []))
-                }
-
-            openai_out = await openai_analysis(market) if client else None
-
-            summary_lines = [f"Snapshot (UTC {datetime.utcnow().strftime('%H:%M')})"]
-            for s in SYMBOLS:
-                d = market.get(s, {})
-                summary_lines.append(f"{s}: {d.get('price','NA')} vol={d.get('volume','NA')}")
-            await send_text(session, "🧠 " + "\n".join(summary_lines))
-
-            for s in SYMBOLS:
-                d = market.get(s, {})
-                loc = local.get(s, {})
-                # majority local
-                vals = list(loc.values()) if loc else []
-                majority = "NEUTRAL"
-                if vals:
-                    counts = {}
-                    for v in vals: counts[v] = counts.get(v,0) + 1
-                    sorted_items = sorted(counts.items(), key=lambda x:(-x[1], x[0]))
-                    majority = sorted_items[0][0]
-                    if majority == "NEUTRAL":
-                        for v in vals:
-                            if v in ("BUY","SELL"):
-                                majority = v
-                                break
-
-                history[s].append(majority)
-                if len(history[s]) > 40: history[s].pop(0)
-
-                openai_bias = None
-                openai_reason = ""
-                if openai_out and s in openai_out:
-                    openai_bias = openai_out[s]["bias"]
-                    openai_reason = openai_out[s].get("reason","")
-
-                potential, pot_bias, pot_note = decide_strong(loc, openai_bias, history[s])
-
-                conf_score, conf_breakdown = compute_confidence(
-                    local_biases=loc,
-                    openai_bias=openai_bias,
-                    history=history[s],
-                    price=d.get("price"),
-                    volume=d.get("volume"),
-                    long_short_ratio=d.get("long_short_ratio"),
-                    prev_volume=prev_vol.get(s),
-                    prev_oi=prev_oi.get(s),
-                    prev_ls=prev_ls.get(s),
-                    prev_price=prev_price.get(s),
-                    oi=d.get("oi"),
-                    symbol=s
-                )
-
-                # update prev trackers
-                prev_vol[s] = d.get("volume")
-                prev_oi[s] = d.get("oi")
-                prev_ls[s] = d.get("long_short_ratio")
-                prev_price[s] = d.get("price")
-
-                # STRONG alert -> send chart + Entry/SL/TP (only when both rules satisfied)
-                if potential and pot_bias and conf_score >= CONFIDENCE_MIN:
-                    now_ts = time.time()
-                    if now_ts >= cooldowns[s]:
-                        levels = calc_levels_impl(d.get("candles_30m", []))
-                        tl = compute_trade_levels(d.get("price"), levels, pot_bias)
-                        caption = (
-                            f"🚨 STRONG {pot_bias}: {s}\n"
-                            f"TFs(local): 30m={loc.get('30m')},1h={loc.get('1h')},4h={loc.get('4h')}\n"
-                            f"Reason(openai): {openai_reason or 'N/A'}\n"
-                            f"Confirm: {pot_note}\n"
-                            f"Confidence: {conf_score}%\n"
-                        )
-                        caption += f"Breakdown: local={conf_breakdown['local_agree']}/40 openai={conf_breakdown['openai']}/25 ls={conf_breakdown['ls']}/15 vol={conf_breakdown['vol']}/10 hist={conf_breakdown['history']}/10 oi_bonus={conf_breakdown['oi_bonus']}"
-                        if tl:
-                            caption += f"\n\nEntry: {tl['entry']:.6f}\nSL: {tl['sl']:.6f}\nTP1: {tl['tp1']:.6f}\nTP2: {tl['tp2']:.6f}"
-                        chart_path = plot_candles(d.get("times_30m", None), d.get("candles_30m", []), levels, s)
-                        if chart_path:
-                            ok = await send_photo(session, caption, chart_path)
-                            print(f"[DEBUG] sent STRONG alert for {s}, ok={ok}, conf={conf_score}")
-                        else:
-                            await send_text(session, caption)
-                        cooldowns[s] = now_ts + COOLDOWN_SEC
-                    else:
-                        print(f"[DEBUG] cooldown active for {s}, skipping STRONG alert.")
+            # fetch data
+            tasks = [fetch_data(session, s) for s in SYMBOLS]
+            res = await asyncio.gather(*tasks, return_exceptions=True)
+            market_map = {}
+            for s, r in zip(SYMBOLS, res):
+                if isinstance(r, Exception) or r is None:
+                    print(f"[WARN] fetch for {s} failed:", r)
+                    market_map[s] = {}
                 else:
-                    if potential and pot_bias:
-                        print(f"[DEBUG] {s} potential but low confidence ({conf_score} < {CONFIDENCE_MIN})")
-
-                # Optionally send info chart for all symbols every cycle
-                if SEND_INFO_CHARTS:
-                    try:
-                        levels_info = calc_levels_impl(d.get("candles_30m", []))
-                        tl_info = compute_trade_levels(d.get("price"), levels_info, majority if majority in ("BUY","SELL") else None)
-                        caption_info = f"📊 {s} · Price:{d.get('price')} · Local:{majority} · OpenAI:{openai_bias or 'N/A'} · Conf:{conf_score}%"
-                        if tl_info:
-                            caption_info += f"\nEntry:{tl_info['entry']:.6f} SL:{tl_info['sl']:.6f} TP1:{tl_info['tp1']:.6f}"
-                        chart_path_info = plot_candles(d.get("times_30m", None), d.get("candles_30m", []), levels_info, s)
-                        if chart_path_info:
-                            await send_photo(session, caption_info, chart_path_info)
-                        else:
-                            await send_text(session, caption_info)
-                    except Exception as e:
-                        print("[WARN] failed sending chart/info for", s, e)
-
+                    market_map[s] = r
+            # openai analysis
+            openai_text = await analyze_openai(market_map) if client else None
+            parsed = parse_openai_structured(openai_text) if openai_text else {}
+            print("[TRACE] parsed openai keys:", list(parsed.keys()))
+            # Evaluate each symbol: require both local and openai match and conf >= threshold
+            for s in SYMBOLS:
+                ai = parsed.get(s, {})
+                ai_bias = ai.get("bias", "NEUTRAL")
+                ai_conf = ai.get("conf", None)
+                ai_reason = ai.get("reason", "")
+                local = "NEUTRAL"
+                candles = market_map.get(s, {}).get("candles")
+                if candles:
+                    local = local_bias_from_candles(candles)
+                print(f"[TRACE] {s} local={local} openai={ai_bias} conf={ai_conf}")
+                # only proceed if bias yes and conf numeric
+                if ai_conf is None:
+                    print(f"[DEBUG] skipping {s} because OpenAI conf missing")
+                    continue
+                try:
+                    conf_val = float(ai_conf)
+                except:
+                    print(f"[DEBUG] skipping {s} because conf not numeric: {ai_conf}")
+                    continue
+                if conf_val < SIGNAL_CONF_THRESHOLD:
+                    print(f"[DEBUG] skipping {s} conf {conf_val} < threshold {SIGNAL_CONF_THRESHOLD}")
+                    continue
+                # require agreement
+                if local != ai_bias:
+                    print(f"[DEBUG] skipping {s} bias mismatch local={local} ai={ai_bias}")
+                    continue
+                if ai_bias not in ("BUY", "SELL"):
+                    print(f"[DEBUG] skipping {s} ai_bias not actionable: {ai_bias}")
+                    continue
+                # compose alert: compute levels, trade suggestions, chart and send
+                price = market_map.get(s, {}).get("price")
+                levels = calc_levels(candles or [])
+                trade = compute_trade_levels(price, levels, ai_bias)
+                caption_lines = [
+                    f"🚨 STRONG SIGNAL: {s} → {ai_bias} (Conf: {int(conf_val)}%)",
+                    f"Reason: {ai_reason or 'OpenAI signal'}",
+                ]
+                if trade:
+                    caption_lines.append("")
+                    caption_lines.append(f"Entry: {trade['entry']:.4f}")
+                    caption_lines.append(f"SL: {trade['sl']:.4f}")
+                    caption_lines.append(f"TP1: {trade['tp1']:.4f}")
+                    caption_lines.append(f"TP2: {trade['tp2']:.4f}")
+                caption = "\n".join(caption_lines)
+                chart_path = None
+                try:
+                    chart_path = plot_chart(market_map.get(s, {}).get("times", []), candles or [], s, levels)
+                    if chart_path:
+                        ok = await send_photo(session, caption, chart_path)
+                        print(f"[INFO] alert sent for {s}, send_photo ok={ok}")
+                    else:
+                        print("[WARN] chart not generated, sending text only")
+                        await send_text(session, caption)
+                except Exception as e:
+                    print("[ERROR] while sending alert for", s, e)
+                    await send_text(session, caption)
             elapsed = time.time() - start
-            to_sleep = max(0, POLL_INTERVAL - elapsed)
-            print(f"[DEBUG] cycle done. sleeping {to_sleep} sec.")
-            await asyncio.sleep(to_sleep)
+            sleep_for = max(0, POLL_INTERVAL - elapsed)
+            print(f"[TRACE] cycle complete, sleeping {sleep_for}s")
+            await asyncio.sleep(sleep_for)
+
+def main():
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[ERROR] TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set")
+        return
+    asyncio.run(task_loop())
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main_loop())
-    except KeyboardInterrupt:
-        print("Interrupted")
+    main()

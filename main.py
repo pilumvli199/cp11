@@ -1,4 +1,4 @@
-# main.py - Phase 4.4 Debug-enabled (Charts + Entry/SL/TP) 
+# main.py - Phase 4.4 Debug-enabled (Charts + Entry/SL/TP) with bias normalization
 import os, asyncio, aiohttp, time
 from datetime import datetime
 from dotenv import load_dotenv
@@ -166,7 +166,8 @@ async def analyze_openai(market):
             if d.get("candles"):
                 last10 = d["candles"][-10:]
                 parts.append(f"{s} 30m last10:" + ",".join([f"[{c[0]},{c[1]},{c[2]},{c[3]}]" for c in last10]))
-        prompt = "Output lines: SYMBOL - BIAS - TF - REASON\\n" + "\\n".join(parts)
+        # Ask for BUY/SELL/NEUTRAL but GPT may still use synonyms; we'll normalize later.
+        prompt = ("Output lines: SYMBOL - BIAS - TF - REASON\\n" + "\\n".join(parts))
         print("[DEBUG] OpenAI prompt length:", len(prompt))
         resp = await asyncio.get_event_loop().run_in_executor(None, lambda: client.chat.completions.create(
             model=OPENAI_MODEL,
@@ -180,13 +181,37 @@ async def analyze_openai(market):
         print("[ERROR] analyze_openai exception:", repr(e))
         return None
 
+# ---- normalization utility ----
+def normalize_bias(raw_bias: str) -> str:
+    if not raw_bias:
+        return "NEUTRAL"
+    b = raw_bias.strip().upper()
+    # map common synonyms to BUY/SELL/NEUTRAL
+    if b in ("BUY", "LONG", "BULLISH", "BULL", "ACCUMULATE", "GO LONG"):
+        return "BUY"
+    if b in ("SELL", "SHORT", "BEARISH", "BEAR", "LIQUIDATE", "GO SHORT"):
+        return "SELL"
+    if b in ("NEUTRAL", "HOLD", "WAIT", "NO ACTION"):
+        return "NEUTRAL"
+    # sometimes GPT returns phrases like "slightly bullish" -> check keywords
+    if "BULL" in b or "BUY" in b:
+        return "BUY"
+    if "BEAR" in b or "SELL" in b or "SHORT" in b:
+        return "SELL"
+    return "NEUTRAL"
+
 def parse(text):
     out = {}
     if not text: return out
     for ln in text.splitlines():
         parts = [p.strip() for p in ln.split(" - ")]
         if len(parts) >= 3:
-            out[parts[0].upper()] = {"bias": parts[1].upper(), "tf": parts[2], "reason": parts[3] if len(parts)>3 else ""}
+            sym = parts[0].upper()
+            raw_bias = parts[1]
+            bias = normalize_bias(raw_bias)
+            tfs = parts[2]
+            reason = parts[3] if len(parts) > 3 else ""
+            out[sym] = {"bias": bias, "raw_bias": raw_bias, "tf": tfs, "reason": reason}
     return out
 
 # ---- main loop ----
@@ -202,12 +227,18 @@ async def loop():
                 print("[DEBUG] fetched market keys:", list(market.keys()))
                 analysis = await analyze_openai(market)
                 parsed = parse(analysis) if analysis else {}
+                print("[DEBUG] parsed keys:", parsed.keys())
                 for s, info in parsed.items():
+                    bias = info.get("bias","NEUTRAL")
+                    raw_bias = info.get("raw_bias","")
                     d = market.get(s, {})
                     levs = levels(d.get("candles", []))
-                    tl = trade_levels(d.get("price"), levs, info.get("bias"))
-                    if tl:
-                        caption = f"🚨 {s} {info['bias']} TF:{info['tf']}\\nReason:{info['reason']}\\nEntry:{tl['entry']:.2f} SL:{tl['sl']:.2f} TP1:{tl['tp1']:.2f} TP2:{tl['tp2']:.2f}"
+                    # send chart+trade for BUY/SELL (including normalized from BULLISH/BEARISH)
+                    if bias in ("BUY","SELL"):
+                        tl = trade_levels(d.get("price"), levs, bias)
+                        caption = f"🚨 {s} {bias} (raw:{raw_bias}) TF:{info.get('tf')}\\nReason:{info.get('reason')}\\n"
+                        if tl:
+                            caption += f"Entry:{tl['entry']:.2f} SL:{tl['sl']:.2f} TP1:{tl['tp1']:.2f} TP2:{tl['tp2']:.2f}"
                         chart_path = None
                         try:
                             chart_path = plot_chart(d.get("times", []), d.get("candles", []), s, levs)
@@ -220,6 +251,9 @@ async def loop():
                         except Exception as e:
                             print("[ERROR] during chart/send for", s, repr(e))
                             await send_text(session, caption)
+                    else:
+                        # NEUTRAL -> send short analysis text only
+                        await send_text(session, f"ℹ️ {s} NEUTRAL · reason: {info.get('reason')} (raw:{raw_bias})")
                 print("[DEBUG] cycle done, sleeping", POLL_INTERVAL)
             except Exception as e:
                 print("[ERROR] main loop exception:", repr(e))

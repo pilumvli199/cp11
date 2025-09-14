@@ -1,5 +1,7 @@
-# main.py - Phase 4.5
+# main.py - Phase 4.6
 # Multiframe analysis (30m,1h,4h) + strong-signal-only alerts + charts + Entry/SL/TP + cooldowns
+# Fix: use candle timestamps (times_30m etc.) so charts render correctly on x-axis.
+
 import os, asyncio, aiohttp, time
 from datetime import datetime
 from dotenv import load_dotenv
@@ -97,21 +99,35 @@ async def fetch_json(session, url):
 async def fetch_symbol(session, symbol):
     # fetch 30m,1h,4h candles + ticker + oi + long/short
     t = await fetch_json(session, TICKER_URL.format(symbol=symbol))
-    c30 = await fetch_json(session, CANDLE_URL.format(symbol=symbol, interval="30m"))
-    c1 = await fetch_json(session, CANDLE_URL.format(symbol=symbol, interval="1h"))
-    c4 = await fetch_json(session, CANDLE_URL.format(symbol=symbol, interval="4h"))
+    raw30 = await fetch_json(session, CANDLE_URL.format(symbol=symbol, interval="30m"))
+    raw1  = await fetch_json(session, CANDLE_URL.format(symbol=symbol, interval="1h"))
+    raw4  = await fetch_json(session, CANDLE_URL.format(symbol=symbol, interval="4h"))
     oi = await fetch_json(session, OI_URL.format(symbol=symbol))
     ls = await fetch_json(session, LONGSHORT_URL.format(symbol=symbol))
     out = {}
     if t:
-        out["price"] = float(t.get("lastPrice", 0))
-        out["volume"] = float(t.get("volume", 0))
-    def to_candles(raw):
-        if not isinstance(raw, list): return []
-        return [[float(x[1]), float(x[2]), float(x[3]), float(x[4])] for x in raw]
-    out["candles_30m"] = to_candles(c30)
-    out["candles_1h"] = to_candles(c1)
-    out["candles_4h"] = to_candles(c4)
+        try:
+            out["price"] = float(t.get("lastPrice", 0))
+            out["volume"] = float(t.get("volume", 0))
+        except:
+            out["price"] = None
+            out["volume"] = None
+
+    def to_candles_and_times(raw):
+        if not isinstance(raw, list):
+            return [], []
+        candles = [[float(x[1]), float(x[2]), float(x[3]), float(x[4])] for x in raw]
+        times = [int(x[0]) // 1000 for x in raw]  # openTime (ms -> s)
+        return candles, times
+
+    c30, t30 = to_candles_and_times(raw30)
+    c1,  t1  = to_candles_and_times(raw1)
+    c4,  t4  = to_candles_and_times(raw4)
+
+    out["candles_30m"] = c30; out["times_30m"] = t30
+    out["candles_1h"]  = c1;  out["times_1h"]  = t1
+    out["candles_4h"]  = c4;  out["times_4h"]  = t4
+
     out["oi"] = float(oi.get("openInterest")) if isinstance(oi, dict) and oi.get("openInterest") else None
     if isinstance(ls, list) and ls:
         try:
@@ -129,7 +145,6 @@ def simple_tf_bias(candles, lookback=10, threshold_pct=0.002):
     closes = [c[3] for c in arr]
     last = closes[-1]
     mean = sum(closes)/len(closes)
-    # pct diff
     if mean == 0: return "NEUTRAL"
     pct = (last - mean) / mean
     if pct > threshold_pct:
@@ -139,7 +154,7 @@ def simple_tf_bias(candles, lookback=10, threshold_pct=0.002):
     return "NEUTRAL"
 
 # ---------- level plot & trade levels ----------
-def calc_levels(candles, lookback=24):
+def calc_levels_impl(candles, lookback=24):
     if not candles: return (None,None,None)
     arr = candles[-lookback:] if len(candles)>=lookback else candles[:]
     highs = sorted([c[1] for c in arr], reverse=True)
@@ -152,14 +167,17 @@ def calc_levels(candles, lookback=24):
 
 def plot_candles(times, candles, levels, symbol):
     try:
-        times = times or list(range(len(candles)))
-        dates = [datetime.utcfromtimestamp(t) for t in times] if isinstance(times[0], (int,float)) else times
+        # times: list of epoch seconds or None
+        if times and len(times) == len(candles):
+            dates = [datetime.utcfromtimestamp(t) for t in times]
+        else:
+            dates = [datetime.utcfromtimestamp(int(time.time()) - (len(candles)-i)*60*30) for i in range(len(candles))]  # fallback spaced 30m
         o = [c[0] for c in candles]; h = [c[1] for c in candles]; l = [c[2] for c in candles]; cclose = [c[3] for c in candles]
         x = date2num(dates)
         fig, ax = plt.subplots(figsize=(8,4), dpi=100)
         for xi, oi, hi, li, ci in zip(x, o, h, l, cclose):
             col = "green" if ci >= oi else "red"
-            ax.vlines(x, li, hi, color="black", linewidth=0.6)
+            ax.vlines(xi, li, hi, color="black", linewidth=0.6)
             ax.add_patch(plt.Rectangle((xi-0.3, min(oi,ci)), 0.6, abs(ci-oi), color=col, alpha=0.9))
         sup, res, mid = levels
         if res: ax.axhline(res, color="orange", linestyle="--", linewidth=1)
@@ -224,7 +242,6 @@ async def openai_analysis(market_map):
         )
         text = resp.choices[0].message.content.strip()
         print("[DEBUG] OpenAI returned (truncated):", text[:800])
-        # parse into dict
         parsed = {}
         for ln in text.splitlines():
             if " - " in ln:
@@ -234,7 +251,6 @@ async def openai_analysis(market_map):
                     bias_raw = p[1].upper()
                     tfs = p[2]
                     reason = p[3] if len(p) > 3 else ""
-                    # normalize
                     if "BULL" in bias_raw or "BUY" in bias_raw or "LONG" in bias_raw:
                         bias = "BUY"
                     elif "BEAR" in bias_raw or "SELL" in bias_raw or "SHORT" in bias_raw:
@@ -249,18 +265,10 @@ async def openai_analysis(market_map):
 
 # ---------- strong-signal decision ----------
 def decide_strong(local_biases, openai_bias, hist_biases):
-    """
-    local_biases: dict {'30m': 'BUY'...}
-    openai_bias: 'BUY'/'SELL'/None
-    hist_biases: list of last biases for symbol (recent cycles)
-    Rules:
-      - If openai_bias in (BUY,SELL) AND at least 2 of 3 local timeframes == openai_bias -> strong
-      - OR if last 3 history entries == same (BUY/SELL) -> strong
-    """
-    # check history
+    # history 3-cycle
     if len(hist_biases) >= 3 and hist_biases[-3:] == [hist_biases[-1]]*3 and hist_biases[-1] in ("BUY","SELL"):
         return True, hist_biases[-1], "3-cycle confirmation"
-    # check openai + local majority
+    # openai + local majority
     if openai_bias in ("BUY","SELL"):
         agrees = sum(1 for v in local_biases.values() if v == openai_bias)
         if agrees >= 2:
@@ -270,14 +278,12 @@ def decide_strong(local_biases, openai_bias, hist_biases):
 # ---------- main loop ----------
 async def main_loop():
     async with aiohttp.ClientSession() as session:
-        await send_text(session, "*Bot online — Phase 4.5 (multiframe + strong alerts only)*")
-        prev_market = {}
-        history = {s: [] for s in SYMBOLS}       # store last biases (BUY/SELL/NEUTRAL)
+        await send_text(session, "*Bot online — Phase 4.6 (multiframe + strong alerts only)*")
+        history = {s: [] for s in SYMBOLS}       # store last majority biases
         cooldowns = {s: 0 for s in SYMBOLS}      # timestamp until which don't resend same strong alert
 
         while True:
             start = time.time()
-            # fetch all symbols concurrently
             tasks = [fetch_symbol(session, s) for s in SYMBOLS]
             results = await asyncio.gather(*tasks)
             market = {s:r for s,r in zip(SYMBOLS, results)}
@@ -312,31 +318,26 @@ async def main_loop():
                     openai_bias = openai_out[s]["bias"]
                     openai_reason = openai_out[s]["reason"]
                 loc = local.get(s, {})
-                # determine majority local
+                # majority of local tf
                 vals = list(loc.values())
                 majority = max(set(vals), key=vals.count) if vals else "NEUTRAL"
-                # history push (use majority as this cycle's local summary)
                 history[s].append(majority)
-                if len(history[s]) > 10: history[s].pop(0)
+                if len(history[s]) > 20: history[s].pop(0)
 
                 strong, strong_bias, strong_note = decide_strong(loc, openai_bias, history[s])
-                # cooldown check
                 now_ts = time.time()
                 if strong and strong_bias:
                     if now_ts < cooldowns[s]:
                         print(f"[DEBUG] cooldown active for {s}, skipping strong alert.")
                     else:
-                        # create chart + trade suggestion + send
-                        levels = calc_levels(d.get("candles_30m", []))
+                        levels = calc_levels_impl(d.get("candles_30m", []))
                         tl = compute_trade_levels(d.get("price"), levels, strong_bias)
                         caption = f"🚨 STRONG {strong_bias}: {s}\nTFs(local): 30m={loc.get('30m')},1h={loc.get('1h')},4h={loc.get('4h')}\nReason(openai): {openai_reason or 'N/A'}\nConfirm: {strong_note}"
                         if tl:
                             caption += f"\nEntry:{tl['entry']:.4f} SL:{tl['sl']:.4f} TP1:{tl['tp1']:.4f} TP2:{tl['tp2']:.4f}"
-                        # generate chart (use 30m candles for chart)
-                        times = None
-                        c30 = d.get("candles_30m") or []
-                        # we don't have times in fetch_symbol (to keep payload small) -> plot using index-based x
-                        chart_path = plot_candles(list(range(len(c30))), c30, levels, s) if c30 else None
+                        c30 = d.get("candles_30m", [])
+                        t30 = d.get("times_30m", None)
+                        chart_path = plot_candles(t30, c30, levels, s) if c30 else None
                         if chart_path:
                             ok = await send_photo(session, caption, chart_path)
                             print(f"[DEBUG] sent strong alert for {s}, ok={ok}")
@@ -344,18 +345,17 @@ async def main_loop():
                             await send_text(session, caption)
                         cooldowns[s] = now_ts + COOLDOWN_SEC
                 else:
-                    # weak/neutral — optionally send small summary for important symbols
-                    # We will NOT spam charts for weak signals.
-                    # But if you want chart for specific symbols always (BTC/ETH/SOL), send them as info:
+                    # show informative chart for top symbols
                     if s in ("BTCUSDT","ETHUSDT","SOLUSDT"):
-                        # small informative chart + short reason (no strong label)
-                        levels = calc_levels(d.get("candles_30m", []))
+                        levels = calc_levels_impl(d.get("candles_30m", []))
                         tl = compute_trade_levels(d.get("price"), levels, majority if majority in ("BUY","SELL") else None)
                         caption = f"ℹ️ {s} {majority} (local majority) · OpenAI:{openai_bias or 'N/A'}\nTFs:30m={loc.get('30m')},1h={loc.get('1h')},4h={loc.get('4h')}"
                         if tl:
                             caption += f"\nEntry:{tl['entry']:.4f} SL:{tl['sl']:.4f} TP1:{tl['tp1']:.4f}"
+                        c30 = d.get("candles_30m", [])
+                        t30 = d.get("times_30m", None)
                         try:
-                            chart_path = plot_candles(list(range(len(d.get("candles_30m",[])))), d.get("candles_30m",[]), levels, s)
+                            chart_path = plot_candles(t30, c30, levels, s) if c30 else None
                             if chart_path:
                                 await send_photo(session, caption, chart_path)
                             else:
@@ -369,25 +369,6 @@ async def main_loop():
             to_sleep = max(0, POLL_INTERVAL - elapsed)
             print(f"[DEBUG] cycle finished. sleeping {to_sleep} sec.")
             await asyncio.sleep(to_sleep)
-
-# ---------- helpers used above ----------
-def calc_levels(candles):
-    return calc_levels if False else (lambda cs: (None,None,None))([ ])  # safe stub (overridden below)
-
-# small wrapper to avoid name conflict with earlier calc_levels usage
-def calc_levels(candles_input):
-    return calc_levels_impl(candles_input)
-
-def calc_levels_impl(candles, lookback=24):
-    if not candles: return (None,None,None)
-    arr = candles[-lookback:] if len(candles)>=lookback else candles[:]
-    highs = sorted([c[1] for c in arr], reverse=True)
-    lows  = sorted([c[2] for c in arr])
-    k = min(3, len(arr))
-    res = sum(highs[:k]) / k
-    sup = sum(lows[:k]) / k
-    mid = (res + sup) / 2
-    return sup, res, mid
 
 # run
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-# main.py - Enhanced GPT-driven Crypto Bot with Improved Accuracy (fixed)
+# main.py - Price Action Focused Crypto Bot with Reduced Indicators
 import os
 import re
 import asyncio
@@ -27,20 +27,15 @@ POLL_INTERVAL = max(30, int(os.getenv("POLL_INTERVAL", 1800)))
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")  # Better model for analysis
-SIGNAL_CONF_THRESHOLD = float(os.getenv("SIGNAL_CONF_THRESHOLD", 80.0))  # Higher threshold
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
+SIGNAL_CONF_THRESHOLD = float(os.getenv("SIGNAL_CONF_THRESHOLD", 80.0))
 
-# Enhanced Analysis windows
+# Simplified Analysis - Focus on Price Action
 RSI_PERIOD = 14
-MACD_FAST = 12
-MACD_SLOW = 26
-MACD_SIGNAL = 9
 MA_SHORT = 7
 MA_MEDIUM = 21
 MA_LONG = 50
-BB_PERIOD = 20
-BB_STD = 2
-VOLUME_MULTIPLIER = 1.8  # More conservative
+VOLUME_MULTIPLIER = 2.0  # Higher threshold for volume spikes
 MIN_CANDLES_FOR_ANALYSIS = 30
 LOOKBACK_PERIOD = 100
 FIBONACCI_LEVELS = [0.236, 0.382, 0.5, 0.618, 0.786]
@@ -79,9 +74,9 @@ def fmt_decimal(val, small_prec=6, large_prec=2) -> str:
         return str(val)
     return f"{v:.{small_prec}f}" if abs(v) < 1 else f"{v:.{large_prec}f}"
 
-# ---------------- Enhanced Indicators ----------------
+# ---------------- Simplified Indicators ----------------
 def calculate_rsi(prices: List[float], period: int = 14) -> Optional[float]:
-    """Improved RSI calculation with smoothing"""
+    """Simplified RSI calculation"""
     if len(prices) < period + 1:
         return None
     
@@ -89,22 +84,8 @@ def calculate_rsi(prices: List[float], period: int = 14) -> Optional[float]:
     gains = np.where(deltas > 0, deltas, 0)
     losses = np.where(deltas < 0, -deltas, 0)
     
-    # Use Wilder's smoothing method
-    avg_gains = []
-    avg_losses = []
-    
-    # First calculation
     avg_gain = np.mean(gains[:period])
     avg_loss = np.mean(losses[:period])
-    avg_gains.append(avg_gain)
-    avg_losses.append(avg_loss)
-    
-    # Subsequent calculations with smoothing
-    for i in range(period, len(gains)):
-        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-        avg_gains.append(avg_gain)
-        avg_losses.append(avg_loss)
     
     if avg_loss == 0:
         return 100.0
@@ -113,104 +94,28 @@ def calculate_rsi(prices: List[float], period: int = 14) -> Optional[float]:
     rsi = 100 - (100 / (1 + rs))
     return round(rsi, 2)
 
-def calculate_macd(prices: List[float]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
-    """Calculate MACD, Signal line, and Histogram"""
-    if len(prices) < MACD_SLOW:
-        return None, None, None
-    
-    prices_array = np.array(prices)
-    
-    # Calculate EMAs
-    def ema(data, span):
-        alpha = 2 / (span + 1)
-        ema_values = [data[0]]
-        for price in data[1:]:
-            ema_values.append(alpha * price + (1 - alpha) * ema_values[-1])
-        return ema_values
-    
-    ema_fast = ema(prices, MACD_FAST)
-    ema_slow = ema(prices, MACD_SLOW)
-    
-    macd_line = ema_fast[-1] - ema_slow[-1]
-    
-    # Calculate signal line (EMA of MACD)
-    macd_values = [fast - slow for fast, slow in zip(ema_fast[MACD_SLOW-1:], ema_slow)]
-    if len(macd_values) >= MACD_SIGNAL:
-        signal_line = ema(macd_values, MACD_SIGNAL)[-1]
-        histogram = macd_line - signal_line
-        return round(macd_line, 6), round(signal_line, 6), round(histogram, 6)
-    
-    return round(macd_line, 6), None, None
-
-def calculate_bollinger_bands(prices: List[float]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
-    """Calculate Bollinger Bands"""
-    if len(prices) < BB_PERIOD:
-        return None, None, None
-    
-    recent_prices = prices[-BB_PERIOD:]
-    sma = np.mean(recent_prices)
-    std = np.std(recent_prices)
-    
-    upper_band = sma + (BB_STD * std)
-    lower_band = sma - (BB_STD * std)
-    
-    return round(upper_band, 6), round(sma, 6), round(lower_band, 6)
-
-def calculate_fibonacci_retracements(highs: List[float], lows: List[float]) -> Dict[str, float]:
-    """Calculate Fibonacci retracement levels"""
-    if not highs or not lows:
-        return {}
-    
-    recent_high = max(highs[-50:])  # Last 50 candles
-    recent_low = min(lows[-50:])
-    
-    diff = recent_high - recent_low
-    fib_levels = {}
-    
-    for level in FIBONACCI_LEVELS:
-        fib_levels[f"fib_{level}"] = recent_low + (diff * level)
-    
-    return fib_levels
-
-def detect_divergence(prices: List[float], rsi_values: List[float]) -> str:
-    """Detect bullish/bearish divergence"""
-    if len(prices) < 10 or len(rsi_values) < 10:
-        return "none"
-    
-    recent_prices = prices[-10:]
-    recent_rsi = rsi_values[-10:]
-    
-    # Simple divergence detection
-    price_trend = "up" if recent_prices[-1] > recent_prices[0] else "down"
-    rsi_trend = "up" if recent_rsi[-1] > recent_rsi[0] else "down"
-    
-    if price_trend == "down" and rsi_trend == "up":
-        return "bullish_divergence"
-    elif price_trend == "up" and rsi_trend == "down":
-        return "bearish_divergence"
-    
-    return "none"
-
 def calculate_market_structure(candles: List[List[float]]) -> Dict[str, any]:
-    """Analyze market structure - Higher Highs, Lower Lows etc."""
+    """Analyze market structure - Higher Highs, Lower Lows etc. (PRICE ACTION FOCUS)"""
     if len(candles) < 10:
         return {}
     
     highs = [c[1] for c in candles]
     lows = [c[2] for c in candles]
+    closes = [c[3] for c in candles]
     
     # Find peaks and troughs
     peaks = []
     troughs = []
     
     for i in range(2, len(highs) - 2):
-        if highs[i] > highs[i-1] and highs[i] > highs[i+1] and highs[i] > highs[i-2] and highs[i] > highs[i+2]:
+        if highs[i] > highs[i-1] and highs[i] > highs[i+1]:
             peaks.append((i, highs[i]))
-        if lows[i] < lows[i-1] and lows[i] < lows[i+1] and lows[i] < lows[i-2] and lows[i] < lows[i+2]:
+        if lows[i] < lows[i-1] and lows[i] < lows[i+1]:
             troughs.append((i, lows[i]))
     
-    structure = {"trend": "sideways", "strength": 0}
+    structure = {"trend": "sideways", "strength": 0, "swings": []}
     
+    # Analyze swing points for price action
     if len(peaks) >= 2 and len(troughs) >= 2:
         # Check for higher highs and higher lows (uptrend)
         if peaks[-1][1] > peaks[-2][1] and troughs[-1][1] > troughs[-2][1]:
@@ -221,10 +126,19 @@ def calculate_market_structure(candles: List[List[float]]) -> Dict[str, any]:
             structure["trend"] = "downtrend"
             structure["strength"] = 2
     
+    # Recent price action analysis
+    recent_closes = closes[-5:]
+    structure["recent_momentum"] = "neutral"
+    if len(recent_closes) >= 3:
+        if recent_closes[-1] > recent_closes[-2] > recent_closes[-3]:
+            structure["recent_momentum"] = "bullish"
+        elif recent_closes[-1] < recent_closes[-2] < recent_closes[-3]:
+            structure["recent_momentum"] = "bearish"
+    
     return structure
 
 def enhanced_volume_analysis(volumes: List[float], prices: List[float]) -> Dict[str, any]:
-    """Enhanced volume analysis"""
+    """Enhanced volume analysis with focus on price-volume relationship"""
     if len(volumes) < 20:
         return {}
     
@@ -234,32 +148,57 @@ def enhanced_volume_analysis(volumes: List[float], prices: List[float]) -> Dict[
     
     volume_ratio = current_volume / avg_volume if avg_volume > 0 else 0
     
-    # Price-Volume relationship
+    # Price-Volume relationship (PRICE ACTION FOCUS)
     price_change = (prices[-1] - prices[-2]) / prices[-2] if len(prices) >= 2 else 0
     
     analysis = {
         "volume_spike": volume_ratio > VOLUME_MULTIPLIER,
         "volume_ratio": round(volume_ratio, 2),
-        "price_volume_confirmation": False
+        "price_volume_confirmation": False,
+        "volume_trend": "neutral"
     }
     
-    # Volume confirms price movement
-    if abs(price_change) > 0.01:  # 1% price change
-        if (price_change > 0 and volume_ratio > 1.2) or (price_change < 0 and volume_ratio > 1.2):
+    # Volume trend analysis
+    if len(volumes) >= 5:
+        volume_ma_short = np.mean(volumes[-5:])
+        volume_ma_long = np.mean(volumes[-20:])
+        if volume_ma_short > volume_ma_long * 1.2:
+            analysis["volume_trend"] = "increasing"
+        elif volume_ma_short < volume_ma_long * 0.8:
+            analysis["volume_trend"] = "decreasing"
+    
+    # Volume confirms price movement (KEY PRICE ACTION CONCEPT)
+    if abs(price_change) > 0.008:  # 0.8% price change
+        if (price_change > 0 and volume_ratio > 1.5) or (price_change < 0 and volume_ratio > 1.5):
             analysis["price_volume_confirmation"] = True
     
     return analysis
 
-def detect_advanced_patterns(candles: List[List[float]]) -> Dict[str, bool]:
-    """Detect advanced candlestick patterns"""
+def detect_price_action_patterns(candles: List[List[float]]) -> Dict[str, bool]:
+    """Detect price action patterns (simplified and focused)"""
     if len(candles) < 5:
         return {}
     
     patterns = {}
-    
-    # Get recent candles
     recent = candles[-5:]
     
+    # Support and Resistance breaks
+    highs = [c[1] for c in recent]
+    lows = [c[2] for c in recent]
+    closes = [c[3] for c in recent]
+    opens = [c[0] for c in recent]
+    
+    # Key resistance/support breaks
+    if len(candles) > 20:
+        prev_high = max([c[1] for c in candles[-21:-1]])
+        prev_low = min([c[2] for c in candles[-21:-1]])
+        
+        if closes[-1] > prev_high:
+            patterns['resistance_break'] = True
+        if closes[-1] < prev_low:
+            patterns['support_break'] = True
+    
+    # Simple candlestick patterns
     for i, candle in enumerate(recent):
         open_price, high, low, close = candle
         body = abs(close - open_price)
@@ -270,40 +209,86 @@ def detect_advanced_patterns(candles: List[List[float]]) -> Dict[str, bool]:
         if range_size == 0:
             continue
             
-        # More sophisticated pattern detection
+        # Focus on high-probability patterns only
         if i == len(recent) - 1:  # Current candle
-            # Shooting Star
-            if (upper_wick > 2 * body and lower_wick < body * 0.1 and 
-                close < open_price and i > 0 and recent[i-1][3] > recent[i-1][0]):
+            # Engulfing patterns
+            if i > 0:
+                prev_open, prev_high, prev_low, prev_close = recent[i-1]
+                prev_body = abs(prev_close - prev_open)
+                
+                # Bullish engulfing
+                if (close > open_price and prev_close < prev_open and 
+                    close > prev_open and open_price < prev_close and
+                    body > prev_body * 1.2):
+                    patterns['bullish_engulfing'] = True
+                
+                # Bearish engulfing
+                if (close < open_price and prev_close > prev_open and 
+                    close < prev_open and open_price > prev_close and
+                    body > prev_body * 1.2):
+                    patterns['bearish_engulfing'] = True
+            
+            # Pin bars (simplified)
+            if (upper_wick > body * 2 and lower_wick < body * 0.5 and 
+                close < open_price):
                 patterns['shooting_star'] = True
             
-            # Hammer
-            if (lower_wick > 2 * body and upper_wick < body * 0.1 and 
-                i > 0 and recent[i-1][3] < recent[i-1][0]):
+            if (lower_wick > body * 2 and upper_wick < body * 0.5 and 
+                close > open_price):
                 patterns['hammer'] = True
-            
-            # Inverted Hammer
-            if (upper_wick > 2 * body and lower_wick < body * 0.1 and 
-                close > open_price and i > 0 and recent[i-1][3] < recent[i-1][0]):
-                patterns['inverted_hammer'] = True
     
     # Multi-candle patterns
     if len(recent) >= 3:
-        # Morning Star
-        if (recent[-3][3] < recent[-3][0] and  # First candle bearish
-            abs(recent[-2][3] - recent[-2][0]) < (recent[-3][1] - recent[-3][2]) * 0.3 and  # Middle doji/small body
-            recent[-1][3] > recent[-1][0] and  # Third candle bullish
-            recent[-1][3] > (recent[-3][0] + recent[-3][3]) / 2):  # Third candle closes above midpoint of first
-            patterns['morning_star'] = True
+        # Inside bars (consolidation)
+        if (highs[-1] <= highs[-2] and lows[-1] >= lows[-2] and
+            highs[-2] <= highs[-3] and lows[-2] >= lows[-3]):
+            patterns['double_inside_bar'] = True
         
-        # Evening Star
-        if (recent[-3][3] > recent[-3][0] and  # First candle bullish
-            abs(recent[-2][3] - recent[-2][0]) < (recent[-3][1] - recent[-3][2]) * 0.3 and  # Middle doji/small body
-            recent[-1][3] < recent[-1][0] and  # Third candle bearish
-            recent[-1][3] < (recent[-3][0] + recent[-3][3]) / 2):  # Third candle closes below midpoint of first
-            patterns['evening_star'] = True
+        # Outside bars (breakout potential)
+        if (highs[-1] > highs[-2] and lows[-1] < lows[-2] and
+            highs[-2] > highs[-3] and lows[-2] < lows[-3]):
+            patterns['double_outside_bar'] = True
     
     return patterns
+
+def calculate_support_resistance(candles: List[List[float]]) -> Dict[str, float]:
+    """Calculate key support and resistance levels from price action"""
+    if len(candles) < 20:
+        return {}
+    
+    highs = [c[1] for c in candles]
+    lows = [c[2] for c in candles]
+    closes = [c[3] for c in candles]
+    
+    # Recent swing points
+    swing_highs = []
+    swing_lows = []
+    
+    for i in range(2, len(highs) - 2):
+        if highs[i] > highs[i-1] and highs[i] > highs[i+1]:
+            swing_highs.append(highs[i])
+        if lows[i] < lows[i-1] and lows[i] < lows[i+1]:
+            swing_lows.append(lows[i])
+    
+    levels = {}
+    
+    if swing_highs:
+        levels['resistance_1'] = max(swing_highs[-3:]) if len(swing_highs) >= 3 else swing_highs[-1]
+        levels['resistance_2'] = max(swing_highs) if swing_highs else None
+    
+    if swing_lows:
+        levels['support_1'] = min(swing_lows[-3:]) if len(swing_lows) >= 3 else swing_lows[-1]
+        levels['support_2'] = min(swing_lows) if swing_lows else None
+    
+    # Current price relative to levels
+    current_price = closes[-1]
+    if levels:
+        if 'resistance_1' in levels and levels['resistance_1']:
+            levels['distance_to_resistance'] = ((levels['resistance_1'] - current_price) / current_price) * 100
+        if 'support_1' in levels and levels['support_1']:
+            levels['distance_to_support'] = ((current_price - levels['support_1']) / current_price) * 100
+    
+    return levels
 
 # ---------------- Enhanced Data Fetching ----------------
 async def fetch_enhanced_data(session, symbol):
@@ -350,50 +335,28 @@ async def fetch_enhanced_data(session, symbol):
             out["times"] = times
             out["volumes"] = volumes
             
-            # Calculate all indicators
+            # Calculate simplified indicators (PRICE ACTION FOCUS)
             closes = [c[3] for c in parsed_candles]
             highs = [c[1] for c in parsed_candles]
             lows = [c[2] for c in parsed_candles]
             
-            # Basic indicators
+            # Basic indicators only
             out["rsi"] = calculate_rsi(closes, RSI_PERIOD)
             out["ma_short"] = sum(closes[-MA_SHORT:]) / MA_SHORT if len(closes) >= MA_SHORT else None
             out["ma_medium"] = sum(closes[-MA_MEDIUM:]) / MA_MEDIUM if len(closes) >= MA_MEDIUM else None
             out["ma_long"] = sum(closes[-MA_LONG:]) / MA_LONG if len(closes) >= MA_LONG else None
             
-            # Advanced indicators
-            macd, signal, histogram = calculate_macd(closes)
-            out["macd"] = macd
-            out["macd_signal"] = signal
-            out["macd_histogram"] = histogram
-            
-            bb_upper, bb_middle, bb_lower = calculate_bollinger_bands(closes)
-            out["bb_upper"] = bb_upper
-            out["bb_middle"] = bb_middle
-            out["bb_lower"] = bb_lower
-            
-            # Market structure and patterns
+            # Price action analysis (FOCUS AREA)
             out["market_structure"] = calculate_market_structure(parsed_candles)
             out["volume_analysis"] = enhanced_volume_analysis(volumes, closes)
-            out["patterns"] = detect_advanced_patterns(parsed_candles)
-            out["fibonacci"] = calculate_fibonacci_retracements(highs, lows)
-            
-            # Calculate RSI for divergence detection
-            if len(closes) >= 20:
-                rsi_values = []
-                for i in range(RSI_PERIOD, len(closes)):
-                    rsi = calculate_rsi(closes[:i+1], RSI_PERIOD)
-                    if rsi:
-                        rsi_values.append(rsi)
-                
-                if len(rsi_values) >= 10:
-                    out["divergence"] = detect_divergence(closes[-len(rsi_values):], rsi_values)
+            out["patterns"] = detect_price_action_patterns(parsed_candles)
+            out["key_levels"] = calculate_support_resistance(parsed_candles)
                 
         except Exception as e:
             print(f"Enhanced candle processing error for {symbol}: {e}")
             traceback.print_exc()
     
-    # Enhanced order book analysis
+    # Order book analysis for key levels
     if orderbook:
         try:
             bids = [(float(x[0]), float(x[1])) for x in orderbook.get("bids", [])]
@@ -405,14 +368,12 @@ async def fetch_enhanced_data(session, symbol):
                 out["spread"] = asks[0][0] - bids[0][0]
                 out["spread_pct"] = (out["spread"] / bids[0][0]) * 100
                 
-                # Calculate order book imbalance
-                total_bid_volume = sum(x[1] for x in bids[:10])
-                total_ask_volume = sum(x[1] for x in asks[:10])
-                out["order_imbalance"] = (total_bid_volume - total_ask_volume) / (total_bid_volume + total_ask_volume)
+                # Significant order clusters
+                avg_bid_size = np.mean([x[1] for x in bids[:5]])
+                avg_ask_size = np.mean([x[1] for x in asks[:5]])
                 
-                # Support and resistance from order book
-                significant_bids = [x for x in bids if x[1] > np.mean([b[1] for b in bids]) * 1.5]
-                significant_asks = [x for x in asks if x[1] > np.mean([a[1] for a in asks]) * 1.5]
+                significant_bids = [x for x in bids if x[1] > avg_bid_size * 2]
+                significant_asks = [x for x in asks if x[1] > avg_ask_size * 2]
                 
                 out["ob_support"] = significant_bids[0][0] if significant_bids else None
                 out["ob_resistance"] = significant_asks[0][0] if significant_asks else None
@@ -449,15 +410,15 @@ async def fetch_json(session, url):
         print("fetch_json exception for", url, e)
         return None
 
-# ---------------- Enhanced AI Analysis ----------------
+# ---------------- Enhanced AI Analysis with Price Action Focus ----------------
 async def enhanced_analyze_openai(market):
     if not client:
         print("No OpenAI client configured.")
         return None
     
-    # Prepare comprehensive market analysis
+    # Prepare comprehensive market analysis with price action focus
     market_summary = []
-    technical_signals = []
+    price_action_signals = []
     
     for symbol, data in market.items():
         if not data.get("price"):
@@ -469,132 +430,136 @@ async def enhanced_analyze_openai(market):
         volume_analysis = data.get("volume_analysis", {})
         market_structure = data.get("market_structure", {})
         patterns = data.get("patterns", {})
+        key_levels = data.get("key_levels", {})
         
-        # Technical signal strength calculation
+        # Price action signal strength calculation
         signal_strength = 0
         signal_direction = "neutral"
         reasons = []
         
-        # RSI signals
-        if rsi:
-            if rsi < 30:
-                signal_strength += 2
+        # Market structure signals
+        trend = market_structure.get("trend", "sideways")
+        momentum = market_structure.get("recent_momentum", "neutral")
+        
+        if trend != "sideways":
+            signal_strength += 1
+            reasons.append(f"Trend: {trend}")
+        
+        if momentum != "neutral":
+            signal_strength += 1
+            signal_direction = momentum
+            reasons.append(f"Momentum: {momentum}")
+        
+        # Key level breaks (STRONG PRICE ACTION SIGNAL)
+        if patterns.get('resistance_break'):
+            signal_strength += 3
+            signal_direction = "bullish"
+            reasons.append("Resistance break")
+        elif patterns.get('support_break'):
+            signal_strength += 3
+            signal_direction = "bearish"
+            reasons.append("Support break")
+        
+        # Candlestick patterns
+        if patterns.get('bullish_engulfing'):
+            signal_strength += 2
+            signal_direction = "bullish"
+            reasons.append("Bullish engulfing")
+        elif patterns.get('bearish_engulfing'):
+            signal_strength += 2
+            signal_direction = "bearish"
+            reasons.append("Bearish engulfing")
+        
+        if patterns.get('hammer'):
+            signal_strength += 1
+            if signal_direction != "bearish":
                 signal_direction = "bullish"
-                reasons.append(f"RSI oversold ({rsi})")
-            elif rsi > 70:
-                signal_strength += 2
+            reasons.append("Hammer pattern")
+        elif patterns.get('shooting_star'):
+            signal_strength += 1
+            if signal_direction != "bullish":
                 signal_direction = "bearish"
-                reasons.append(f"RSI overbought ({rsi})")
-        
-        # MACD signals
-        macd = data.get("macd")
-        macd_signal = data.get("macd_signal")
-        if macd and macd_signal:
-            if macd > macd_signal and data.get("macd_histogram", 0) > 0:
-                signal_strength += 1
-                if signal_direction != "bearish":
-                    signal_direction = "bullish"
-                reasons.append("MACD bullish crossover")
-            elif macd < macd_signal and data.get("macd_histogram", 0) < 0:
-                signal_strength += 1
-                if signal_direction != "bullish":
-                    signal_direction = "bearish"
-                reasons.append("MACD bearish crossover")
-        
-        # Bollinger Bands
-        bb_upper = data.get("bb_upper")
-        bb_lower = data.get("bb_lower")
-        if bb_upper and bb_lower:
-            if price <= bb_lower:
-                signal_strength += 1
-                reasons.append("Price at BB lower band")
-            elif price >= bb_upper:
-                signal_strength += 1
-                reasons.append("Price at BB upper band")
+            reasons.append("Shooting star")
         
         # Volume confirmation
         if volume_analysis.get("price_volume_confirmation"):
-            signal_strength += 1
+            signal_strength += 2
             reasons.append("Volume confirms price move")
         
-        # Pattern recognition
-        strong_patterns = ["morning_star", "evening_star", "hammer", "shooting_star"]
-        for pattern in strong_patterns:
-            if patterns.get(pattern):
-                signal_strength += 2
-                reasons.append(f"Strong pattern: {pattern}")
+        # RSI for confluence only
+        if rsi:
+            if rsi < 35 and signal_direction == "bullish":
+                signal_strength += 1
+                reasons.append("RSI oversold")
+            elif rsi > 65 and signal_direction == "bearish":
+                signal_strength += 1
+                reasons.append("RSI overbought")
         
-        # Market structure
-        trend = market_structure.get("trend", "sideways")
-        if trend != "sideways":
-            signal_strength += 1
-            reasons.append(f"Market structure: {trend}")
-        
-        # Create summary
+        # Create summary with price action focus
         summary = f"""
 {symbol}: Price=${fmt_price(price)}, RSI={rsi}, Change24h={data.get('price_change_24h', 0):.2f}%
-- MACD: {fmt_decimal(macd) if macd is not None else 'N/A'}, Signal: {fmt_decimal(macd_signal) if macd_signal is not None else 'N/A'}
-- BB: Upper={fmt_price(bb_upper) if bb_upper is not None else 'N/A'}, Lower={fmt_price(bb_lower) if bb_lower is not None else 'N/A'}
-- Volume: {data.get('volume_analysis', {}).get('volume_ratio', 0):.2f}x avg, Spike={data.get('volume_analysis', {}).get('volume_spike', False)}
-- Structure: {trend}, Patterns: {list(patterns.keys())}
-- Signal Strength: {signal_strength}/10, Direction: {signal_direction}
-- Key Levels: Support={fmt_price(data.get('ob_support'))}, Resistance={fmt_price(data.get('ob_resistance'))}"""
+- Trend: {trend}, Momentum: {momentum}
+- Volume: {volume_analysis.get('volume_ratio', 0):.2f}x avg, Spike={volume_analysis.get('volume_spike', False)}
+- Patterns: {list(patterns.keys())}
+- Key Levels: S1={fmt_price(key_levels.get('support_1'))}, R1={fmt_price(key_levels.get('resistance_1'))}
+- Signal Strength: {signal_strength}/10, Direction: {signal_direction}"""
         
         market_summary.append(summary)
         
-        # Only include symbols with strong signals
+        # Only include symbols with strong price action signals
         if signal_strength >= 4:
-            technical_signals.append({
+            price_action_signals.append({
                 "symbol": symbol,
                 "strength": signal_strength,
                 "direction": signal_direction,
-                "reasons": reasons
+                "reasons": reasons,
+                "key_levels": key_levels
             })
     
     if not market_summary:
         print("No market data available for analysis.")
         return None
     
-    # Enhanced prompt with more specific instructions
-    prompt = f"""You are a professional crypto trader with 10+ years experience. Analyze the provided 30-minute timeframe data and identify ONLY the highest probability trades.
+    # Enhanced prompt with price action focus
+    prompt = f"""You are a professional price action trader with 10+ years experience. Analyze the provided 30-minute timeframe data and identify ONLY the highest probability trades based on PRICE ACTION.
 
 STRICT REQUIREMENTS:
 1. Only suggest trades with confidence ≥ 80%
 2. Each signal MUST have specific ENTRY, STOPLOSS, and TARGET prices
 3. Risk:Reward ratio must be at least 1:2
-4. Consider market structure, volume, and multiple confirmations
-5. Account for current market conditions and volatility
+4. Focus on price action: breakouts, patterns, volume confirmation
+5. Account for key support/resistance levels
 
 OUTPUT FORMAT (one line per signal):
 SYMBOL - ACTION - ENTRY: <exact_price> - SL: <exact_price> - TP: <exact_price> - REASON: <max_50_words> - CONF: <80-95>%
 
-ANALYSIS RULES:
-- BUY signals: RSI<40 + bullish patterns + volume confirmation + support levels
-- SELL signals: RSI>60 + bearish patterns + volume confirmation + resistance levels
-- ENTRY: Near current price or breakout level
-- STOPLOSS: Beyond recent swing high/low with 0.5-2% buffer
-- TARGET: Based on key resistance/support levels with min 1:2 R:R
-- No signals if trend is unclear or conflicting indicators
+PRICE ACTION RULES:
+- BUY signals: Resistance breaks + bullish patterns + volume confirmation + trend alignment
+- SELL signals: Support breaks + bearish patterns + volume confirmation + trend alignment
+- ENTRY: At breakout confirmation or pattern completion
+- STOPLOSS: Beyond recent swing point or pattern invalidation level
+- TARGET: Based on measured moves or next key level
+- No signals if price action is unclear or conflicting
 
 MARKET DATA:
 {"".join(market_summary)}
 
-PRIORITY SIGNALS (Strong technical setups):
-{json.dumps([{"symbol": s["symbol"], "strength": s["strength"], "direction": s["direction"], "reasons": s["reasons"]} for s in technical_signals], indent=2)}
+PRICE ACTION SIGNALS (Strong setups):
+{json.dumps([{"symbol": s["symbol"], "strength": s["strength"], "direction": s["direction"], "reasons": s["reasons"], "levels": s["key_levels"]} for s in price_action_signals], indent=2)}
 
-Remember: Quality over quantity. Only suggest trades you would take with your own money."""
-    
+Remember: Quality over quantity. Only suggest trades with clear price action confirmation."""
+
     try:
         loop = asyncio.get_running_loop()
         def call_model():
             return client.chat.completions.create(
                 model=OPENAI_MODEL,
                 messages=[
-                    {"role": "system", "content": "You are a professional cryptocurrency trader with deep expertise in technical analysis. You provide only high-probability trading signals with precise entry, stop-loss, and take-profit levels."},
+                    {"role": "system", "content": "You are a professional price action trader specializing in cryptocurrency markets. You provide only high-probability trading signals based on clear price action patterns, breakouts, and volume confirmation."},
                     {"role": "user", "content": prompt}
                 ],
                 max_tokens=1500,
-                temperature=0.1  # Lower temperature for more consistent analysis
+                temperature=0.1
             )
         
         resp = await loop.run_in_executor(None, call_model)
@@ -705,7 +670,7 @@ def enhanced_parse(text):
     
     return out
 
-# ---------------- Enhanced Charting ----------------
+# ---------------- Simplified Charting ----------------
 def enhanced_plot_chart(times, candles, symbol, market_data):
     if not times or not candles or len(times) != len(candles) or len(candles) < 10:
         raise ValueError("Insufficient data for enhanced plotting")
@@ -716,14 +681,13 @@ def enhanced_plot_chart(times, candles, symbol, market_data):
     lows = [c[2] for c in candles]
     x = date2num(dates)
     
-    # Create subplots with better layout
-    fig = plt.figure(figsize=(16, 12), dpi=120)
-    gs = fig.add_gridspec(4, 1, height_ratios=[3, 1, 1, 1], hspace=0.3)
+    # Create simplified subplots
+    fig = plt.figure(figsize=(16, 10), dpi=120)
+    gs = fig.add_gridspec(3, 1, height_ratios=[2, 1, 1], hspace=0.3)
     
     ax_price = fig.add_subplot(gs[0])
     ax_volume = fig.add_subplot(gs[1])
     ax_rsi = fig.add_subplot(gs[2])
-    ax_macd = fig.add_subplot(gs[3])
     
     # Enhanced candlestick plotting
     width = 0.6 * (x[1] - x[0]) if len(x) > 1 else 0.4
@@ -740,46 +704,20 @@ def enhanced_plot_chart(times, candles, symbol, market_data):
                            facecolor=color, edgecolor=edge_color, alpha=0.9, linewidth=0.8)
         ax_price.add_patch(rect)
     
-    # Support and Resistance levels
-    sup1, res1, sup2, res2, mid = enhanced_levels(candles, lookback=LOOKBACK_PERIOD)
-    if res1:
-        ax_price.axhline(res1, color="red", linestyle="--", alpha=0.8, linewidth=2, 
-                        label=f"Primary Resistance: {fmt_price(res1)}")
-    if sup1:
-        ax_price.axhline(sup1, color="blue", linestyle="--", alpha=0.8, linewidth=2,
-                        label=f"Primary Support: {fmt_price(sup1)}")
-    if res2:
-        ax_price.axhline(res2, color="orange", linestyle=":", alpha=0.6, linewidth=1.5,
-                        label=f"Secondary Resistance: {fmt_price(res2)}")
-    if sup2:
-        ax_price.axhline(sup2, color="cyan", linestyle=":", alpha=0.6, linewidth=1.5,
-                        label=f"Secondary Support: {fmt_price(sup2)}")
+    # Support and Resistance levels from price action
+    key_levels = market_data.get("key_levels", {})
+    if key_levels.get('support_1'):
+        ax_price.axhline(key_levels['support_1'], color="blue", linestyle="--", alpha=0.8, 
+                        linewidth=2, label=f"Support: {fmt_price(key_levels['support_1'])}")
+    if key_levels.get('resistance_1'):
+        ax_price.axhline(key_levels['resistance_1'], color="red", linestyle="--", alpha=0.8, 
+                        linewidth=2, label=f"Resistance: {fmt_price(key_levels['resistance_1'])}")
     
-    # Bollinger Bands
-    bb_upper = market_data.get("bb_upper")
-    bb_middle = market_data.get("bb_middle")
-    bb_lower = market_data.get("bb_lower")
-    
-    if bb_upper and bb_middle and bb_lower:
-        bb_upper_line = [bb_upper] * len(x)
-        bb_middle_line = [bb_middle] * len(x)
-        bb_lower_line = [bb_lower] * len(x)
-        
-        ax_price.plot(x, bb_upper_line, alpha=0.5, linewidth=1, label="BB Upper")
-        ax_price.plot(x, bb_middle_line, alpha=0.5, linewidth=1, label="BB Middle")
-        ax_price.plot(x, bb_lower_line, alpha=0.5, linewidth=1, label="BB Lower")
-        ax_price.fill_between(x, bb_upper_line, bb_lower_line, alpha=0.1)
-    
-    # Moving Averages
+    # Moving Averages (simplified)
     if len(closes) >= MA_LONG:
-        ma_short_values, ma_medium_values, ma_long_values = [], [], []
+        ma_medium_values, ma_long_values = [], []
         
         for i in range(len(closes)):
-            if i >= MA_SHORT - 1:
-                ma_short_values.append(sum(closes[i-MA_SHORT+1:i+1]) / MA_SHORT)
-            else:
-                ma_short_values.append(None)
-                
             if i >= MA_MEDIUM - 1:
                 ma_medium_values.append(sum(closes[i-MA_MEDIUM+1:i+1]) / MA_MEDIUM)
             else:
@@ -791,13 +729,9 @@ def enhanced_plot_chart(times, candles, symbol, market_data):
                 ma_long_values.append(None)
         
         # Plot MAs
-        valid_short = [(x[i], ma) for i, ma in enumerate(ma_short_values) if ma is not None]
         valid_medium = [(x[i], ma) for i, ma in enumerate(ma_medium_values) if ma is not None]
         valid_long = [(x[i], ma) for i, ma in enumerate(ma_long_values) if ma is not None]
         
-        if valid_short:
-            x_short, y_short = zip(*valid_short)
-            ax_price.plot(x_short, y_short, linewidth=2, alpha=0.8, label=f"MA{MA_SHORT}")
         if valid_medium:
             x_medium, y_medium = zip(*valid_medium)
             ax_price.plot(x_medium, y_medium, linewidth=2, alpha=0.8, label=f"MA{MA_MEDIUM}")
@@ -832,407 +766,15 @@ def enhanced_plot_chart(times, candles, symbol, market_data):
         if rsi_values:
             rsi_x = x[-len(rsi_values):]
             ax_rsi.plot(rsi_x, rsi_values, linewidth=2)
-            ax_rsi.axhline(70, linestyle="--", alpha=0.7, linewidth=1)
-            ax_rsi.axhline(30, linestyle="--", alpha=0.7, linewidth=1)
-            ax_rsi.axhline(50, linestyle=":", alpha=0.5, linewidth=1)
-            ax_rsi.fill_between(rsi_x, 70, 100, alpha=0.2)
-            ax_rsi.fill_between(rsi_x, 0, 30, alpha=0.2)
+            ax_rsi.axhline(70, linestyle="--", alpha=0.7, linewidth=1, color="red")
+            ax_rsi.axhline(30, linestyle="--", alpha=0.7, linewidth=1, color="green")
+            ax_rsi.axhline(50, linestyle=":", alpha=0.5, linewidth=1, color="gray")
+            ax_rsi.fill_between(rsi_x, 70, 100, alpha=0.2, color="red")
+            ax_rsi.fill_between(rsi_x, 0, 30, alpha=0.2, color="green")
             ax_rsi.set_ylim(0, 100)
             ax_rsi.set_ylabel("RSI", fontsize=10)
             ax_rsi.grid(True, alpha=0.3)
     
-    # MACD chart
-    macd = market_data.get("macd")
-    macd_signal = market_data.get("macd_signal")
-    macd_histogram = market_data.get("macd_histogram")
-    
-    if macd and macd_signal:
-        # Simple representation for current values
-        ax_macd.axhline(macd, linewidth=2, label=f"MACD: {fmt_decimal(macd)}")
-        ax_macd.axhline(macd_signal, linewidth=2, label=f"Signal: {fmt_decimal(macd_signal)}")
-        if macd_histogram:
-            ax_macd.axhline(0, linestyle="-", alpha=0.5)
-            ax_macd.bar([x[-1]], [macd_histogram], width=width*5, 
-                       color="green" if macd_histogram > 0 else "red", alpha=0.7)
-        ax_macd.set_ylabel("MACD", fontsize=10)
-        ax_macd.legend(fontsize="small")
-        ax_macd.grid(True, alpha=0.3)
-    
-    # Enhanced title with more information
+    # Enhanced title with price action information
     current_price = closes[-1]
-    rsi_current = market_data.get("rsi", "N/A")
-    price_change_24h = market_data.get("price_change_24h", 0)
-    volume_ratio = market_data.get("volume_analysis", {}).get("volume_ratio", 0)
-    trend = market_data.get("market_structure", {}).get("trend", "sideways")
-    
-    title = f"""{symbol} | Price: ${fmt_price(current_price)} | 24h: {price_change_24h:+.2f}% | RSI: {rsi_current}
-Volume: {volume_ratio:.1f}x | Trend: {trend.upper()} | TF: 30m"""
-    
-    ax_price.set_title(title, fontsize=14, fontweight="bold", pad=20)
-    ax_price.legend(loc="upper left", fontsize="small", framealpha=0.9)
-    ax_price.grid(True, alpha=0.3)
-    
-    # Format dates
-    fig.autofmt_xdate()
-    
-    # Save chart
-    plt.tight_layout()
-    tmp = NamedTemporaryFile(delete=False, suffix=".png")
-    fig.savefig(tmp.name, bbox_inches="tight", dpi=120, facecolor='white')
-    plt.close(fig)
-    
-    return tmp.name
-
-def enhanced_levels(candles, lookback=LOOKBACK_PERIOD):
-    """Enhanced support and resistance calculation"""
-    if not candles or len(candles) < 10:
-        return (None, None, None, None, None)
-    
-    arr = candles[-min(len(candles), lookback):]
-    highs = [c[1] for c in arr]
-    lows = [c[2] for c in arr]
-    closes = [c[3] for c in arr]
-    
-    # Use weighted approach for better level detection
-    recent_weight = 1.5
-    older_weight = 1.0
-    
-    weighted_highs = []
-    weighted_lows = []
-    
-    for i, (high, low) in enumerate(zip(highs, lows)):
-        weight = recent_weight if i >= len(highs) * 0.7 else older_weight
-        weighted_highs.extend([high] * int(weight * 10))
-        weighted_lows.extend([low] * int(weight * 10))
-    
-    # Calculate support and resistance levels
-    highs_sorted = sorted(weighted_highs, reverse=True)
-    lows_sorted = sorted(weighted_lows)
-    
-    # Primary levels (strongest)
-    primary_resistance = np.mean(highs_sorted[:30]) if len(highs_sorted) >= 30 else None
-    primary_support = np.mean(lows_sorted[:30]) if len(lows_sorted) >= 30 else None
-    
-    # Secondary levels
-    secondary_resistance = np.mean(highs_sorted[30:60]) if len(highs_sorted) >= 60 else None
-    secondary_support = np.mean(lows_sorted[30:60]) if len(lows_sorted) >= 60 else None
-    
-    # Middle level
-    current_price = closes[-1]
-    if primary_resistance and primary_support:
-        mid_level = (primary_resistance + primary_support) / 2
-    else:
-        mid_level = current_price
-    
-    return primary_support, primary_resistance, secondary_support, secondary_resistance, mid_level
-
-# ---------------- Telegram Functions ----------------
-async def send_text(session, text):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram not configured. Skipping send_text.")
-        return
-    
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    
-    try:
-        async with session.post(url, json={
-            "chat_id": TELEGRAM_CHAT_ID, 
-            "text": text, 
-            "parse_mode": "Markdown",
-            "disable_web_page_preview": True
-        }) as r:
-            if r.status != 200:
-                txt = await r.text()
-                print(f"Telegram send_text failed {r.status}: {txt}")
-    except Exception as e:
-        print("send_text error:", e)
-
-async def send_photo(session, caption, path):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram not configured. Skipping send_photo.")
-        try: 
-            os.remove(path)
-        except: 
-            pass
-        return
-    
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
-    
-    try:
-        with open(path, "rb") as f:
-            data = aiohttp.FormData()
-            data.add_field("chat_id", str(TELEGRAM_CHAT_ID))
-            data.add_field("caption", caption)
-            data.add_field("parse_mode", "Markdown")
-            data.add_field("photo", f, filename=os.path.basename(path), content_type="image/png")
-            
-            async with session.post(url, data=data, timeout=90) as r:
-                if r.status != 200:
-                    text = await r.text()
-                    print(f"Telegram send_photo failed {r.status}: {text}")
-    except Exception as e:
-        print("send_photo error:", e)
-    finally:
-        try: 
-            os.remove(path)
-        except Exception: 
-            pass
-
-# ---------------- Performance Tracking ----------------
-def track_signal_performance():
-    """Track and analyze signal performance"""
-    if not performance_tracking:
-        return
-    
-    total_signals = len(performance_tracking)
-    profitable = sum(1 for p in performance_tracking if p.get("profit", 0) > 0)
-    
-    if total_signals > 0:
-        win_rate = (profitable / total_signals) * 100
-        avg_profit = np.mean([p.get("profit", 0) for p in performance_tracking])
-        
-        print(f"Performance: {total_signals} signals, {win_rate:.1f}% win rate, avg profit: {avg_profit:.2f}%")
-
-# ---------------- Main Enhanced Loop ----------------
-async def enhanced_loop():
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
-        startup_msg = f"""🤖 *ENHANCED Crypto Trading Bot v2.0* 🚀
-
-📊 *Configuration:*
-• Symbols: {len(SYMBOLS)} pairs
-• Timeframe: 30 minutes  
-• Poll Interval: {POLL_INTERVAL}s
-• Confidence Threshold: ≥{SIGNAL_CONF_THRESHOLD}%
-• Min Risk:Reward: 1.5:1
-
-🎯 *Features:*
-• Advanced Technical Analysis
-• MACD, RSI, Bollinger Bands
-• Market Structure Analysis
-• Volume Confirmation
-• Pattern Recognition
-• Performance Tracking
-
-✅ Bot is now ONLINE and monitoring markets..."""
-        
-        await send_text(session, startup_msg)
-        
-        iteration = 0
-        
-        while True:
-            try:
-                iteration += 1
-                start_time = datetime.now()
-                print(f"\n{'='*60}")
-                print(f"ITERATION {iteration} @ {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-                print(f"{'='*60}")
-                
-                # Fetch market data for all symbols
-                print("Fetching market data...")
-                fetch_tasks = [fetch_enhanced_data(session, symbol) for symbol in SYMBOLS]
-                results = await asyncio.gather(*fetch_tasks, return_exceptions=True)
-                
-                market = {}
-                fetch_errors = 0
-                
-                for symbol, result in zip(SYMBOLS, results):
-                    if isinstance(result, Exception):
-                        print(f"❌ Fetch error {symbol}: {result}")
-                        fetch_errors += 1
-                        continue
-                    
-                    if result and result.get("price") is not None:
-                        market[symbol] = result
-                        print(f"✅ {symbol}: ${fmt_price(result.get('price'))}")
-                    else:
-                        print(f"⚠️  No price data for {symbol}")
-                
-                if not market:
-                    print("❌ No market data available - sleeping...")
-                    await asyncio.sleep(min(120, POLL_INTERVAL))
-                    continue
-                
-                print(f"\n📊 Successfully fetched data for {len(market)}/{len(SYMBOLS)} symbols")
-                if fetch_errors > 0:
-                    print(f"⚠️  {fetch_errors} fetch errors")
-                
-                # Analyze with OpenAI
-                print("\n🤖 Running AI analysis...")
-                analysis_start = datetime.now()
-                analysis_result = await enhanced_analyze_openai(market)
-                analysis_time = (datetime.now() - analysis_start).total_seconds()
-                
-                if not analysis_result:
-                    print("❌ No analysis result from AI - sleeping...")
-                    await asyncio.sleep(POLL_INTERVAL)
-                    continue
-                
-                print(f"✅ AI analysis completed in {analysis_time:.1f}s")
-                
-                # Parse signals
-                signals = enhanced_parse(analysis_result)
-                
-                if signals:
-                    print(f"\n🚨 Found {len(signals)} HIGH-CONFIDENCE signals:")
-                    for symbol, sig in signals.items():
-                        print(f"   {symbol}: {sig['action']} @ {fmt_price(sig.get('entry'))} | Conf: {sig['confidence']}% | R:R: {sig['risk_reward']}")
-                else:
-                    print("📈 No high-confidence signals this iteration")
-                
-                # Process and send signals
-                signals_sent = 0
-                for symbol, sig in signals.items():
-                    try:
-                        confidence = sig["confidence"]
-                        action = sig["action"]
-                        entry = sig["entry"]
-                        sl = sig["sl"]
-                        tp = sig["tp"]
-                        reason = sig.get("reason", "")
-                        risk_reward = sig["risk_reward"]
-                        
-                        symbol_data = market.get(symbol, {})
-                        current_price = symbol_data.get("price", entry)
-                        
-                        # Enhanced formatting
-                        def fmt_price_local(p):
-                            if p is None: 
-                                return "N/A"
-                            return f"{p:.6f}" if p < 1 else f"{p:.2f}"
-                        
-                        # Calculate potential profit percentage
-                        if action == "BUY":
-                            potential_profit = ((tp - entry) / entry) * 100
-                            risk_pct = ((entry - sl) / entry) * 100
-                        else:
-                            potential_profit = ((entry - tp) / entry) * 100
-                            risk_pct = ((sl - entry) / entry) * 100
-                        
-                        # Enhanced signal message
-                        signal_emoji = "🟢" if action == "BUY" else "🔴"
-                        
-                        caption = f"""{signal_emoji} *SIGNAL ALERT* {signal_emoji}
-
-🎯 *{symbol}* → *{action}*
-💰 Entry: `{fmt_price(entry)}`
-🛑 Stop Loss: `{fmt_price(sl)}`
-🎯 Take Profit: `{fmt_price(tp)}`
-
-📊 *Analysis:*
-• Confidence: *{confidence}%*
-• Risk:Reward: *1:{risk_reward}*
-• Risk: {risk_pct:.1f}%
-• Potential: +{potential_profit:.1f}%
-
-🔍 *Reason:* {reason}
-
-⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}
-🤖 Enhanced Bot v2.0"""
-                        
-                        # Create and send chart
-                        if symbol_data.get("candles") and symbol_data.get("times"):
-                            try:
-                                print(f"📈 Creating chart for {symbol}...")
-                                chart_path = enhanced_plot_chart(
-                                    symbol_data["times"], 
-                                    symbol_data["candles"], 
-                                    symbol, 
-                                    symbol_data
-                                )
-                                await send_photo(session, caption, chart_path)
-                                signals_sent += 1
-                                print(f"✅ Signal sent for {symbol}")
-                            except Exception as e:
-                                print(f"❌ Chart error {symbol}: {e}")
-                                await send_text(session, caption)
-                                signals_sent += 1
-                        else:
-                            await send_text(session, caption)
-                            signals_sent += 1
-                        
-                        # Store for performance tracking
-                        performance_tracking.append({
-                            "symbol": symbol,
-                            "action": action,
-                            "entry": entry,
-                            "sl": sl,
-                            "tp": tp,
-                            "confidence": confidence,
-                            "risk_reward": risk_reward,
-                            "timestamp": datetime.now(),
-                            "reason": reason
-                        })
-                        
-                        # Limit history size
-                        if len(performance_tracking) > 500:
-                            performance_tracking[:] = performance_tracking[-400:]
-                        
-                    except Exception as e:
-                        print(f"❌ Error processing signal {symbol}: {e}")
-                        traceback.print_exc()
-                
-                # Status updates
-                iteration_time = (datetime.now() - start_time).total_seconds()
-                
-                if signals_sent > 0:
-                    print(f"\n✅ Sent {signals_sent} signals in {iteration_time:.1f}s")
-                
-                # Periodic status and performance report
-                if iteration % 12 == 0:  # Every ~6 hours if 30min intervals
-                    track_signal_performance()
-                    
-                    status_msg = f"""📊 *Status Report* - Iteration {iteration}
-
-🔍 *Market Scan:* {len(market)}/{len(SYMBOLS)} pairs
-🚨 *Total Signals:* {len(performance_tracking)}
-⏱️ *Uptime:* {iteration * POLL_INTERVAL // 3600:.1f} hours
-🎯 *Last Analysis:* {analysis_time:.1f}s
-
-✅ Bot running smoothly..."""
-                    
-                    await send_text(session, status_msg)
-                
-                print(f"\n⏰ Iteration {iteration} completed in {iteration_time:.1f}s")
-                print(f"💤 Sleeping for {POLL_INTERVAL}s...")
-                
-                await asyncio.sleep(POLL_INTERVAL)
-                
-            except asyncio.CancelledError:
-                print("\n🛑 Shutdown signal received")
-                await send_text(session, "🤖 Bot shutting down gracefully...")
-                break
-                
-            except Exception as e:
-                print(f"\n❌ MAIN LOOP ERROR: {e}")
-                traceback.print_exc()
-                
-                error_msg = f"""⚠️ *Bot Error Alert*
-
-Error: `{str(e)[:150]}`
-Time: {datetime.now().strftime('%H:%M:%S')}
-Iteration: {iteration}
-
-Bot will retry in {min(120, POLL_INTERVAL)}s..."""
-                
-                await send_text(session, error_msg)
-                await asyncio.sleep(min(120, POLL_INTERVAL))
-
-# ---------------- Entry Point ----------------
-if __name__ == "__main__":
-    print("""
-    ╔══════════════════════════════════════════════════════════════════════╗
-    ║                    ENHANCED CRYPTO TRADING BOT v2.0                 ║
-    ║                        with Advanced Analytics                       ║
-    ╠══════════════════════════════════════════════════════════════════════╣
-    ║  Features: MACD, RSI, Bollinger Bands, Market Structure Analysis,   ║
-    ║  Volume Confirmation, Pattern Recognition, Performance Tracking      ║
-    ╚══════════════════════════════════════════════════════════════════════╝
-    """)
-    
-    try:
-        asyncio.run(enhanced_loop())
-    except KeyboardInterrupt:
-        print("\n🛑 Bot stopped by user")
-    except Exception as e:
-        print(f"\n💥 FATAL ERROR: {e}")
-        traceback.print_exc()
+    rsi_current = market_data.get("rsi", "

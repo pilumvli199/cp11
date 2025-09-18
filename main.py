@@ -479,7 +479,13 @@ def enhanced_plot_chart(times, candles, symbol, market_data):
     rsi_current = market_data.get("rsi", "N/A")
     volume_status = "📈" if market_data.get("volume_spike") else "📊"
     
-    title = f"{symbol} - Price: {current_price:.6f if current_price < 1 else current_price:.2f} | RSI: {rsi_current} {volume_status}"
+    # Fix price formatting
+    if current_price < 1:
+        price_str = f"{current_price:.6f}"
+    else:
+        price_str = f"{current_price:.2f}"
+    
+    title = f"{symbol} - Price: {price_str} | RSI: {rsi_current} {volume_status}"
     ax1.set_title(title, fontsize=12, fontweight="bold")
     ax1.legend(loc="upper left", fontsize="small")
     ax1.grid(True, alpha=0.3)
@@ -657,7 +663,6 @@ async def enhanced_loop():
                                         )
                                         
                                         # Create comprehensive caption
-                                        price = symbol_data.get("price", 0)
                                         rsi = symbol_data.get("rsi", "N/A")
                                         volume_spike = "🔥 VOLUME SPIKE" if symbol_data.get("volume_spike") else ""
                                         
@@ -665,8 +670,14 @@ async def enhanced_loop():
                                         active_patterns = [k.replace("_", " ").title() for k, v in patterns.items() if v]
                                         pattern_text = f"\n🔍 Patterns: {', '.join(active_patterns)}" if active_patterns else ""
                                         
+                                        # Fix price formatting in caption
+                                        if price < 1:
+                                            price_display = f"{price:.6f}"
+                                        else:
+                                            price_display = f"{price:.2f}"
+                                        
                                         caption = f"""🚨 *{symbol}* → *{action}*
-💰 Price: ${price:.6f if price < 1 else price:.2f}
+💰 Price: ${price_display}
 📊 RSI: {rsi}
 🎯 Confidence: {confidence}%
 {volume_spike}
@@ -697,7 +708,11 @@ async def enhanced_loop():
                                         print(f"Error creating chart for {symbol}: {e}")
                                         
                                         # Send text-only signal if chart fails
-                                        simple_caption = f"🚨 {symbol} → {action}\nPrice: ${price}\nConf: {confidence}%\n{signal['reason']}"
+                                        if price < 1:
+                                            price_display = f"{price:.6f}"
+                                        else:
+                                            price_display = f"{price:.2f}"
+                                        simple_caption = f"🚨 {symbol} → {action}\nPrice: ${price_display}\nConf: {confidence}%\n{signal['reason']}"
                                         await send_text(session, simple_caption)
                                         
                         except Exception as e:

@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
-# main.py - Price-Action Bot (EMA9/20) with multimodal file-upload to OpenAI (gpt-4o-mini)
-# Behavior:
-# 1) Fetch Binance 30m candles (100)
-# 2) Build 100-candle PNG chart with EMA9/20, price-action overlays
-# 3) Upload PNG to OpenAI files endpoint (multipart). If fails -> fallback to base64 embed.
-# 4) Send structured prompt + reference to uploaded file (file_id) + small base64 thumbnail
-# 5) Parse GPT response for SYMBOL - ACTION - ENTRY/SL/TP - CONF and send Telegram message + PNG
+# main.py - Price-Action Bot (EMA9/20) with multimodal file-upload to OpenAI (B) - updated
+# Changes:
+# - upload_file_to_openai default purpose set to "vision"
+# - SIGNAL_CONF_THRESHOLD default lowered to 70.0
 
 import os
 import re
@@ -39,7 +36,8 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-SIGNAL_CONF_THRESHOLD = float(os.getenv("SIGNAL_CONF_THRESHOLD", 80.0))
+# DEFAULT CONFIDENCE THRESHOLD LOWERED TO 70 (can override via .env)
+SIGNAL_CONF_THRESHOLD = float(os.getenv("SIGNAL_CONF_THRESHOLD", 70.0))
 
 RSI_PERIOD = 14
 EMA_SHORT = 9
@@ -110,7 +108,6 @@ def calculate_ema9_20(prices: List[float]) -> Tuple[Optional[float], Optional[fl
     e20 = ema_series(prices, EMA_LONG)
     return round(e9[-1], 6), round(e20[-1], 6), e9, e20
 
-# simplified PA pattern detection & key levels (same as earlier patterns)
 def detect_price_action_patterns(candles: List[List[float]]) -> Dict[str, bool]:
     patterns = {}
     if len(candles) < 5:
@@ -142,6 +139,12 @@ def detect_price_action_patterns(candles: List[List[float]]) -> Dict[str, bool]:
             patterns['shooting_star'] = True
         if lower_wick > body * 2 and upper_wick < body * 0.5 and c > o:
             patterns['hammer'] = True
+    if len(recent) >= 3:
+        highs = [c[1] for c in recent]; lows = [c[2] for c in recent]
+        if (highs[-1] <= highs[-2] and lows[-1] >= lows[-2] and highs[-2] <= highs[-3] and lows[-2] >= lows[-3]):
+            patterns['double_inside_bar'] = True
+        if (highs[-1] > highs[-2] and lows[-1] < lows[-2] and highs[-2] > highs[-3] and lows[-2] < lows[-3]):
+            patterns['double_outside_bar'] = True
     return patterns
 
 def calculate_support_resistance(candles: List[List[float]]) -> Dict[str, float]:
@@ -292,7 +295,6 @@ def enhanced_plot_chart(times, candles, symbol, market_data, out_path=None, img_
     tmp = NamedTemporaryFile(delete=False, suffix=".png")
     fig.savefig(tmp.name, bbox_inches="tight", dpi=120, facecolor="white")
     plt.close(fig)
-    # shrink with PIL & save to out_path or tmp.name
     final_path = out_path if out_path else tmp.name
     try:
         with Image.open(tmp.name) as im:
@@ -300,15 +302,15 @@ def enhanced_plot_chart(times, candles, symbol, market_data, out_path=None, img_
             im.thumbnail(img_maxsize, Image.LANCZOS)
             im.save(final_path, format="PNG", optimize=True)
     except Exception:
-        # if PIL fails, keep tmp
         final_path = tmp.name
     return final_path
 
 # ---------------- OpenAI file upload (multipart) ----------------
-async def upload_file_to_openai(session: aiohttp.ClientSession, file_path: str, purpose: str = "inputs") -> Optional[str]:
+async def upload_file_to_openai(session: aiohttp.ClientSession, file_path: str, purpose: str = "vision") -> Optional[str]:
     """
     Upload file to OpenAI /v1/files endpoint using aiohttp multipart.
     Returns file id on success, else None.
+    Default purpose set to 'vision' (acceptable by OpenAI).
     """
     if not OPENAI_API_KEY:
         print("No OPENAI_API_KEY set.")
@@ -317,11 +319,11 @@ async def upload_file_to_openai(session: aiohttp.ClientSession, file_path: str, 
         with open(file_path, "rb") as f:
             data = aiohttp.FormData()
             data.add_field("file", f, filename=os.path.basename(file_path), content_type="image/png")
-            data.add_field("purpose", purpose)
+            data.add_field("purpose", purpose)  # purpose default now 'vision'
             headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
             async with session.post(OPENAI_FILES_ENDPOINT, data=data, headers=headers, timeout=60) as resp:
                 txt = await resp.text()
-                if resp.status != 200 and resp.status != 201:
+                if resp.status not in (200, 201):
                     print(f"OpenAI file upload failed {resp.status}: {txt[:1000]}")
                     return None
                 try:
@@ -342,11 +344,11 @@ async def ask_openai_with_file(session: aiohttp.ClientSession, market_summary_te
     Try to upload the chart to OpenAI and include file reference in the prompt.
     If upload fails, fallback to small base64 embed.
     """
-    # 1) Try upload
     file_id = None
     if chart_path and os.path.exists(chart_path):
-        file_id = await upload_file_to_openai(session, chart_path, purpose="analysis")
-    # 2) Build small thumbnail base64 (safer to include small image)
+        # call upload with purpose 'vision' (default)
+        file_id = await upload_file_to_openai(session, chart_path, purpose="vision")
+    # make thumbnail base64 (backup)
     thumb_b64 = None
     if chart_path and os.path.exists(chart_path):
         try:
@@ -359,7 +361,6 @@ async def ask_openai_with_file(session: aiohttp.ClientSession, market_summary_te
         except Exception as e:
             print("Thumbnail creation error:", e)
             thumb_b64 = None
-    # 3) Build prompt: include file_id (if present) and small base64 (if available)
     prompt_system = "You are an expert price-action crypto trader. Analyze the provided market summary and chart (image provided as file or thumbnail). Provide high-probability trade setups in the required strict format."
     prompt_user = f"""MARKET SUMMARY (JSON):
 {market_summary_text}
@@ -374,11 +375,9 @@ INSTRUCTIONS:
     if file_id:
         prompt_user += f"\nNOTE: Chart uploaded to OpenAI files with id: {file_id}. Use the image content for visual analysis.\n"
     if thumb_b64:
-        # include as small base64 block for backup
         prompt_user += "\n---BEGIN_THUMBNAIL_BASE64---\n"
         prompt_user += thumb_b64
         prompt_user += "\n---END_THUMBNAIL_BASE64---\n"
-    # Call Chat Completions via OpenAI client if available, else fallback to direct HTTP
     try:
         loop = asyncio.get_running_loop()
         def call_model():
@@ -399,8 +398,7 @@ INSTRUCTIONS:
         except Exception:
             return str(resp)
     except Exception as e:
-        print("OpenAI client chat call failed, falling back to HTTP (this will likely still use your client lib). Error:", e)
-        # As a fallback: send HTTP POST to /v1/chat/completions (careful: depends on model availability)
+        print("OpenAI client chat call failed, falling back to HTTP. Error:", e)
         try:
             headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type":"application/json"}
             payload = {
@@ -415,7 +413,6 @@ INSTRUCTIONS:
                     print("HTTP chat completions failed:", r.status, txt[:1000])
                     return None
                 j = await r.json()
-                # try to extract text
                 try:
                     return j["choices"][0]["message"]["content"].strip()
                 except Exception:
@@ -565,7 +562,6 @@ async def enhanced_loop():
                             chart_path = enhanced_plot_chart(data["times"], data["candles"], symbol, data, img_maxsize=(1000,800))
                         except Exception as e:
                             print("Chart error:", e)
-                    # call OpenAI with file upload attempt
                     ai_resp = await ask_openai_with_file(session, summary_text, chart_path)
                     print(f"--- GPT raw for {symbol} ---\n{(ai_resp or '<empty>')[:3000]}\n--- end ---")
                     parsed = enhanced_parse(ai_resp or "")
@@ -625,7 +621,7 @@ _Reason:_ {reason}
                 await asyncio.sleep(min(120, POLL_INTERVAL))
 
 if __name__ == "__main__":
-    print("Starting Price-Action Bot (EMA9/20) with multimodal file-upload (B)...")
+    print("Starting Price-Action Bot (EMA9/20) with multimodal file-upload (B) - updated")
     try:
         asyncio.run(enhanced_loop())
     except KeyboardInterrupt:

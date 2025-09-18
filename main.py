@@ -23,10 +23,17 @@ from tempfile import NamedTemporaryFile
 import numpy as np
 import json
 from typing import Dict, List, Optional, Tuple, Union
-import pandas as pd
 from dataclasses import dataclass
 
+# Load env
 load_dotenv()
+
+# Optional: guarded import for pandas (prevents crash if not installed)
+try:
+    import pandas as pd
+except Exception:
+    pd = None
+    print("⚠️ pandas not installed. To enable full dataframe features, add pandas to requirements.txt and reinstall.")
 
 # Enhanced Configuration
 SYMBOLS = [
@@ -454,8 +461,8 @@ class SignalGenerator:
         ]
         
         # Require at least 4 out of 6 conditions
-        bullish_score = sum(bullish_conditions)
-        bearish_score = sum(bearish_conditions)
+        bullish_score = sum(bool(x) for x in bullish_conditions)
+        bearish_score = sum(bool(x) for x in bearish_conditions)
         
         if bullish_score >= 4 and nearest_support:
             return self._create_buy_signal(symbol, price, nearest_support, resistances, alignment, volume_ok)
@@ -479,7 +486,7 @@ class SignalGenerator:
             risk = entry_price - stop_loss
             take_profit = entry_price + (risk * MIN_RISK_REWARD_RATIO)
         
-        risk_reward = (take_profit - entry_price) / (entry_price - stop_loss)
+        risk_reward = (take_profit - entry_price) / (entry_price - stop_loss) if (entry_price - stop_loss) != 0 else 0.0
         
         # Calculate confidence
         confidence = self._calculate_confidence(alignment, volume_ok, risk_reward)
@@ -495,8 +502,8 @@ class SignalGenerator:
             confidence=confidence,
             reason=reason,
             risk_reward_ratio=risk_reward,
-            timestamp=datetime.now(),
-            timeframes_aligned=alignment['trend_alignment'],
+            timestamp=datetime.utcnow(),
+            timeframes_aligned=alignment.get('trend_alignment', False),
             volume_confirmed=volume_ok
         )
     
@@ -515,7 +522,7 @@ class SignalGenerator:
             risk = stop_loss - entry_price
             take_profit = entry_price - (risk * MIN_RISK_REWARD_RATIO)
         
-        risk_reward = (entry_price - take_profit) / (stop_loss - entry_price)
+        risk_reward = (entry_price - take_profit) / (stop_loss - entry_price) if (stop_loss - entry_price) != 0 else 0.0
         
         # Calculate confidence
         confidence = self._calculate_confidence(alignment, volume_ok, risk_reward)
@@ -531,8 +538,8 @@ class SignalGenerator:
             confidence=confidence,
             reason=reason,
             risk_reward_ratio=risk_reward,
-            timestamp=datetime.now(),
-            timeframes_aligned=alignment['trend_alignment'],
+            timestamp=datetime.utcnow(),
+            timeframes_aligned=alignment.get('trend_alignment', False),
             volume_confirmed=volume_ok
         )
     
@@ -542,11 +549,11 @@ class SignalGenerator:
         base_confidence = 60.0
         
         # Timeframe alignment bonus
-        if alignment['trend_alignment']:
+        if alignment.get('trend_alignment'):
             base_confidence += 10
-        if alignment['rsi_alignment']:
+        if alignment.get('rsi_alignment'):
             base_confidence += 8
-        if alignment['ema_alignment']:
+        if alignment.get('ema_alignment'):
             base_confidence += 7
         
         # Volume confirmation
@@ -640,8 +647,11 @@ class EnhancedChartGenerator:
         ax_main.set_facecolor('black')
         ax_main.tick_params(colors='white')
         ax_main.grid(True, alpha=0.3, color='gray')
-        ax_main.legend(loc='upper left', facecolor='black', edgecolor='white', 
-                      labelcolor='white', fontsize=10)
+        try:
+            ax_main.legend(loc='upper left', facecolor='black', edgecolor='white', 
+                          labelcolor='white', fontsize=10)
+        except Exception:
+            pass
         
         # Title with signal info
         title = f"{signal.symbol} - {signal.action} Signal | Confidence: {signal.confidence:.1f}% | R:R: {signal.risk_reward_ratio:.2f}"
@@ -718,7 +728,7 @@ class AIAnalysisEngine:
                     ai_confirmation = await self._get_ai_confirmation(signal, session)
                     
                     if ai_confirmation['confirmed']:
-                        signal.confidence = min(signal.confidence * ai_confirmation['multiplier'], 98.0)
+                        signal.confidence = min(signal.confidence * ai_confirmation.get('multiplier', 1.0), 98.0)
                         high_quality_signals.append(signal)
                         print(f"✅ High-quality signal confirmed: {symbol} {signal.action} ({signal.confidence:.1f}%)")
                 
@@ -887,7 +897,7 @@ class TelegramNotifier:
         if iteration % 20 != 0:  # Every 20 iterations
             return
         
-        current_time = datetime.now().strftime('%H:%M:%S UTC')
+        current_time = datetime.utcnow().strftime('%H:%M:%S UTC')
         
         message = f"""🤖 **Bot Status Update - Iteration {iteration}**
 
@@ -943,7 +953,7 @@ class EnhancedTradingBot:
                 try:
                     self.iteration += 1
                     print(f"\n🔄 Starting enhanced analysis - Iteration {self.iteration}")
-                    print(f"⏰ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}")
+                    print(f"⏰ Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
                     
                     # Analyze market for high-quality signals
                     signals = await self.ai_engine.analyze_market_with_ai(session, SYMBOLS)
@@ -1063,7 +1073,7 @@ Only signals with 85%+ confidence and proper risk management will be sent.
 
 🔄 **Action:** Retrying in 5 minutes
 📊 **Status:** Bot continues running
-⏰ **Time:** {datetime.now().strftime('%H:%M:%S UTC')}"""
+⏰ **Time:** {datetime.utcnow().strftime('%H:%M:%S UTC')}"""
 
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         
@@ -1090,6 +1100,7 @@ if __name__ == "__main__":
     print(f"🔧 Enhanced Analysis: Multi-timeframe + AI confirmation")
     print("="*60)
     
+
     if not OPENAI_API_KEY:
         print("⚠️ WARNING: OPENAI_API_KEY not found. AI analysis disabled.")
     

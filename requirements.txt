@@ -9,12 +9,14 @@ aiohttp==3.8.4
 # Environment
 python-dotenv==1.0.0
 
-# OpenAI client (use the version matching your code)
+# OpenAI client
 openai==1.3.5
 
 # Telegram
 python-telegram-bot==20.6
 
-# Other utilities you used earlier
-ta-lib==0.4.28
+# Use pandas_ta instead of ta-lib (pure python)
+pandas_ta==0.3.0b0
+
+# Other
 schedule==1.2.0

@@ -1,10 +1,19 @@
-# main.py - Price Action Focused Crypto Bot with Reduced Indicators
+#!/usr/bin/env python3
+# main.py - Price-Action Bot (EMA9/20) with multimodal file-upload to OpenAI (gpt-4o-mini)
+# Behavior:
+# 1) Fetch Binance 30m candles (100)
+# 2) Build 100-candle PNG chart with EMA9/20, price-action overlays
+# 3) Upload PNG to OpenAI files endpoint (multipart). If fails -> fallback to base64 embed.
+# 4) Send structured prompt + reference to uploaded file (file_id) + small base64 thumbnail
+# 5) Parse GPT response for SYMBOL - ACTION - ENTRY/SL/TP - CONF and send Telegram message + PNG
+
 import os
 import re
 import asyncio
 import aiohttp
 import traceback
 import numpy as np
+import base64
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -15,6 +24,8 @@ from matplotlib.dates import date2num
 from tempfile import NamedTemporaryFile
 from typing import Dict, List, Optional, Tuple
 import json
+from io import BytesIO
+from PIL import Image  # Pillow must be installed
 
 load_dotenv()
 
@@ -27,279 +38,154 @@ POLL_INTERVAL = max(30, int(os.getenv("POLL_INTERVAL", 1800)))
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 SIGNAL_CONF_THRESHOLD = float(os.getenv("SIGNAL_CONF_THRESHOLD", 80.0))
 
-# Simplified Analysis - Focus on Price Action
 RSI_PERIOD = 14
-MA_SHORT = 7
-MA_MEDIUM = 21
-MA_LONG = 50
-VOLUME_MULTIPLIER = 2.0  # Higher threshold for volume spikes
+EMA_SHORT = 9
+EMA_LONG = 20
+VOLUME_MULTIPLIER = 2.0
 MIN_CANDLES_FOR_ANALYSIS = 30
 LOOKBACK_PERIOD = 100
-FIBONACCI_LEVELS = [0.236, 0.382, 0.5, 0.618, 0.786]
 
-# Market condition tracking
 price_history: Dict[str, List[Dict]] = {}
-signal_history: List[Dict] = []
-market_sentiment: Dict[str, str] = {}  # bullish/bearish/neutral
-last_signals: Dict[str, datetime] = {}  # prevent spam signals
+last_signals: Dict[str, datetime] = {}
 performance_tracking: List[Dict] = []
 
+# OpenAI client (used for non-file chat calls; file upload done via direct HTTP below)
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 TICKER_URL = "https://api.binance.com/api/v3/ticker/24hr?symbol={symbol}"
 CANDLE_URL = "https://api.binance.com/api/v3/klines?symbol={symbol}&interval=30m&limit=100"
 ORDER_BOOK_URL = "https://api.binance.com/api/v3/depth?symbol={symbol}&limit=20"
+OPENAI_FILES_ENDPOINT = "https://api.openai.com/v1/files"
 
-# ---------------- Utility formatters ----------------
+# ---------------- utils ----------------
 def fmt_price(p: Optional[float]) -> str:
-    """Format numeric price: 6 decimals for sub-1 prices, 2 decimals otherwise."""
     if p is None:
         return "N/A"
     try:
         v = float(p)
-    except Exception:
+    except:
         return str(p)
     return f"{v:.6f}" if abs(v) < 1 else f"{v:.2f}"
 
-def fmt_decimal(val, small_prec=6, large_prec=2) -> str:
-    """Format a decimal with different precision depending on magnitude."""
+def fmt_decimal(val, s=6, l=2) -> str:
     if val is None:
         return "N/A"
     try:
         v = float(val)
-    except Exception:
+    except:
         return str(val)
-    return f"{v:.{small_prec}f}" if abs(v) < 1 else f"{v:.{large_prec}f}"
+    return f"{v:.{s}f}" if abs(v) < 1 else f"{v:.{l}f}"
 
-# ---------------- Simplified Indicators ----------------
-def calculate_rsi(prices: List[float], period: int = 14) -> Optional[float]:
-    """Simplified RSI calculation"""
+# ---------------- price-action helpers ----------------
+def calculate_rsi(prices: List[float], period: int = RSI_PERIOD) -> Optional[float]:
     if len(prices) < period + 1:
         return None
-    
     deltas = np.diff(prices)
     gains = np.where(deltas > 0, deltas, 0)
     losses = np.where(deltas < 0, -deltas, 0)
-    
     avg_gain = np.mean(gains[:period])
     avg_loss = np.mean(losses[:period])
-    
     if avg_loss == 0:
         return 100.0
-    
     rs = avg_gain / avg_loss
     rsi = 100 - (100 / (1 + rs))
     return round(rsi, 2)
 
-def calculate_market_structure(candles: List[List[float]]) -> Dict[str, any]:
-    """Analyze market structure - Higher Highs, Lower Lows etc. (PRICE ACTION FOCUS)"""
-    if len(candles) < 10:
-        return {}
-    
-    highs = [c[1] for c in candles]
-    lows = [c[2] for c in candles]
-    closes = [c[3] for c in candles]
-    
-    # Find peaks and troughs
-    peaks = []
-    troughs = []
-    
-    for i in range(2, len(highs) - 2):
-        if highs[i] > highs[i-1] and highs[i] > highs[i+1]:
-            peaks.append((i, highs[i]))
-        if lows[i] < lows[i-1] and lows[i] < lows[i+1]:
-            troughs.append((i, lows[i]))
-    
-    structure = {"trend": "sideways", "strength": 0, "swings": []}
-    
-    # Analyze swing points for price action
-    if len(peaks) >= 2 and len(troughs) >= 2:
-        # Check for higher highs and higher lows (uptrend)
-        if peaks[-1][1] > peaks[-2][1] and troughs[-1][1] > troughs[-2][1]:
-            structure["trend"] = "uptrend"
-            structure["strength"] = 2
-        # Check for lower highs and lower lows (downtrend)
-        elif peaks[-1][1] < peaks[-2][1] and troughs[-1][1] < troughs[-2][1]:
-            structure["trend"] = "downtrend"
-            structure["strength"] = 2
-    
-    # Recent price action analysis
-    recent_closes = closes[-5:]
-    structure["recent_momentum"] = "neutral"
-    if len(recent_closes) >= 3:
-        if recent_closes[-1] > recent_closes[-2] > recent_closes[-3]:
-            structure["recent_momentum"] = "bullish"
-        elif recent_closes[-1] < recent_closes[-2] < recent_closes[-3]:
-            structure["recent_momentum"] = "bearish"
-    
-    return structure
+def ema_series(prices: List[float], span: int) -> List[float]:
+    if not prices:
+        return []
+    alpha = 2 / (span + 1)
+    out = [prices[0]]
+    for p in prices[1:]:
+        out.append(alpha * p + (1 - alpha) * out[-1])
+    return out
 
-def enhanced_volume_analysis(volumes: List[float], prices: List[float]) -> Dict[str, any]:
-    """Enhanced volume analysis with focus on price-volume relationship"""
-    if len(volumes) < 20:
-        return {}
-    
-    recent_volumes = volumes[-20:]
-    avg_volume = np.mean(recent_volumes[:-1])
-    current_volume = volumes[-1]
-    
-    volume_ratio = current_volume / avg_volume if avg_volume > 0 else 0
-    
-    # Price-Volume relationship (PRICE ACTION FOCUS)
-    price_change = (prices[-1] - prices[-2]) / prices[-2] if len(prices) >= 2 else 0
-    
-    analysis = {
-        "volume_spike": volume_ratio > VOLUME_MULTIPLIER,
-        "volume_ratio": round(volume_ratio, 2),
-        "price_volume_confirmation": False,
-        "volume_trend": "neutral"
-    }
-    
-    # Volume trend analysis
-    if len(volumes) >= 5:
-        volume_ma_short = np.mean(volumes[-5:])
-        volume_ma_long = np.mean(volumes[-20:])
-        if volume_ma_short > volume_ma_long * 1.2:
-            analysis["volume_trend"] = "increasing"
-        elif volume_ma_short < volume_ma_long * 0.8:
-            analysis["volume_trend"] = "decreasing"
-    
-    # Volume confirms price movement (KEY PRICE ACTION CONCEPT)
-    if abs(price_change) > 0.008:  # 0.8% price change
-        if (price_change > 0 and volume_ratio > 1.5) or (price_change < 0 and volume_ratio > 1.5):
-            analysis["price_volume_confirmation"] = True
-    
-    return analysis
+def calculate_ema9_20(prices: List[float]) -> Tuple[Optional[float], Optional[float], List[float], List[float]]:
+    if len(prices) < 2:
+        return None, None, [], []
+    e9 = ema_series(prices, EMA_SHORT)
+    e20 = ema_series(prices, EMA_LONG)
+    return round(e9[-1], 6), round(e20[-1], 6), e9, e20
 
+# simplified PA pattern detection & key levels (same as earlier patterns)
 def detect_price_action_patterns(candles: List[List[float]]) -> Dict[str, bool]:
-    """Detect price action patterns (simplified and focused)"""
-    if len(candles) < 5:
-        return {}
-    
     patterns = {}
+    if len(candles) < 5:
+        return patterns
     recent = candles[-5:]
-    
-    # Support and Resistance breaks
+    closes = [c[3] for c in recent]
     highs = [c[1] for c in recent]
     lows = [c[2] for c in recent]
-    closes = [c[3] for c in recent]
     opens = [c[0] for c in recent]
-    
-    # Key resistance/support breaks
     if len(candles) > 20:
         prev_high = max([c[1] for c in candles[-21:-1]])
         prev_low = min([c[2] for c in candles[-21:-1]])
-        
         if closes[-1] > prev_high:
             patterns['resistance_break'] = True
         if closes[-1] < prev_low:
             patterns['support_break'] = True
-    
-    # Simple candlestick patterns
-    for i, candle in enumerate(recent):
-        open_price, high, low, close = candle
-        body = abs(close - open_price)
-        upper_wick = high - max(open_price, close)
-        lower_wick = min(open_price, close) - low
-        range_size = high - low
-        
-        if range_size == 0:
-            continue
-            
-        # Focus on high-probability patterns only
-        if i == len(recent) - 1:  # Current candle
-            # Engulfing patterns
-            if i > 0:
-                prev_open, prev_high, prev_low, prev_close = recent[i-1]
-                prev_body = abs(prev_close - prev_open)
-                
-                # Bullish engulfing
-                if (close > open_price and prev_close < prev_open and 
-                    close > prev_open and open_price < prev_close and
-                    body > prev_body * 1.2):
-                    patterns['bullish_engulfing'] = True
-                
-                # Bearish engulfing
-                if (close < open_price and prev_close > prev_open and 
-                    close < prev_open and open_price > prev_close and
-                    body > prev_body * 1.2):
-                    patterns['bearish_engulfing'] = True
-            
-            # Pin bars (simplified)
-            if (upper_wick > body * 2 and lower_wick < body * 0.5 and 
-                close < open_price):
-                patterns['shooting_star'] = True
-            
-            if (lower_wick > body * 2 and upper_wick < body * 0.5 and 
-                close > open_price):
-                patterns['hammer'] = True
-    
-    # Multi-candle patterns
-    if len(recent) >= 3:
-        # Inside bars (consolidation)
-        if (highs[-1] <= highs[-2] and lows[-1] >= lows[-2] and
-            highs[-2] <= highs[-3] and lows[-2] >= lows[-3]):
-            patterns['double_inside_bar'] = True
-        
-        # Outside bars (breakout potential)
-        if (highs[-1] > highs[-2] and lows[-1] < lows[-2] and
-            highs[-2] > highs[-3] and lows[-2] < lows[-3]):
-            patterns['double_outside_bar'] = True
-    
+    if len(recent) >= 2:
+        o, h, l, c = recent[-1]
+        po, ph, pl, pc = recent[-2]
+        body = abs(c - o)
+        prev_body = abs(pc - po)
+        if c > o and pc < po and c > po and o < pc and body > prev_body * 1.2:
+            patterns['bullish_engulfing'] = True
+        if c < o and pc > po and c < po and o > pc and body > prev_body * 1.2:
+            patterns['bearish_engulfing'] = True
+        upper_wick = h - max(o,c)
+        lower_wick = min(o,c) - l
+        if upper_wick > body * 2 and lower_wick < body * 0.5 and c < o:
+            patterns['shooting_star'] = True
+        if lower_wick > body * 2 and upper_wick < body * 0.5 and c > o:
+            patterns['hammer'] = True
     return patterns
 
 def calculate_support_resistance(candles: List[List[float]]) -> Dict[str, float]:
-    """Calculate key support and resistance levels from price action"""
+    levels = {}
     if len(candles) < 20:
-        return {}
-    
-    highs = [c[1] for c in candles]
-    lows = [c[2] for c in candles]
-    closes = [c[3] for c in candles]
-    
-    # Recent swing points
-    swing_highs = []
-    swing_lows = []
-    
-    for i in range(2, len(highs) - 2):
+        return levels
+    highs = [c[1] for c in candles]; lows = [c[2] for c in candles]
+    swing_highs = []; swing_lows = []
+    for i in range(2, len(highs)-2):
         if highs[i] > highs[i-1] and highs[i] > highs[i+1]:
             swing_highs.append(highs[i])
         if lows[i] < lows[i-1] and lows[i] < lows[i+1]:
             swing_lows.append(lows[i])
-    
-    levels = {}
-    
     if swing_highs:
         levels['resistance_1'] = max(swing_highs[-3:]) if len(swing_highs) >= 3 else swing_highs[-1]
-        levels['resistance_2'] = max(swing_highs) if swing_highs else None
-    
     if swing_lows:
         levels['support_1'] = min(swing_lows[-3:]) if len(swing_lows) >= 3 else swing_lows[-1]
-        levels['support_2'] = min(swing_lows) if swing_lows else None
-    
-    # Current price relative to levels
-    current_price = closes[-1]
+    closes = [c[3] for c in candles]; cp = closes[-1]
     if levels:
-        if 'resistance_1' in levels and levels['resistance_1']:
-            levels['distance_to_resistance'] = ((levels['resistance_1'] - current_price) / current_price) * 100
-        if 'support_1' in levels and levels['support_1']:
-            levels['distance_to_support'] = ((current_price - levels['support_1']) / current_price) * 100
-    
+        if 'resistance_1' in levels:
+            levels['distance_to_resistance'] = ((levels['resistance_1'] - cp) / cp) * 100
+        if 'support_1' in levels:
+            levels['distance_to_support'] = ((cp - levels['support_1']) / cp) * 100
     return levels
 
-# ---------------- Enhanced Data Fetching ----------------
+# ---------------- Fetching ----------------
+async def fetch_json(session, url):
+    try:
+        async with session.get(url, timeout=25) as r:
+            if r.status != 200:
+                txt = await r.text()
+                print(f"fetch_json {url} returned {r.status}: {txt[:200]}")
+                return None
+            return await r.json()
+    except Exception as e:
+        print("fetch_json exception for", url, e)
+        return None
+
 async def fetch_enhanced_data(session, symbol):
     ticker_task = fetch_json(session, TICKER_URL.format(symbol=symbol))
     candle_task = fetch_json(session, CANDLE_URL.format(symbol=symbol))
     orderbook_task = fetch_json(session, ORDER_BOOK_URL.format(symbol=symbol))
-    
     ticker, candles, orderbook = await asyncio.gather(ticker_task, candle_task, orderbook_task)
-    
     out = {}
-    
     if ticker:
         try:
             out["price"] = float(ticker.get("lastPrice", 0))
@@ -309,472 +195,441 @@ async def fetch_enhanced_data(session, symbol):
             out["low_24h"] = float(ticker.get("lowPrice", 0))
             out["quote_volume"] = float(ticker.get("quoteVolume", 0))
         except Exception as e:
-            print(f"Error processing ticker for {symbol}: {e}")
+            print("Error processing ticker:", e)
             out["price"] = None
-    
     if isinstance(candles, list) and len(candles) >= MIN_CANDLES_FOR_ANALYSIS:
         try:
-            # Parse candle data
-            parsed_candles = []
-            times = []
-            volumes = []
-            
+            parsed_candles = []; times = []; volumes = []
             for x in candles:
-                open_price = float(x[1])
-                high = float(x[2])
-                low = float(x[3])
-                close = float(x[4])
-                volume = float(x[5])
+                open_price = float(x[1]); high = float(x[2]); low = float(x[3]); close = float(x[4]); volume = float(x[5])
                 timestamp = int(x[0]) // 1000
-                
                 parsed_candles.append([open_price, high, low, close])
-                times.append(timestamp)
-                volumes.append(volume)
-            
-            out["candles"] = parsed_candles
-            out["times"] = times
-            out["volumes"] = volumes
-            
-            # Calculate simplified indicators (PRICE ACTION FOCUS)
+                times.append(timestamp); volumes.append(volume)
+            out["candles"] = parsed_candles; out["times"] = times; out["volumes"] = volumes
             closes = [c[3] for c in parsed_candles]
-            highs = [c[1] for c in parsed_candles]
-            lows = [c[2] for c in parsed_candles]
-            
-            # Basic indicators only
             out["rsi"] = calculate_rsi(closes, RSI_PERIOD)
-            out["ma_short"] = sum(closes[-MA_SHORT:]) / MA_SHORT if len(closes) >= MA_SHORT else None
-            out["ma_medium"] = sum(closes[-MA_MEDIUM:]) / MA_MEDIUM if len(closes) >= MA_MEDIUM else None
-            out["ma_long"] = sum(closes[-MA_LONG:]) / MA_LONG if len(closes) >= MA_LONG else None
-            
-            # Price action analysis (FOCUS AREA)
-            out["market_structure"] = calculate_market_structure(parsed_candles)
-            out["volume_analysis"] = enhanced_volume_analysis(volumes, closes)
+            out["ema9"], out["ema20"], out["ema9_series"], out["ema20_series"] = calculate_ema9_20(closes)
             out["patterns"] = detect_price_action_patterns(parsed_candles)
             out["key_levels"] = calculate_support_resistance(parsed_candles)
-                
+            # order book derived
+            if orderbook:
+                bids = [(float(x[0]), float(x[1])) for x in orderbook.get("bids", [])]
+                asks = [(float(x[0]), float(x[1])) for x in orderbook.get("asks", [])]
+                if bids and asks:
+                    out["bid"] = bids[0][0]; out["ask"] = asks[0][0]
+                    avg_bid = np.mean([b[1] for b in bids[:5]]) if bids else 0
+                    avg_ask = np.mean([a[1] for a in asks[:5]]) if asks else 0
+                    sig_bids = [x for x in bids if x[1] > avg_bid*2]
+                    sig_asks = [x for x in asks if x[1] > avg_ask*2]
+                    out["ob_support"] = sig_bids[0][0] if sig_bids else None
+                    out["ob_resistance"] = sig_asks[0][0] if sig_asks else None
         except Exception as e:
-            print(f"Enhanced candle processing error for {symbol}: {e}")
+            print("Candle processing error:", e)
             traceback.print_exc()
-    
-    # Order book analysis for key levels
-    if orderbook:
-        try:
-            bids = [(float(x[0]), float(x[1])) for x in orderbook.get("bids", [])]
-            asks = [(float(x[0]), float(x[1])) for x in orderbook.get("asks", [])]
-            
-            if bids and asks:
-                out["bid"] = bids[0][0]
-                out["ask"] = asks[0][0]
-                out["spread"] = asks[0][0] - bids[0][0]
-                out["spread_pct"] = (out["spread"] / bids[0][0]) * 100
-                
-                # Significant order clusters
-                avg_bid_size = np.mean([x[1] for x in bids[:5]])
-                avg_ask_size = np.mean([x[1] for x in asks[:5]])
-                
-                significant_bids = [x for x in bids if x[1] > avg_bid_size * 2]
-                significant_asks = [x for x in asks if x[1] > avg_ask_size * 2]
-                
-                out["ob_support"] = significant_bids[0][0] if significant_bids else None
-                out["ob_resistance"] = significant_asks[0][0] if significant_asks else None
-                
-        except Exception as e:
-            print(f"Order book processing error for {symbol}: {e}")
-    
-    # Update price history
-    if symbol not in price_history:
-        price_history[symbol] = []
-    
     if out.get("price") is not None:
-        price_history[symbol].append({
-            "price": out["price"],
-            "timestamp": datetime.now(),
-            "volume": out.get("volume", 0),
-            "rsi": out.get("rsi")
-        })
-        
+        price_history.setdefault(symbol, []).append({"price": out["price"], "timestamp": datetime.now()})
         if len(price_history[symbol]) > 200:
             price_history[symbol] = price_history[symbol][-200:]
-    
     return out
 
-async def fetch_json(session, url):
+# ---------------- Charting ----------------
+def enhanced_plot_chart(times, candles, symbol, market_data, out_path=None, img_maxsize=(1000,800)):
+    if not times or not candles or len(times) != len(candles) or len(candles) < 10:
+        raise ValueError("Insufficient data for plotting")
+    dates = [datetime.utcfromtimestamp(int(t)) for t in times]
+    closes = [c[3] for c in candles]; highs = [c[1] for c in candles]; lows = [c[2] for c in candles]
+    x = date2num(dates)
+    fig = plt.figure(figsize=(14,9), dpi=120, constrained_layout=True)
+    gs = fig.add_gridspec(3,1, height_ratios=[3,1,1], hspace=0.25)
+    ax_price = fig.add_subplot(gs[0]); ax_vol = fig.add_subplot(gs[1]); ax_rsi = fig.add_subplot(gs[2])
+    width = 0.6*(x[1]-x[0]) if len(x)>1 else 0.4
+    for xi, candle in zip(x, candles):
+        o,h,l,c = candle
+        color = "#006600" if c>=o else "#660000"
+        ax_price.vlines(xi, l, h, color=color, linewidth=1.1, alpha=0.9)
+        rect_h = abs(c-o) if abs(c-o)>0.0001 else 0.0001
+        rect = plt.Rectangle((xi-width/2, min(o,c)), width, rect_h, facecolor=color, edgecolor=color, alpha=0.9)
+        ax_price.add_patch(rect)
+    # EMAs
+    e9 = market_data.get("ema9_series", []); e20 = market_data.get("ema20_series", [])
+    if e9 and e20 and len(e9) == len(x):
+        ax_price.plot(x, e9, linewidth=1.2, label=f"EMA{EMA_SHORT}")
+        ax_price.plot(x, e20, linewidth=1.2, label=f"EMA{EMA_LONG}")
+    # key levels
+    kl = market_data.get("key_levels", {})
+    if kl.get("support_1"):
+        ax_price.axhline(kl["support_1"], color="blue", linestyle="--", linewidth=1.4, label=f"S1 {fmt_price(kl['support_1'])}")
+    if kl.get("resistance_1"):
+        ax_price.axhline(kl["resistance_1"], color="red", linestyle="--", linewidth=1.4, label=f"R1 {fmt_price(kl['resistance_1'])}")
+    # volume
+    vols = market_data.get("volumes", [])
+    if vols and len(vols) == len(x):
+        colors = []
+        for i in range(len(candles)):
+            if i==0: colors.append("gray")
+            elif candles[i][3] >= candles[i-1][3]: colors.append("green")
+            else: colors.append("red")
+        ax_vol.bar(x, vols, width=width, color=colors, alpha=0.7)
+        ax_vol.set_ylabel("Vol")
+    # rsi
+    if len(closes) >= RSI_PERIOD + 5:
+        rsi_vals = []
+        for i in range(RSI_PERIOD, len(closes)):
+            r = calculate_rsi(closes[:i+1], RSI_PERIOD)
+            if r is not None:
+                rsi_vals.append(r)
+        if rsi_vals:
+            rx = x[-len(rsi_vals):]
+            ax_rsi.plot(rx, rsi_vals, linewidth=1.1)
+            ax_rsi.axhline(70, linestyle="--", alpha=0.6); ax_rsi.axhline(30, linestyle="--", alpha=0.6)
+            ax_rsi.set_ylim(0,100)
+    current_price = closes[-1]
+    title = f"{symbol} | Price: ${fmt_price(current_price)} | EMA{EMA_SHORT}: {fmt_decimal(market_data.get('ema9'))} EMA{EMA_LONG}: {fmt_decimal(market_data.get('ema20'))}"
+    ax_price.set_title(title, fontsize=12, fontweight="bold")
+    ax_price.legend(loc="upper left", fontsize="small")
+    ax_price.grid(alpha=0.25)
+    fig.autofmt_xdate()
+    tmp = NamedTemporaryFile(delete=False, suffix=".png")
+    fig.savefig(tmp.name, bbox_inches="tight", dpi=120, facecolor="white")
+    plt.close(fig)
+    # shrink with PIL & save to out_path or tmp.name
+    final_path = out_path if out_path else tmp.name
     try:
-        async with session.get(url, timeout=20) as r:
-            if r.status != 200:
-                txt = await r.text() if r is not None else "<no body>"
-                print(f"fetch_json {url} returned {r.status}: {txt[:200]}")
-                return None
-            return await r.json()
+        with Image.open(tmp.name) as im:
+            im = im.convert("RGB")
+            im.thumbnail(img_maxsize, Image.LANCZOS)
+            im.save(final_path, format="PNG", optimize=True)
+    except Exception:
+        # if PIL fails, keep tmp
+        final_path = tmp.name
+    return final_path
+
+# ---------------- OpenAI file upload (multipart) ----------------
+async def upload_file_to_openai(session: aiohttp.ClientSession, file_path: str, purpose: str = "inputs") -> Optional[str]:
+    """
+    Upload file to OpenAI /v1/files endpoint using aiohttp multipart.
+    Returns file id on success, else None.
+    """
+    if not OPENAI_API_KEY:
+        print("No OPENAI_API_KEY set.")
+        return None
+    try:
+        with open(file_path, "rb") as f:
+            data = aiohttp.FormData()
+            data.add_field("file", f, filename=os.path.basename(file_path), content_type="image/png")
+            data.add_field("purpose", purpose)
+            headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+            async with session.post(OPENAI_FILES_ENDPOINT, data=data, headers=headers, timeout=60) as resp:
+                txt = await resp.text()
+                if resp.status != 200 and resp.status != 201:
+                    print(f"OpenAI file upload failed {resp.status}: {txt[:1000]}")
+                    return None
+                try:
+                    j = await resp.json()
+                    file_id = j.get("id") or j.get("file_id") or j.get("name")
+                    print("Uploaded file, response keys:", list(j.keys()))
+                    return file_id
+                except Exception:
+                    print("Upload returned non-json:", txt[:500])
+                    return None
     except Exception as e:
-        print("fetch_json exception for", url, e)
+        print("upload_file_to_openai exception:", e)
         return None
 
-# ---------------- Enhanced AI Analysis with Price Action Focus ----------------
-async def enhanced_analyze_openai(market):
-    if not client:
-        print("No OpenAI client configured.")
-        return None
-    
-    # Prepare comprehensive market analysis with price action focus
-    market_summary = []
-    price_action_signals = []
-    
-    for symbol, data in market.items():
-        if not data.get("price"):
-            continue
-        
-        # Basic data
-        price = data["price"]
-        rsi = data.get("rsi")
-        volume_analysis = data.get("volume_analysis", {})
-        market_structure = data.get("market_structure", {})
-        patterns = data.get("patterns", {})
-        key_levels = data.get("key_levels", {})
-        
-        # Price action signal strength calculation
-        signal_strength = 0
-        signal_direction = "neutral"
-        reasons = []
-        
-        # Market structure signals
-        trend = market_structure.get("trend", "sideways")
-        momentum = market_structure.get("recent_momentum", "neutral")
-        
-        if trend != "sideways":
-            signal_strength += 1
-            reasons.append(f"Trend: {trend}")
-        
-        if momentum != "neutral":
-            signal_strength += 1
-            signal_direction = momentum
-            reasons.append(f"Momentum: {momentum}")
-        
-        # Key level breaks (STRONG PRICE ACTION SIGNAL)
-        if patterns.get('resistance_break'):
-            signal_strength += 3
-            signal_direction = "bullish"
-            reasons.append("Resistance break")
-        elif patterns.get('support_break'):
-            signal_strength += 3
-            signal_direction = "bearish"
-            reasons.append("Support break")
-        
-        # Candlestick patterns
-        if patterns.get('bullish_engulfing'):
-            signal_strength += 2
-            signal_direction = "bullish"
-            reasons.append("Bullish engulfing")
-        elif patterns.get('bearish_engulfing'):
-            signal_strength += 2
-            signal_direction = "bearish"
-            reasons.append("Bearish engulfing")
-        
-        if patterns.get('hammer'):
-            signal_strength += 1
-            if signal_direction != "bearish":
-                signal_direction = "bullish"
-            reasons.append("Hammer pattern")
-        elif patterns.get('shooting_star'):
-            signal_strength += 1
-            if signal_direction != "bullish":
-                signal_direction = "bearish"
-            reasons.append("Shooting star")
-        
-        # Volume confirmation
-        if volume_analysis.get("price_volume_confirmation"):
-            signal_strength += 2
-            reasons.append("Volume confirms price move")
-        
-        # RSI for confluence only
-        if rsi:
-            if rsi < 35 and signal_direction == "bullish":
-                signal_strength += 1
-                reasons.append("RSI oversold")
-            elif rsi > 65 and signal_direction == "bearish":
-                signal_strength += 1
-                reasons.append("RSI overbought")
-        
-        # Create summary with price action focus
-        summary = f"""
-{symbol}: Price=${fmt_price(price)}, RSI={rsi}, Change24h={data.get('price_change_24h', 0):.2f}%
-- Trend: {trend}, Momentum: {momentum}
-- Volume: {volume_analysis.get('volume_ratio', 0):.2f}x avg, Spike={volume_analysis.get('volume_spike', False)}
-- Patterns: {list(patterns.keys())}
-- Key Levels: S1={fmt_price(key_levels.get('support_1'))}, R1={fmt_price(key_levels.get('resistance_1'))}
-- Signal Strength: {signal_strength}/10, Direction: {signal_direction}"""
-        
-        market_summary.append(summary)
-        
-        # Only include symbols with strong price action signals
-        if signal_strength >= 4:
-            price_action_signals.append({
-                "symbol": symbol,
-                "strength": signal_strength,
-                "direction": signal_direction,
-                "reasons": reasons,
-                "key_levels": key_levels
-            })
-    
-    if not market_summary:
-        print("No market data available for analysis.")
-        return None
-    
-    # Enhanced prompt with price action focus
-    prompt = f"""You are a professional price action trader with 10+ years experience. Analyze the provided 30-minute timeframe data and identify ONLY the highest probability trades based on PRICE ACTION.
+# ---------------- OpenAI analysis with file reference ----------------
+async def ask_openai_with_file(session: aiohttp.ClientSession, market_summary_text: str, chart_path: Optional[str]) -> Optional[str]:
+    """
+    Try to upload the chart to OpenAI and include file reference in the prompt.
+    If upload fails, fallback to small base64 embed.
+    """
+    # 1) Try upload
+    file_id = None
+    if chart_path and os.path.exists(chart_path):
+        file_id = await upload_file_to_openai(session, chart_path, purpose="analysis")
+    # 2) Build small thumbnail base64 (safer to include small image)
+    thumb_b64 = None
+    if chart_path and os.path.exists(chart_path):
+        try:
+            with Image.open(chart_path) as im:
+                im = im.convert("RGB")
+                im.thumbnail((600,400), Image.LANCZOS)
+                bio = BytesIO()
+                im.save(bio, format="PNG", optimize=True)
+                thumb_b64 = base64.b64encode(bio.getvalue()).decode("ascii")
+        except Exception as e:
+            print("Thumbnail creation error:", e)
+            thumb_b64 = None
+    # 3) Build prompt: include file_id (if present) and small base64 (if available)
+    prompt_system = "You are an expert price-action crypto trader. Analyze the provided market summary and chart (image provided as file or thumbnail). Provide high-probability trade setups in the required strict format."
+    prompt_user = f"""MARKET SUMMARY (JSON):
+{market_summary_text}
 
-STRICT REQUIREMENTS:
-1. Only suggest trades with confidence ≥ 80%
-2. Each signal MUST have specific ENTRY, STOPLOSS, and TARGET prices
-3. Risk:Reward ratio must be at least 1:2
-4. Focus on price action: breakouts, patterns, volume confirmation
-5. Account for key support/resistance levels
+INSTRUCTIONS:
+- Only return signals with CONF >= {int(SIGNAL_CONF_THRESHOLD)}%
+- Output lines: SYMBOL - ACTION - ENTRY: <price> - SL: <price> - TP: <price> - REASON: <<=50 words> - CONF: <{int(SIGNAL_CONF_THRESHOLD)}-100>%
+- Use EMA{EMA_SHORT}/{EMA_LONG} for momentum context. Min R:R 1.5:1.
+- If no valid signals, reply exactly: NO_SIGNAL
 
-OUTPUT FORMAT (one line per signal):
-SYMBOL - ACTION - ENTRY: <exact_price> - SL: <exact_price> - TP: <exact_price> - REASON: <max_50_words> - CONF: <80-95>%
-
-PRICE ACTION RULES:
-- BUY signals: Resistance breaks + bullish patterns + volume confirmation + trend alignment
-- SELL signals: Support breaks + bearish patterns + volume confirmation + trend alignment
-- ENTRY: At breakout confirmation or pattern completion
-- STOPLOSS: Beyond recent swing point or pattern invalidation level
-- TARGET: Based on measured moves or next key level
-- No signals if price action is unclear or conflicting
-
-MARKET DATA:
-{"".join(market_summary)}
-
-PRICE ACTION SIGNALS (Strong setups):
-{json.dumps([{"symbol": s["symbol"], "strength": s["strength"], "direction": s["direction"], "reasons": s["reasons"], "levels": s["key_levels"]} for s in price_action_signals], indent=2)}
-
-Remember: Quality over quantity. Only suggest trades with clear price action confirmation."""
-
+"""
+    if file_id:
+        prompt_user += f"\nNOTE: Chart uploaded to OpenAI files with id: {file_id}. Use the image content for visual analysis.\n"
+    if thumb_b64:
+        # include as small base64 block for backup
+        prompt_user += "\n---BEGIN_THUMBNAIL_BASE64---\n"
+        prompt_user += thumb_b64
+        prompt_user += "\n---END_THUMBNAIL_BASE64---\n"
+    # Call Chat Completions via OpenAI client if available, else fallback to direct HTTP
     try:
         loop = asyncio.get_running_loop()
         def call_model():
             return client.chat.completions.create(
                 model=OPENAI_MODEL,
                 messages=[
-                    {"role": "system", "content": "You are a professional price action trader specializing in cryptocurrency markets. You provide only high-probability trading signals based on clear price action patterns, breakouts, and volume confirmation."},
-                    {"role": "user", "content": prompt}
+                    {"role":"system","content":prompt_system},
+                    {"role":"user","content":prompt_user}
                 ],
-                max_tokens=1500,
-                temperature=0.1
+                max_tokens=1200,
+                temperature=0.05
             )
-        
         resp = await loop.run_in_executor(None, call_model)
-        
         try:
             content = resp.choices[0].message.content
-            print("Enhanced OpenAI response:\n", content[:3000])
-            return content.strip()
+            print("OpenAI response preview:", (content or "")[:1000])
+            return content.strip() if content else None
         except Exception:
             return str(resp)
-            
     except Exception as e:
-        print("Enhanced OpenAI call failed:", e)
-        traceback.print_exc()
-        return None
+        print("OpenAI client chat call failed, falling back to HTTP (this will likely still use your client lib). Error:", e)
+        # As a fallback: send HTTP POST to /v1/chat/completions (careful: depends on model availability)
+        try:
+            headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type":"application/json"}
+            payload = {
+                "model": OPENAI_MODEL,
+                "messages":[{"role":"system","content":prompt_system},{"role":"user","content":prompt_user}],
+                "max_tokens":1200,
+                "temperature":0.05
+            }
+            async with session.post("https://api.openai.com/v1/chat/completions", json=payload, headers=headers, timeout=60) as r:
+                txt = await r.text()
+                if r.status != 200:
+                    print("HTTP chat completions failed:", r.status, txt[:1000])
+                    return None
+                j = await r.json()
+                # try to extract text
+                try:
+                    return j["choices"][0]["message"]["content"].strip()
+                except Exception:
+                    return str(j)
+        except Exception as ee:
+            print("HTTP fallback failed:", ee)
+            return None
 
-# ---------------- Signal Processing with Enhanced Validation ----------------
-def enhanced_parse(text):
+# ---------------- parse GPT signals ----------------
+def enhanced_parse(text: Optional[str]):
     out = {}
     if not text:
         return out
-    
     for line in text.splitlines():
         line = line.strip()
-        if not line or not any(k in line.upper() for k in ("BUY", "SELL")):
+        if not line or line.upper() == "NO_SIGNAL":
             continue
-        
+        if not any(k in line.upper() for k in ("BUY","SELL")):
+            continue
         parts = [p.strip() for p in line.split(" - ")]
         if len(parts) < 3:
             continue
-        
         symbol = parts[0].upper().replace(" ", "")
         action = parts[1].upper()
-        
-        if action not in ["BUY", "SELL"]:
+        if action not in ("BUY","SELL"):
             continue
-        
-        entry = sl = tp = None
-        reason = ""
-        conf = None
-        
+        entry = sl = tp = None; reason = ""; conf = None
         remainder = " - ".join(parts[2:])
-        
-        # Extract values with improved regex
         m_entry = re.search(r'ENTRY\s*[:=]\s*([0-9\.]+)', remainder, flags=re.I)
         m_sl = re.search(r'\bSL\b\s*[:=]\s*([0-9\.]+)', remainder, flags=re.I)
         m_tp = re.search(r'\bTP\b\s*[:=]\s*([0-9\.]+)', remainder, flags=re.I)
         m_conf = re.search(r'CONF(?:IDENCE)?\s*[:=]?\s*(\d{2,3})', remainder, flags=re.I)
         m_reason = re.search(r'REASON\s*[:=]\s*(.+?)(?:\s*-\s*CONF|$)', remainder, flags=re.I)
-        
-        if m_entry:
-            entry = float(m_entry.group(1))
-        if m_sl:
-            sl = float(m_sl.group(1))
-        if m_tp:
-            tp = float(m_tp.group(1))
-        if m_conf:
-            conf = int(m_conf.group(1))
-        if m_reason:
-            reason = m_reason.group(1).strip()
-        
-        # Enhanced validation
+        if m_entry: entry = float(m_entry.group(1))
+        if m_sl: sl = float(m_sl.group(1))
+        if m_tp: tp = float(m_tp.group(1))
+        if m_conf: conf = int(m_conf.group(1))
+        if m_reason: reason = m_reason.group(1).strip()
         if not all([entry, sl, tp, conf]):
-            print(f"Incomplete signal for {symbol}: entry={entry}, sl={sl}, tp={tp}, conf={conf}")
+            print(f"Incomplete signal parsed for {symbol}: {entry},{sl},{tp},{conf}")
             continue
-        
         if conf < SIGNAL_CONF_THRESHOLD:
-            print(f"Low confidence signal for {symbol}: {conf}% < {SIGNAL_CONF_THRESHOLD}%")
+            print(f"Signal below threshold: {conf}% < {SIGNAL_CONF_THRESHOLD}%")
             continue
-        
-        # Risk:Reward validation
         if action == "BUY":
-            risk = entry - sl
-            reward = tp - entry
-        else:  # SELL
-            risk = sl - entry
-            reward = entry - tp
-        
+            risk = entry - sl; reward = tp - entry
+        else:
+            risk = sl - entry; reward = entry - tp
         if risk <= 0 or reward <= 0:
-            print(f"Invalid risk/reward for {symbol}: risk={risk}, reward={reward}")
+            print("Invalid R/R skip")
             continue
-        
-        risk_reward_ratio = reward / risk
-        if risk_reward_ratio < 1.5:  # Minimum 1.5:1 R:R
-            print(f"Poor risk:reward ratio for {symbol}: {risk_reward_ratio:.2f}")
+        rr = reward / risk
+        if rr < 1.5:
+            print(f"Poor R:R {rr:.2f} skip")
             continue
-        
-        # Check for recent signals to avoid spam
-        if symbol in last_signals:
-            time_since_last = datetime.now() - last_signals[symbol]
-            if time_since_last < timedelta(hours=2):
-                print(f"Recent signal exists for {symbol}, skipping")
-                continue
-        
-        out[symbol] = {
-            "action": action,
-            "entry": entry,
-            "sl": sl,
-            "tp": tp,
-            "reason": reason,
-            "confidence": conf,
-            "risk_reward": round(risk_reward_ratio, 2),
-            "timestamp": datetime.now()
-        }
-        
-        # Update last signal time
+        if symbol in last_signals and datetime.now() - last_signals[symbol] < timedelta(hours=2):
+            print(f"Recent signal exists for {symbol}, skipping")
+            continue
+        out[symbol] = {"action":action,"entry":entry,"sl":sl,"tp":tp,"reason":reason,"confidence":conf,"risk_reward":round(rr,2),"timestamp":datetime.now()}
         last_signals[symbol] = datetime.now()
-    
     return out
 
-# ---------------- Simplified Charting ----------------
-def enhanced_plot_chart(times, candles, symbol, market_data):
-    if not times or not candles or len(times) != len(candles) or len(candles) < 10:
-        raise ValueError("Insufficient data for enhanced plotting")
-    
-    dates = [datetime.utcfromtimestamp(int(t)) for t in times]
-    closes = [c[3] for c in candles]
-    highs = [c[1] for c in candles]
-    lows = [c[2] for c in candles]
-    x = date2num(dates)
-    
-    # Create simplified subplots
-    fig = plt.figure(figsize=(16, 10), dpi=120)
-    gs = fig.add_gridspec(3, 1, height_ratios=[2, 1, 1], hspace=0.3)
-    
-    ax_price = fig.add_subplot(gs[0])
-    ax_volume = fig.add_subplot(gs[1])
-    ax_rsi = fig.add_subplot(gs[2])
-    
-    # Enhanced candlestick plotting
-    width = 0.6 * (x[1] - x[0]) if len(x) > 1 else 0.4
-    
-    for xi, candle in zip(x, candles):
-        o, h, l, c = candle
-        color = "#00ff00" if c >= o else "#ff0000"
-        edge_color = "#008000" if c >= o else "#800000"
-        
-        # Candlestick body and wicks
-        ax_price.vlines(xi, l, h, color=edge_color, linewidth=1.2, alpha=0.8)
-        rect_height = abs(c - o) if abs(c - o) > 0.0001 else 0.0001
-        rect = plt.Rectangle((xi - width/2, min(o, c)), width, rect_height,
-                           facecolor=color, edgecolor=edge_color, alpha=0.9, linewidth=0.8)
-        ax_price.add_patch(rect)
-    
-    # Support and Resistance levels from price action
-    key_levels = market_data.get("key_levels", {})
-    if key_levels.get('support_1'):
-        ax_price.axhline(key_levels['support_1'], color="blue", linestyle="--", alpha=0.8, 
-                        linewidth=2, label=f"Support: {fmt_price(key_levels['support_1'])}")
-    if key_levels.get('resistance_1'):
-        ax_price.axhline(key_levels['resistance_1'], color="red", linestyle="--", alpha=0.8, 
-                        linewidth=2, label=f"Resistance: {fmt_price(key_levels['resistance_1'])}")
-    
-    # Moving Averages (simplified)
-    if len(closes) >= MA_LONG:
-        ma_medium_values, ma_long_values = [], []
-        
-        for i in range(len(closes)):
-            if i >= MA_MEDIUM - 1:
-                ma_medium_values.append(sum(closes[i-MA_MEDIUM+1:i+1]) / MA_MEDIUM)
-            else:
-                ma_medium_values.append(None)
-                
-            if i >= MA_LONG - 1:
-                ma_long_values.append(sum(closes[i-MA_LONG+1:i+1]) / MA_LONG)
-            else:
-                ma_long_values.append(None)
-        
-        # Plot MAs
-        valid_medium = [(x[i], ma) for i, ma in enumerate(ma_medium_values) if ma is not None]
-        valid_long = [(x[i], ma) for i, ma in enumerate(ma_long_values) if ma is not None]
-        
-        if valid_medium:
-            x_medium, y_medium = zip(*valid_medium)
-            ax_price.plot(x_medium, y_medium, linewidth=2, alpha=0.8, label=f"MA{MA_MEDIUM}")
-        if valid_long:
-            x_long, y_long = zip(*valid_long)
-            ax_price.plot(x_long, y_long, linewidth=2, alpha=0.8, label=f"MA{MA_LONG}")
-    
-    # Volume chart
-    volumes = market_data.get("volumes", [])
-    if volumes and len(volumes) == len(x):
-        volume_colors = []
-        for i in range(len(candles)):
-            if i == 0:
-                volume_colors.append("gray")
-            elif candles[i][3] >= candles[i-1][3]:  # Close >= previous close
-                volume_colors.append("green")
-            else:
-                volume_colors.append("red")
-        
-        ax_volume.bar(x, volumes, width=width, color=volume_colors, alpha=0.7)
-        ax_volume.set_ylabel("Volume", fontsize=10)
-        ax_volume.ticklabel_format(style='scientific', axis='y', scilimits=(0,0))
-    
-    # RSI chart
-    if market_data.get("candles") and len(market_data["candles"]) >= RSI_PERIOD + 5:
-        rsi_values = []
-        for i in range(RSI_PERIOD, len(closes)):
-            rsi = calculate_rsi(closes[:i+1], RSI_PERIOD)
-            if rsi:
-                rsi_values.append(rsi)
-        
-        if rsi_values:
-            rsi_x = x[-len(rsi_values):]
-            ax_rsi.plot(rsi_x, rsi_values, linewidth=2)
-            ax_rsi.axhline(70, linestyle="--", alpha=0.7, linewidth=1, color="red")
-            ax_rsi.axhline(30, linestyle="--", alpha=0.7, linewidth=1, color="green")
-            ax_rsi.axhline(50, linestyle=":", alpha=0.5, linewidth=1, color="gray")
-            ax_rsi.fill_between(rsi_x, 70, 100, alpha=0.2, color="red")
-            ax_rsi.fill_between(rsi_x, 0, 30, alpha=0.2, color="green")
-            ax_rsi.set_ylim(0, 100)
-            ax_rsi.set_ylabel("RSI", fontsize=10)
-            ax_rsi.grid(True, alpha=0.3)
-    
-    # Enhanced title with price action information
-    current_price = closes[-1]
-    rsi_current = market_data.get("rsi", "
+# ---------------- Telegram ----------------
+async def send_text(session, text):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("TG not configured; would send text:", text[:300])
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    try:
+        async with session.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode":"Markdown", "disable_web_page_preview": True}, timeout=30) as r:
+            if r.status != 200:
+                txt = await r.text()
+                print("Telegram send_text failed:", r.status, txt[:300])
+    except Exception as e:
+        print("send_text error:", e)
+
+async def send_photo(session, caption, path):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("TG not configured; would send photo with caption:", caption[:200])
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+    try:
+        with open(path, "rb") as f:
+            data = aiohttp.FormData()
+            data.add_field("chat_id", str(TELEGRAM_CHAT_ID))
+            data.add_field("caption", caption)
+            data.add_field("parse_mode", "Markdown")
+            data.add_field("photo", f, filename=os.path.basename(path), content_type="image/png")
+            async with session.post(url, data=data, timeout=90) as r:
+                if r.status != 200:
+                    txt = await r.text()
+                    print("Telegram send_photo failed:", r.status, txt[:500])
+    except Exception as e:
+        print("send_photo error:", e)
+    finally:
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
+# ---------------- Main loop ----------------
+async def enhanced_loop():
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=90)) as session:
+        startup = f"🤖 Price-Action Bot (EMA{EMA_SHORT}/{EMA_LONG}) online. Symbols: {len(SYMBOLS)}, Poll: {POLL_INTERVAL}s"
+        print(startup)
+        await send_text(session, startup)
+        iteration = 0
+        while True:
+            iteration += 1
+            start_time = datetime.now()
+            print(f"\nITERATION {iteration} @ {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+            try:
+                tasks = [fetch_enhanced_data(session, s) for s in SYMBOLS]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                market = {}
+                for s, res in zip(SYMBOLS, results):
+                    if isinstance(res, Exception):
+                        print(f"Fetch error {s}: {res}")
+                        continue
+                    if res and res.get("price") is not None:
+                        market[s] = res
+                        print(f"✅ {s}: ${fmt_price(res['price'])}")
+                    else:
+                        print(f"⚠️ No data for {s}")
+                if not market:
+                    print("No market data; sleeping")
+                    await asyncio.sleep(min(120, POLL_INTERVAL))
+                    continue
+                signals_found = {}
+                for symbol, data in market.items():
+                    summary = {
+                        "symbol": symbol,
+                        "price": data.get("price"),
+                        "ema9": data.get("ema9"),
+                        "ema20": data.get("ema20"),
+                        "patterns": data.get("patterns"),
+                        "key_levels": data.get("key_levels"),
+                        "volume_analysis": data.get("volume_analysis"),
+                        "ob_support": data.get("ob_support"),
+                        "ob_resistance": data.get("ob_resistance"),
+                        "candles_count": len(data.get("candles", []))
+                    }
+                    summary_text = json.dumps(summary, default=str, indent=2)
+                    chart_path = None
+                    if data.get("candles") and data.get("times"):
+                        try:
+                            chart_path = enhanced_plot_chart(data["times"], data["candles"], symbol, data, img_maxsize=(1000,800))
+                        except Exception as e:
+                            print("Chart error:", e)
+                    # call OpenAI with file upload attempt
+                    ai_resp = await ask_openai_with_file(session, summary_text, chart_path)
+                    print(f"--- GPT raw for {symbol} ---\n{(ai_resp or '<empty>')[:3000]}\n--- end ---")
+                    parsed = enhanced_parse(ai_resp or "")
+                    for k,v in parsed.items():
+                        signals_found[k] = {"signal": v, "chart": chart_path}
+                        performance_tracking.append({
+                            "symbol": k,
+                            "action": v["action"],
+                            "entry": v["entry"],
+                            "sl": v["sl"],
+                            "tp": v["tp"],
+                            "confidence": v["confidence"],
+                            "risk_reward": v["risk_reward"],
+                            "timestamp": datetime.now(),
+                            "reason": v.get("reason","")
+                        })
+                if signals_found:
+                    print(f"🚨 Found {len(signals_found)} signals")
+                    for sym, payload in signals_found.items():
+                        sig = payload["signal"]; chart = payload.get("chart")
+                        action = sig["action"]; entry = sig["entry"]; sl = sig["sl"]; tp = sig["tp"]
+                        conf = sig["confidence"]; rr = sig["risk_reward"]; reason = sig.get("reason","")
+                        emoji = "🟢" if action=="BUY" else "🔴"
+                        potential = ((tp - entry)/entry)*100 if action=="BUY" else ((entry - tp)/entry)*100
+                        riskpct = ((entry - sl)/entry)*100 if action=="BUY" else ((sl - entry)/entry)*100
+                        caption = f"""{emoji} *SIGNAL* {emoji}
+
+*{sym}* → *{action}*
+Entry: `{fmt_price(entry)}`  SL: `{fmt_price(sl)}`  TP: `{fmt_price(tp)}`
+Confidence: *{conf}%*  R:R: *1:{rr}*  Risk: {riskpct:.1f}%  Potential: +{potential:.1f}%
+
+_Reason:_ {reason}
+"""
+                        if chart:
+                            await send_photo(session, caption, chart)
+                        else:
+                            await send_text(session, caption)
+                else:
+                    print("No high-confidence signals this iteration.")
+                if iteration % 12 == 0:
+                    wins = sum(1 for p in performance_tracking if p.get("profit",0)>0)
+                    print(f"Perf: total {len(performance_tracking)}, wins {wins}")
+                elapsed = (datetime.now() - start_time).total_seconds()
+                print(f"Iteration finished in {elapsed:.1f}s. Sleeping {POLL_INTERVAL}s")
+                await asyncio.sleep(POLL_INTERVAL)
+            except asyncio.CancelledError:
+                print("Shutdown requested")
+                await send_text(session, "Bot shutting down")
+                break
+            except Exception as e:
+                print("MAIN LOOP ERROR:", e)
+                traceback.print_exc()
+                try:
+                    await send_text(session, f"⚠️ Bot error: {str(e)[:200]}")
+                except:
+                    pass
+                await asyncio.sleep(min(120, POLL_INTERVAL))
+
+if __name__ == "__main__":
+    print("Starting Price-Action Bot (EMA9/20) with multimodal file-upload (B)...")
+    try:
+        asyncio.run(enhanced_loop())
+    except KeyboardInterrupt:
+        print("Stopped by user")
+    except Exception as e:
+        print("Fatal:", e)
+        traceback.print_exc()

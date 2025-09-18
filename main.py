@@ -1,4 +1,4 @@
-# main.py - Enhanced GPT-driven Crypto Bot with Improved Accuracy
+# main.py - Enhanced GPT-driven Crypto Bot with Improved Accuracy (fixed)
 import os
 import re
 import asyncio
@@ -57,6 +57,27 @@ client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 TICKER_URL = "https://api.binance.com/api/v3/ticker/24hr?symbol={symbol}"
 CANDLE_URL = "https://api.binance.com/api/v3/klines?symbol={symbol}&interval=30m&limit=100"
 ORDER_BOOK_URL = "https://api.binance.com/api/v3/depth?symbol={symbol}&limit=20"
+
+# ---------------- Utility formatters ----------------
+def fmt_price(p: Optional[float]) -> str:
+    """Format numeric price: 6 decimals for sub-1 prices, 2 decimals otherwise."""
+    if p is None:
+        return "N/A"
+    try:
+        v = float(p)
+    except Exception:
+        return str(p)
+    return f"{v:.6f}" if abs(v) < 1 else f"{v:.2f}"
+
+def fmt_decimal(val, small_prec=6, large_prec=2) -> str:
+    """Format a decimal with different precision depending on magnitude."""
+    if val is None:
+        return "N/A"
+    try:
+        v = float(val)
+    except Exception:
+        return str(val)
+    return f"{v:.{small_prec}f}" if abs(v) < 1 else f"{v:.{large_prec}f}"
 
 # ---------------- Enhanced Indicators ----------------
 def calculate_rsi(prices: List[float], period: int = 14) -> Optional[float]:
@@ -511,13 +532,13 @@ async def enhanced_analyze_openai(market):
         
         # Create summary
         summary = f"""
-{symbol}: Price=${price:.6f if price < 1 else price:.2f}, RSI={rsi}, Change24h={data.get('price_change_24h', 0):.2f}%
-- MACD: {macd:.6f if macd and abs(macd) < 1 else macd}, Signal: {macd_signal}
-- BB: Upper={bb_upper:.6f if bb_upper and bb_upper < 1 else bb_upper}, Lower={bb_lower:.6f if bb_lower and bb_lower < 1 else bb_lower}
-- Volume: {volume_analysis.get('volume_ratio', 0):.2f}x avg, Spike={volume_analysis.get('volume_spike', False)}
+{symbol}: Price=${fmt_price(price)}, RSI={rsi}, Change24h={data.get('price_change_24h', 0):.2f}%
+- MACD: {fmt_decimal(macd) if macd is not None else 'N/A'}, Signal: {fmt_decimal(macd_signal) if macd_signal is not None else 'N/A'}
+- BB: Upper={fmt_price(bb_upper) if bb_upper is not None else 'N/A'}, Lower={fmt_price(bb_lower) if bb_lower is not None else 'N/A'}
+- Volume: {data.get('volume_analysis', {}).get('volume_ratio', 0):.2f}x avg, Spike={data.get('volume_analysis', {}).get('volume_spike', False)}
 - Structure: {trend}, Patterns: {list(patterns.keys())}
 - Signal Strength: {signal_strength}/10, Direction: {signal_direction}
-- Key Levels: Support={data.get('ob_support')}, Resistance={data.get('ob_resistance')}"""
+- Key Levels: Support={fmt_price(data.get('ob_support'))}, Resistance={fmt_price(data.get('ob_resistance'))}"""
         
         market_summary.append(summary)
         
@@ -527,9 +548,7 @@ async def enhanced_analyze_openai(market):
                 "symbol": symbol,
                 "strength": signal_strength,
                 "direction": signal_direction,
-                "reasons": reasons,
-                "price": price,
-                "data": data
+                "reasons": reasons
             })
     
     if not market_summary:
@@ -725,16 +744,16 @@ def enhanced_plot_chart(times, candles, symbol, market_data):
     sup1, res1, sup2, res2, mid = enhanced_levels(candles, lookback=LOOKBACK_PERIOD)
     if res1:
         ax_price.axhline(res1, color="red", linestyle="--", alpha=0.8, linewidth=2, 
-                        label=f"Primary Resistance: {res1:.6f if res1 < 1 else res1:.2f}")
+                        label=f"Primary Resistance: {fmt_price(res1)}")
     if sup1:
         ax_price.axhline(sup1, color="blue", linestyle="--", alpha=0.8, linewidth=2,
-                        label=f"Primary Support: {sup1:.6f if sup1 < 1 else sup1:.2f}")
+                        label=f"Primary Support: {fmt_price(sup1)}")
     if res2:
         ax_price.axhline(res2, color="orange", linestyle=":", alpha=0.6, linewidth=1.5,
-                        label=f"Secondary Resistance: {res2:.2f}")
+                        label=f"Secondary Resistance: {fmt_price(res2)}")
     if sup2:
         ax_price.axhline(sup2, color="cyan", linestyle=":", alpha=0.6, linewidth=1.5,
-                        label=f"Secondary Support: {sup2:.2f}")
+                        label=f"Secondary Support: {fmt_price(sup2)}")
     
     # Bollinger Bands
     bb_upper = market_data.get("bb_upper")
@@ -746,10 +765,10 @@ def enhanced_plot_chart(times, candles, symbol, market_data):
         bb_middle_line = [bb_middle] * len(x)
         bb_lower_line = [bb_lower] * len(x)
         
-        ax_price.plot(x, bb_upper_line, color="purple", alpha=0.5, linewidth=1, label="BB Upper")
-        ax_price.plot(x, bb_middle_line, color="gray", alpha=0.5, linewidth=1, label="BB Middle")
-        ax_price.plot(x, bb_lower_line, color="purple", alpha=0.5, linewidth=1, label="BB Lower")
-        ax_price.fill_between(x, bb_upper_line, bb_lower_line, alpha=0.1, color="purple")
+        ax_price.plot(x, bb_upper_line, alpha=0.5, linewidth=1, label="BB Upper")
+        ax_price.plot(x, bb_middle_line, alpha=0.5, linewidth=1, label="BB Middle")
+        ax_price.plot(x, bb_lower_line, alpha=0.5, linewidth=1, label="BB Lower")
+        ax_price.fill_between(x, bb_upper_line, bb_lower_line, alpha=0.1)
     
     # Moving Averages
     if len(closes) >= MA_LONG:
@@ -778,13 +797,13 @@ def enhanced_plot_chart(times, candles, symbol, market_data):
         
         if valid_short:
             x_short, y_short = zip(*valid_short)
-            ax_price.plot(x_short, y_short, color="yellow", linewidth=2, alpha=0.8, label=f"MA{MA_SHORT}")
+            ax_price.plot(x_short, y_short, linewidth=2, alpha=0.8, label=f"MA{MA_SHORT}")
         if valid_medium:
             x_medium, y_medium = zip(*valid_medium)
-            ax_price.plot(x_medium, y_medium, color="orange", linewidth=2, alpha=0.8, label=f"MA{MA_MEDIUM}")
+            ax_price.plot(x_medium, y_medium, linewidth=2, alpha=0.8, label=f"MA{MA_MEDIUM}")
         if valid_long:
             x_long, y_long = zip(*valid_long)
-            ax_price.plot(x_long, y_long, color="red", linewidth=2, alpha=0.8, label=f"MA{MA_LONG}")
+            ax_price.plot(x_long, y_long, linewidth=2, alpha=0.8, label=f"MA{MA_LONG}")
     
     # Volume chart
     volumes = market_data.get("volumes", [])
@@ -812,12 +831,12 @@ def enhanced_plot_chart(times, candles, symbol, market_data):
         
         if rsi_values:
             rsi_x = x[-len(rsi_values):]
-            ax_rsi.plot(rsi_x, rsi_values, linewidth=2, color="blue")
-            ax_rsi.axhline(70, color="red", linestyle="--", alpha=0.7, linewidth=1)
-            ax_rsi.axhline(30, color="green", linestyle="--", alpha=0.7, linewidth=1)
-            ax_rsi.axhline(50, color="gray", linestyle=":", alpha=0.5, linewidth=1)
-            ax_rsi.fill_between(rsi_x, 70, 100, alpha=0.2, color="red")
-            ax_rsi.fill_between(rsi_x, 0, 30, alpha=0.2, color="green")
+            ax_rsi.plot(rsi_x, rsi_values, linewidth=2)
+            ax_rsi.axhline(70, linestyle="--", alpha=0.7, linewidth=1)
+            ax_rsi.axhline(30, linestyle="--", alpha=0.7, linewidth=1)
+            ax_rsi.axhline(50, linestyle=":", alpha=0.5, linewidth=1)
+            ax_rsi.fill_between(rsi_x, 70, 100, alpha=0.2)
+            ax_rsi.fill_between(rsi_x, 0, 30, alpha=0.2)
             ax_rsi.set_ylim(0, 100)
             ax_rsi.set_ylabel("RSI", fontsize=10)
             ax_rsi.grid(True, alpha=0.3)
@@ -829,10 +848,10 @@ def enhanced_plot_chart(times, candles, symbol, market_data):
     
     if macd and macd_signal:
         # Simple representation for current values
-        ax_macd.axhline(macd, color="blue", linewidth=2, label=f"MACD: {macd:.6f}")
-        ax_macd.axhline(macd_signal, color="red", linewidth=2, label=f"Signal: {macd_signal:.6f}")
+        ax_macd.axhline(macd, linewidth=2, label=f"MACD: {fmt_decimal(macd)}")
+        ax_macd.axhline(macd_signal, linewidth=2, label=f"Signal: {fmt_decimal(macd_signal)}")
         if macd_histogram:
-            ax_macd.axhline(0, color="gray", linestyle="-", alpha=0.5)
+            ax_macd.axhline(0, linestyle="-", alpha=0.5)
             ax_macd.bar([x[-1]], [macd_histogram], width=width*5, 
                        color="green" if macd_histogram > 0 else "red", alpha=0.7)
         ax_macd.set_ylabel("MACD", fontsize=10)
@@ -846,9 +865,7 @@ def enhanced_plot_chart(times, candles, symbol, market_data):
     volume_ratio = market_data.get("volume_analysis", {}).get("volume_ratio", 0)
     trend = market_data.get("market_structure", {}).get("trend", "sideways")
     
-    price_str = f"{current_price:.6f}" if current_price < 1 else f"{current_price:.2f}"
-    
-    title = f"""{symbol} | Price: ${price_str} | 24h: {price_change_24h:+.2f}% | RSI: {rsi_current}
+    title = f"""{symbol} | Price: ${fmt_price(current_price)} | 24h: {price_change_24h:+.2f}% | RSI: {rsi_current}
 Volume: {volume_ratio:.1f}x | Trend: {trend.upper()} | TF: 30m"""
     
     ax_price.set_title(title, fontsize=14, fontweight="bold", pad=20)
@@ -1026,7 +1043,7 @@ async def enhanced_loop():
                     
                     if result and result.get("price") is not None:
                         market[symbol] = result
-                        print(f"✅ {symbol}: ${result['price']:.6f if result['price'] < 1 else result['price']:.2f}")
+                        print(f"✅ {symbol}: ${fmt_price(result.get('price'))}")
                     else:
                         print(f"⚠️  No price data for {symbol}")
                 
@@ -1058,7 +1075,7 @@ async def enhanced_loop():
                 if signals:
                     print(f"\n🚨 Found {len(signals)} HIGH-CONFIDENCE signals:")
                     for symbol, sig in signals.items():
-                        print(f"   {symbol}: {sig['action']} @ {sig['entry']:.6f if sig['entry'] < 1 else sig['entry']:.2f} | Conf: {sig['confidence']}% | R:R: {sig['risk_reward']}")
+                        print(f"   {symbol}: {sig['action']} @ {fmt_price(sig.get('entry'))} | Conf: {sig['confidence']}% | R:R: {sig['risk_reward']}")
                 else:
                     print("📈 No high-confidence signals this iteration")
                 
@@ -1078,7 +1095,7 @@ async def enhanced_loop():
                         current_price = symbol_data.get("price", entry)
                         
                         # Enhanced formatting
-                        def fmt_price(p):
+                        def fmt_price_local(p):
                             if p is None: 
                                 return "N/A"
                             return f"{p:.6f}" if p < 1 else f"{p:.2f}"

@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-# main.py - Enhanced Crypto Trading Bot v5.0 (Multi-timeframe + Redis Layers)
-
+# main.py - Enhanced Crypto Trading Bot v5.1 (Multi-timeframe + Redis Layers + secure TLS)
 import os, re, asyncio, aiohttp, traceback, numpy as np, json
 from datetime import datetime
 from dotenv import load_dotenv
@@ -10,7 +9,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.dates import date2num
 from tempfile import NamedTemporaryFile
-import redis
+
+# Redis & SSL
+import ssl, certifi, redis
 
 load_dotenv()
 
@@ -32,34 +33,127 @@ client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 CANDLE_URL = "https://api.binance.com/api/v3/klines?symbol={symbol}&interval={tf}&limit=100"
 TICKER_24H_URL = "https://api.binance.com/api/v3/ticker/24hr?symbol={symbol}"
 
-# ---------------- Redis Config ----------------
-REDIS = redis.Redis.from_url(os.getenv("REDIS_URL"), decode_responses=True)
+# ---------------- Redis Config & INIT (secure preferred; permissive fallback for debug) ----------------
+REDIS = None
+REDIS_URL = os.getenv("REDIS_URL")
 
-# Retentions
+def init_redis():
+    global REDIS
+    if not REDIS_URL:
+        print("WARNING: REDIS_URL not set - Redis disabled.")
+        return
+    try:
+        # Preferred: verified TLS using certifi CA bundle
+        REDIS = redis.Redis.from_url(
+            REDIS_URL,
+            ssl=True,
+            ssl_cert_reqs=ssl.CERT_REQUIRED,
+            ssl_ca_certs=certifi.where(),
+            decode_responses=True,
+            socket_keepalive=True
+        )
+        print("Trying verified TLS connection to Redis...")
+        ok = REDIS.ping()
+        print("Redis ping (verified):", ok)
+    except Exception as e:
+        print("Verified TLS connection failed:", e)
+        traceback.print_exc()
+        # Permissive fallback - DEBUG ONLY (no cert verification)
+        try:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            REDIS = redis.Redis.from_url(
+                REDIS_URL, ssl=True, ssl_context=ctx, decode_responses=True
+            )
+            print("Permissive TLS fallback succeeded (DEBUG). Ping:", REDIS.ping())
+        except Exception as e2:
+            print("Permissive TLS fallback failed:", e2)
+            traceback.print_exc()
+            REDIS = None
+
+init_redis()
+
+# Retentions (entries count)
 STREAM_MAXLEN = {
     "30m": 2880,   # 60 days (48 per day)
     "1h": 2160,    # 90 days
     "4h": 1080,    # 180 days
-    "1d": 730      # 2 years
+    "1d": 730      # ~2 years
 }
 
-# ---------------- Redis Helpers ----------------
+# ---------------- Redis helper wrappers (safe) ----------------
+def safe_ping():
+    try:
+        return REDIS and REDIS.ping()
+    except Exception as e:
+        print("Redis ping error:", e)
+        return False
+
+def safe_setex(key, seconds, value):
+    try:
+        if REDIS:
+            REDIS.setex(key, seconds, value)
+    except Exception as e:
+        print("Redis setex error:", e)
+
+def safe_hset(hash_key, field, value):
+    try:
+        if REDIS:
+            REDIS.hset(hash_key, field, value)
+    except Exception as e:
+        print("Redis hset error:", e)
+
+def safe_xadd(key, mapping, maxlen=None, approximate=True):
+    try:
+        if REDIS:
+            if maxlen is not None:
+                REDIS.xadd(key, mapping=mapping, maxlen=maxlen, approximate=approximate)
+            else:
+                REDIS.xadd(key, mapping=mapping)
+    except Exception as e:
+        print("Redis xadd error:", e)
+
+def safe_get(key):
+    try:
+        return REDIS.get(key) if REDIS else None
+    except Exception as e:
+        print("Redis get error:", e)
+        return None
+
+def safe_hget(hash_key, field):
+    try:
+        return REDIS.hget(hash_key, field) if REDIS else None
+    except Exception as e:
+        print("Redis hget error:", e)
+        return None
+
+# ---------------- Redis Storage helpers ----------------
 def store_ltp(symbol, price, ts):
-    REDIS.setex(f"crypto:ltp:{symbol}", 30, f"{price},{ts}")
+    # Hot LTP with TTL 30s
+    safe_setex(f"crypto:ltp:{symbol}", 30, f"{price},{ts}")
 
 def store_24h(symbol, stats: dict):
-    # Store 24hr ticker stats with 5m TTL
-    REDIS.setex(f"crypto:24h:{symbol}", 300, json.dumps(stats))
+    # 24h ticker stats with TTL 5 minutes
+    try:
+        if REDIS:
+            REDIS.setex(f"crypto:24h:{symbol}", 300, json.dumps(stats))
+    except Exception as e:
+        print("store_24h error:", e)
 
 def store_candle(symbol, tf, candle: dict):
     key = f"candles:{tf}:{symbol}"
-    REDIS.xadd(key, mapping=candle, maxlen=STREAM_MAXLEN[tf], approximate=True)
+    safe_xadd(key, mapping=candle, maxlen=STREAM_MAXLEN.get(tf))
 
 def store_signal(symbol, signal: dict):
-    REDIS.hset("signals:active", symbol, json.dumps(signal))
+    safe_hset("signals:active", symbol, json.dumps(signal))
 
 def store_prediction(symbol, prediction: dict):
-    REDIS.setex(f"predictions:{symbol}", 3600, json.dumps(prediction))  # TTL 1h
+    try:
+        if REDIS:
+            REDIS.setex(f"predictions:{symbol}", 3600, json.dumps(prediction))
+    except Exception as e:
+        print("store_prediction error:", e)
 
 # ---------------- Utils ----------------
 def fmt_price(p): return f"{p:.6f}" if abs(p)<1 else f"{p:.2f}"
@@ -124,12 +218,14 @@ async def fetch_json(session,url):
         async with session.get(url,timeout=20) as r:
             if r.status!=200: return None
             return await r.json()
-    except: return None
+    except Exception as e:
+        print("fetch_json error:", e)
+        return None
 
 # ---------------- AI ----------------
 async def ask_openai_for_signals(summary):
     if not client: return None
-    sys="You are pro crypto trader. Only output signals." 
+    sys="You are pro crypto trader. Only output signals."
     usr=f"{summary}\nRules: Conf≥{int(SIGNAL_CONF_THRESHOLD)}% Format: SYMBOL - BUY/SELL - ENTRY:x - SL:y - TP:z - REASON:.. - CONF:n%"
     try:
         loop=asyncio.get_running_loop()
@@ -138,20 +234,30 @@ async def ask_openai_for_signals(summary):
             max_tokens=400,temperature=0.0)
         resp=await loop.run_in_executor(None,call)
         return resp.choices[0].message.content.strip()
-    except: return None
+    except Exception as e:
+        print("ask_openai_for_signals error:", e)
+        return None
 
-# ---------------- Telegram ----------------
+# ---------------- Telegram (via aiohttp) ----------------
 async def send_text(session,text):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: print(text); return
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print(text); return
     url=f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    await session.post(url,json={"chat_id":TELEGRAM_CHAT_ID,"text":text})
+    try:
+        await session.post(url,json={"chat_id":TELEGRAM_CHAT_ID,"text":text})
+    except Exception as e:
+        print("send_text error:", e)
 
 async def send_photo(session,caption,path):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: print(caption); return
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print(caption); return
     url=f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
-    with open(path,"rb") as f:
-        data=aiohttp.FormData(); data.add_field("chat_id",TELEGRAM_CHAT_ID); data.add_field("caption",caption); data.add_field("photo",f)
-        await session.post(url,data=data)
+    try:
+        with open(path,"rb") as f:
+            data=aiohttp.FormData(); data.add_field("chat_id",TELEGRAM_CHAT_ID); data.add_field("caption",caption); data.add_field("photo",f)
+            await session.post(url,data=data)
+    except Exception as e:
+        print("send_photo error:", e)
 
 # ---------------- Main ----------------
 async def enhanced_loop():
@@ -163,13 +269,15 @@ async def enhanced_loop():
             it+=1; print(f"\nITER {it} @ {datetime.now().strftime('%H:%M:%S')}")
             for sym in SYMBOLS:
                 try:
-                    # Fetch multi-timeframe candles
+                    # Fetch multi-timeframe candles (REST)
                     c30 = await fetch_json(session,CANDLE_URL.format(symbol=sym,tf="30m"))
                     c1h = await fetch_json(session,CANDLE_URL.format(symbol=sym,tf="1h"))
                     c4h = await fetch_json(session,CANDLE_URL.format(symbol=sym,tf="4h"))
                     c1d = await fetch_json(session,CANDLE_URL.format(symbol=sym,tf="1d"))
                     stats24h = await fetch_json(session,TICKER_24H_URL.format(symbol=sym))
-                    if not c30 or not c1h: continue
+                    if not c30 or not c1h:
+                        print(f"{sym}: missing c30/c1h, skipping")
+                        continue
 
                     # Parse candles (OHLC)
                     can30=[[float(x[1]),float(x[2]),float(x[3]),float(x[4])] for x in c30]
@@ -177,8 +285,11 @@ async def enhanced_loop():
 
                     # ---------------- Redis Store ----------------
                     # LTP + 24h
-                    store_ltp(sym, can30[-1][3], int(datetime.now().timestamp()))
-                    if stats24h: store_24h(sym, stats24h)
+                    try:
+                        store_ltp(sym, can30[-1][3], int(datetime.now().timestamp()))
+                        if stats24h: store_24h(sym, stats24h)
+                    except Exception as e:
+                        print("Redis store LTP/24h error:", e)
 
                     # Multi-timeframe candles
                     for tf, data in [("30m",c30),("1h",c1h),("4h",c4h),("1d",c1d)]:
@@ -192,7 +303,7 @@ async def enhanced_loop():
                         store_candle(sym, tf, candle_data)
                     # ---------------- End Redis Store -------------
 
-                    # Local analysis
+                    # Local analysis (30m used for local logic)
                     local=analyze_trade_logic(can30)
 
                     # AI confirmation
@@ -204,8 +315,11 @@ async def enhanced_loop():
                             "side": local["side"], "entry": local["entry"], "sl": local["sl"],
                             "tp": local["tp"], "confidence": conf, "reason": local["reason"]
                         }
-                        # Store signal in Redis
-                        store_signal(sym, signal)
+                        # Store signal in Redis (AI layer)
+                        try:
+                            store_signal(sym, signal)
+                        except Exception as e:
+                            print("store_signal error:", e)
 
                         msg=f"{sym} {signal['side']} | Entry {fmt_price(signal['entry'])} | SL {fmt_price(signal['sl'])} | TP {fmt_price(signal['tp'])} | Conf {signal['confidence']}%\nReason: {signal['reason']}"
                         chart=plot_signal_chart(sym,c30,signal)
@@ -219,5 +333,7 @@ async def enhanced_loop():
             await asyncio.sleep(POLL_INTERVAL)
 
 if __name__=="__main__":
-    try: asyncio.run(enhanced_loop())
-    except KeyboardInterrupt: print("Stopped by user")
+    try:
+        asyncio.run(enhanced_loop())
+    except KeyboardInterrupt:
+        print("Stopped by user")

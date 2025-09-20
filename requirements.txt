@@ -20,3 +20,6 @@ pandas-ta-openbb==0.4.22
 
 # Other
 schedule==1.2.0
+
+# Redis client
+redis==5.0.1

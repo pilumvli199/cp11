@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-# main.py - Crypto bot v5.2 (Redis integrated - non-TLS friendly)
+# main.py - Crypto bot (Redis integrated, fixed xadd call)
 # - Uses Redis host/port (non-TLS) from env
-# - Stores LTP and candles streams
-# - Keeps original signal/chart logic and Telegram/OpenAI integration
+# - Stores LTP and candles streams using Redis streams (xadd)
+# - Generates signals and sends to Telegram (optional) and OpenAI (optional)
 
 import os, json, asyncio, traceback, time
 from datetime import datetime
@@ -50,14 +50,14 @@ def init_redis_plain():
     port = int(os.getenv("REDIS_PORT")) if os.getenv("REDIS_PORT") else None
     user = os.getenv("REDIS_USER") or None
     password = os.getenv("REDIS_PASSWORD") or None
-    # allow REDIS_URL fallback (non-TLS redis://)
-    url = os.getenv("REDIS_URL")
+    url = os.getenv("REDIS_URL")  # optional fallback
 
     # Try host/port first (works with free Redis)
     if host and port:
         try:
             print("Connecting to Redis (plain host/port)...")
             REDIS = redis.Redis(host=host, port=port, username=user, password=password, decode_responses=True)
+            # optional quick ping
             print("Redis ping:", REDIS.ping())
             return
         except Exception as e:
@@ -97,12 +97,18 @@ def safe_hset(h, field, val):
     return safe_call(REDIS.hset, h, field, val) if REDIS else None
 
 def safe_xadd(key, mapping, maxlen=None):
-    if not REDIS: return None
+    """
+    redis-py xadd signature expects fields as second positional arg.
+    mapping must be a dict of strings (we pass mapping directly).
+    Use maxlen and approximate=True if needed.
+    """
+    if not REDIS:
+        return None
     try:
         if maxlen:
-            return REDIS.xadd(key, mapping=mapping, maxlen=maxlen, approximate=True)
+            return REDIS.xadd(key, mapping, maxlen=maxlen, approximate=True)
         else:
-            return REDIS.xadd(key, mapping=mapping)
+            return REDIS.xadd(key, mapping)
     except Exception as e:
         print("Redis xadd error:", e)
         return None
@@ -111,6 +117,7 @@ def safe_xadd(key, mapping, maxlen=None):
 STREAM_MAXLEN = {"30m":2880, "1h":2160, "4h":1080, "1d":730}
 
 def store_ltp(symbol, price, ts):
+    # stores "price,timestamp" with small TTL
     safe_setex(f"crypto:ltp:{symbol}", 30, f"{price},{ts}")
 
 def store_24h(symbol, stats):
@@ -122,7 +129,7 @@ def store_24h(symbol, stats):
 
 def store_candle(symbol, tf, candle):
     key = f"candles:{tf}:{symbol}"
-    safe_xadd(key, mapping=candle, maxlen=STREAM_MAXLEN.get(tf))
+    safe_xadd(key, candle, maxlen=STREAM_MAXLEN.get(tf))
 
 def store_signal(symbol, signal):
     safe_hset("signals:active", symbol, json.dumps(signal))
@@ -147,14 +154,14 @@ def ema(values, period):
 
 def horizontal_levels(closes, highs, lows, lookback=50, binsize=0.002):
     pts = closes[-lookback:]+highs[-lookback:]+lows[-lookback:]
-    lvls=[] 
+    lvls = []
     for p in pts:
-        found=False
+        found = False
         for lv in lvls:
             if abs((lv["price"]-p)/p) < binsize:
-                lv["count"]+=1
-                lv["price"]=(lv["price"]*(lv["count"]-1)+p)/lv["count"]
-                found=True; break
+                lv["count"] += 1
+                lv["price"] = (lv["price"]*(lv["count"]-1)+p)/lv["count"]
+                found = True; break
         if not found: lvls.append({"price":p,"count":1})
     lvls.sort(key=lambda x:-x["count"])
     return [lv["price"] for lv in lvls[:5]]

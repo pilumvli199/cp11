@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
-# main.py - Enhanced Crypto Trading Bot v5.1 (Multi-timeframe + Redis Layers + secure TLS)
-import os, re, asyncio, aiohttp, traceback, numpy as np, json
+# main.py - Enhanced Crypto Trading Bot v5.1 (Multi-timeframe + Redis Layers + SSLConnection)
+import os
+import re
+import asyncio
+import aiohttp
+import traceback
+import numpy as np
+import json
 from datetime import datetime
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -11,7 +17,9 @@ from matplotlib.dates import date2num
 from tempfile import NamedTemporaryFile
 
 # Redis & SSL
-import ssl, certifi, redis
+import ssl
+import certifi
+import redis
 
 load_dotenv()
 
@@ -33,7 +41,7 @@ client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 CANDLE_URL = "https://api.binance.com/api/v3/klines?symbol={symbol}&interval={tf}&limit=100"
 TICKER_24H_URL = "https://api.binance.com/api/v3/ticker/24hr?symbol={symbol}"
 
-# ---------------- Redis Config & INIT (secure preferred; permissive fallback for debug) ----------------
+# ---------------- Redis Config & INIT (use SSLConnection) ----------------
 REDIS = None
 REDIS_URL = os.getenv("REDIS_URL")
 
@@ -42,35 +50,42 @@ def init_redis():
     if not REDIS_URL:
         print("WARNING: REDIS_URL not set - Redis disabled.")
         return
+
     try:
-        # Preferred: verified TLS using certifi CA bundle
+        # Use explicit SSLConnection class and certifi CA bundle (secure)
         REDIS = redis.Redis.from_url(
             REDIS_URL,
-            ssl=True,
+            decode_responses=True,
+            connection_class=redis.connection.SSLConnection,
             ssl_cert_reqs=ssl.CERT_REQUIRED,
             ssl_ca_certs=certifi.where(),
-            decode_responses=True,
             socket_keepalive=True
         )
-        print("Trying verified TLS connection to Redis...")
+        print("Trying verified TLS connection to Redis (SSLConnection)...")
         ok = REDIS.ping()
         print("Redis ping (verified):", ok)
+        return
     except Exception as e:
-        print("Verified TLS connection failed:", e)
+        print("Verified TLS (SSLConnection) failed:", e)
         traceback.print_exc()
-        # Permissive fallback - DEBUG ONLY (no cert verification)
-        try:
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            REDIS = redis.Redis.from_url(
-                REDIS_URL, ssl=True, ssl_context=ctx, decode_responses=True
-            )
-            print("Permissive TLS fallback succeeded (DEBUG). Ping:", REDIS.ping())
-        except Exception as e2:
-            print("Permissive TLS fallback failed:", e2)
-            traceback.print_exc()
-            REDIS = None
+
+    # Permissive fallback (DEBUG only) - try to connect with a permissive SSLContext
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        REDIS = redis.Redis.from_url(
+            REDIS_URL,
+            decode_responses=True,
+            connection_class=redis.connection.SSLConnection,
+            ssl_context=ctx,
+            socket_keepalive=True
+        )
+        print("Permissive TLS fallback succeeded (DEBUG). Ping:", REDIS.ping())
+    except Exception as e2:
+        print("Permissive TLS fallback failed:", e2)
+        traceback.print_exc()
+        REDIS = None
 
 init_redis()
 

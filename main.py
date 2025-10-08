@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-# main.py - Professional BTC/ETH Bot (Options Chain, Deep Candlesticks, GPT-4o-mini Analysis)
-# FIXES: 1. mpfinance 'linestyles' to 'linestyle'. 2. Robust options data fetching. 
-# 3. Fixed ValueError: x and y must have same first dimension (SMA200 now filtered to 300 points).
+# main.py - Advanced Multi-Timeframe BTC/ETH Bot (999 Candles, 4H/1H Analysis, GPT-4o-mini)
+# FIXES: 1. Max Candle Limit set to 999 for all TFs. 2. Added 4H EMA/RSI analysis. 
+# 3. GPT Prompt updated to request TP1 (Short-Term) and TP2 (Macro/OI Walls).
 
 import os, json, asyncio, traceback, time
 import numpy as np
@@ -51,7 +51,8 @@ OPTIONS_EXCHANGE_INFO_URL = OPTIONS_BASE_URL + "/eapi/v1/exchangeInfo"
 OPTIONS_TICKER_URL = OPTIONS_BASE_URL + "/eapi/v1/ticker" # Ticker for OI/IV
 OPTIONS_DEPTH_URL = OPTIONS_BASE_URL + "/eapi/v1/depth?symbol={symbol}&limit=100" 
 
-CANDLE_LIMITS = {"1h": 720, "4h": 200, "1d": 200}
+# Set all Timeframes to the maximum robust limit of 999 klines
+CANDLE_LIMITS = {"1h": 999, "4h": 999, "1d": 999} 
 
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
@@ -90,6 +91,7 @@ def safe_hset(h, field, val):
 def store_signal(symbol, signal): safe_hset("signals:advanced", symbol, json.dumps(signal))
 
 # ---------------- Options Chain Analysis ----------------
+# (Function get_options_data_for_symbol remains the same, it is robust)
 
 async def get_options_data_for_symbol(session, base_symbol) -> Dict[str, Any]:
     data = {"options_sentiment": "Neutral", "oi_summary": "N/A", "near_term_symbol": None}
@@ -183,15 +185,21 @@ async def get_options_data_for_symbol(session, base_symbol) -> Dict[str, Any]:
     return data
 
 
-# ---------------- GPT-4o-mini Analysis ----------------
+# ---------------- GPT-4o-mini Analysis (UPDATED) ----------------
 
-async def analyze_with_openai(symbol, candles_1h, spot_depth, agg_trades, options_data):
+async def analyze_with_openai(symbol, data): # Now accepts full data dictionary
     if not client: return {"side":"none","confidence":0,"reason":"NO_AI_KEY"}
     
-    # 1. Prepare Data Summary
-    df_1h = pd.DataFrame(candles_1h, columns=['OpenTime', 'Open', 'High', 'Low', 'Close', 'Volume', 'CloseTime', 'QuoteAssetVolume', 'NumberOfTrades', 'TakerBuyBaseAssetVolume', 'TakerBuyQuoteAssetVolume', 'Ignore'])
+    # Extract data parts
+    c1h = data.get("1h")
+    spot_depth = data.get("depth")
+    agg_trades = data.get("aggTrades")
+    options_data = data.get("options")
+    candles_4h = data.get("4h")
+
+    # 1. Prepare 1H Data (Short-Term)
+    df_1h = pd.DataFrame(c1h, columns=['OpenTime', 'Open', 'High', 'Low', 'Close', 'Volume', 'CloseTime', 'QuoteAssetVolume', 'NumberOfTrades', 'TakerBuyBaseAssetVolume', 'TakerBuyQuoteAssetVolume', 'Ignore'])
     df_1h = df_1h[['Open', 'High', 'Low', 'Close', 'Volume']].astype(float)
-    
     current_price = df_1h['Close'].iloc[-1]
     
     # Simple Candlestick Pattern detection
@@ -203,7 +211,35 @@ async def analyze_with_openai(symbol, candles_1h, spot_depth, agg_trades, option
     elif c3['Close'] < c3['Open'] and c2['Close'] > c2['Open'] and c1['Close'] > c1['Open'] and c3['Open'] < c2['Close']:
         pattern_summary = "Possible Bearish Engulfing/Evening Star formation."
         
-    # Spot Market Depth Analysis
+    # ATR for Risk Management
+    highs = df_1h['High'].to_numpy(); lows = df_1h['Low'].to_numpy(); closes = df_1h['Close'].to_numpy()
+    current_atr = atr(highs, lows, closes) 
+    
+    # ----------------- 4H Long-Term Analysis (Macro) -----------------
+    if candles_4h:
+        df_4h = pd.DataFrame(candles_4h, columns=['OpenTime', 'Open', 'High', 'Low', 'Close', 'Volume', 'CloseTime', 'QuoteAssetVolume', 'NumberOfTrades', 'TakerBuyBaseAssetVolume', 'TakerBuyQuoteAssetVolume', 'Ignore'])
+        df_4h = df_4h[['Open', 'High', 'Low', 'Close']].astype(float)
+        
+        # Calculate Long-Term Indicators
+        long_term_ema = df_4h['Close'].ewm(span=200, adjust=False).mean().iloc[-1]
+        long_term_rsi = df_4h['Close'].rolling(window=14).apply(lambda x: rsi(x.values), raw=True).iloc[-1]
+        
+        # Determine Trend
+        if current_price > long_term_ema:
+            long_term_trend = f"BULLISH (Price above 4H EMA 200: {long_term_ema:.2f})"
+        else:
+            long_term_trend = f"BEARISH (Price below 4H EMA 200: {long_term_ema:.2f})"
+            
+        # Identify recent key S/R levels (4H) for breakout context
+        recent_4h_high = df_4h['High'].iloc[-50:].max()
+        recent_4h_low = df_4h['Low'].iloc[-50:].min()
+    else:
+        long_term_trend = "4H Data Unavailable"
+        long_term_rsi = 50.0 
+        recent_4h_high = current_price
+        recent_4h_low = current_price
+
+    # 2. Spot Market Flow Analysis
     bid_vol_spot = sum([float(b[1]) for b in spot_depth.get('bids', [])])
     ask_vol_spot = sum([float(a[1]) for a in spot_depth.get('asks', [])])
     spot_imbalance = (bid_vol_spot - ask_vol_spot) / (bid_vol_spot + ask_vol_spot) * 100 if (bid_vol_spot + ask_vol_spot) > 0 else 0
@@ -213,48 +249,52 @@ async def analyze_with_openai(symbol, candles_1h, spot_depth, agg_trades, option
     sell_vol_agg = sum([float(t['q']) for t in agg_trades if t['m']])
     agg_imbalance = (buy_vol_agg - sell_vol_agg) / (buy_vol_agg + sell_vol_agg) * 100 if (buy_vol_agg + sell_vol_agg) > 0 else 0
     
-    # Options Data Summary 
+    # 3. Options Data Summary 
     opt_info = options_data
     opt_summary = opt_info.get('oi_summary', 'No Open Interest Data.')
     opt_sentiment = opt_info.get('options_sentiment', 'Neutral')
     opt_symbol = opt_info.get('near_term_symbol', 'N/A')
-    
-    # ATR for Risk Management
-    highs = df_1h['High'].to_numpy(); lows = df_1h['Low'].to_numpy(); closes = df_1h['Close'].to_numpy()
-    current_atr = atr(highs, lows, closes) 
+    pcr_value = re.search(r'PCR:\s*([\d.]+)', opt_summary)
+    pcr_val = float(pcr_value.group(1)) if pcr_value else 0.0
 
-    # 2. Construct the Detailed Prompt
+    # 4. Construct the Detailed Prompt
     sys_prompt = (
-        "You are a sophisticated quantitative crypto analyst using a comprehensive multi-factor model. "
+        "You are a sophisticated quantitative crypto analyst using a comprehensive multi-factor, multi-timeframe model. "
         "Your task is to analyze the provided market data and generate a high-conviction trading signal "
-        "(BUY/SELL/HOLD) for the next few hours. Use ALL data points below to formulate your logic. "
-        "Strictly adhere to the output format: 'SYMBOL - ACTION - ENTRY:x - SL:y - TP:z - REASON:.. - CONF:n%'"
+        "(BUY/SELL/HOLD) for the next 24-48 hours. Use ALL data points below, especially combining Macro (4H/OI) "
+        "with Short-Term (1H/Flow) to formulate your logic. "
+        "Strictly adhere to the output format, providing two Take Profit levels: 'SYMBOL - ACTION - ENTRY:x - SL:y - TP:z - TP2:w - REASON:.. - CONF:n%'"
     )
 
     usr_prompt = f"""
-    ### {symbol} - Advanced Analysis Request
+    ### {symbol} - Advanced Multi-Timeframe Analysis Request
     
-    **1. Price Action & Candlesticks (1H TF - Last 720 Candles):**
+    **1. Macro Trend (4H TF - Last 999 Candles):**
+    - Long-Term Trend (EMA 200): {long_term_trend}
+    - 4H RSI (14-period): {long_term_rsi:.2f} (Overbought > 70, Oversold < 30)
+    - Recent 4H Key Resistance: {recent_4h_high:.2f} | Recent 4H Key Support: {recent_4h_low:.2f}
+    
+    **2. Price Action & Momentum (1H TF - Short Term):**
     - Current Price: {current_price:.2f}
     - Last 3 Candles (OHLCV): \n{last_3_candles.to_string()}
     - Recent Candlestick Pattern: {pattern_summary}
-    - **Current ATR (14-period):** {current_atr:.4f} (Use this for SL/TP suggestions: SL ~1.5x ATR, TP ~3x ATR)
+    - Current ATR (14-period): {current_atr:.4f} (Use this for SL/TP1 suggestions: SL ~1.5x ATR, TP1 ~3x ATR)
     
-    **2. Spot Market Flow Analysis (Order Book & Agg Trades):**
-    - Spot Depth Imbalance (50 levels): {spot_imbalance:.2f}% (Positive=Buy Pressure, Negative=Sell Pressure)
-    - Aggressive Trades Imbalance (Last 100 trades): {agg_imbalance:.2f}% (Positive=Aggressive Buying, Negative=Aggressive Selling)
+    **3. Spot Market Flow Analysis:**
+    - Spot Depth Imbalance: {spot_imbalance:.2f}% 
+    - Aggressive Trades Imbalance: {agg_imbalance:.2f}% 
     
-    **3. Options Chain Deep Analysis (Vanilla Options - Next Nearest Expiry):**
-    - Nearest Expiry Contract Symbol (Reference): {opt_symbol}
-    - **Global OI Summary:** {opt_summary}
-    - **Synthesized Sentiment:** {opt_sentiment}
-    - **Interpretation Hint:** Use PCR (Put/Call Ratio) and OI distribution to gauge institutional positioning and future expectations. High Call OI/low PCR is bullish; High Put OI/high PCR suggests hedging or bearish pressure.
+    **4. Options Chain Deep Analysis (Macro Sentiment & Key Levels):**
+    - Synthesized Sentiment: {opt_sentiment}
+    - Put/Call Ratio (PCR): {pcr_val:.2f}.
+    - OI Summary (Reference for Macro S/R/Expiry): {opt_summary}
+    - **Crucial Interpretation Hint:** The strongest Call OI walls act as Major Resistance (potential TP2), and the strongest Put OI walls act as Major Support (potential SL).
     
-    **4. Instructions:**
-    - Analyze the long-term trend from the 720 candles.
-    - Identify key price action, support, and resistance levels from the historical data.
-    - Combine market flow (Spot Depth, Agg Trades) with Options sentiment.
-    - **If Confidence is ≥ {int(SIGNAL_CONF_THRESHOLD)}%**, provide a specific **BUY/SELL** signal with calculated ENTRY, SL, and TP.
+    **5. Trading Instructions (Set TP1 and TP2):**
+    - **TP1 (Short-Term):** Must be based on the current ATR and short-term 1H momentum (3x ATR default).
+    - **TP2 (Long-Term/Macro):** Must be set based on **4H Key S/R levels** or the **strongest unbreached Options OI Wall**.
+    - **Fake Breakout Check:** If the current price is near or breaking {recent_4h_high:.2f} or {recent_4h_low:.2f}, confirm the move with strong **Aggressive Flow** (> 20%) and **OI confirmation** (OI building in the direction of the break). If confirmation is missing, signal HOLD/NONE or suggest a reversal.
+    - **If Confidence is ≥ {int(SIGNAL_CONF_THRESHOLD)}%**, provide a specific **BUY/SELL** signal with calculated ENTRY, SL, TP, and TP2.
     - **If Confidence is < {int(SIGNAL_CONF_THRESHOLD)}%**, the action must be **HOLD** or **NONE**.
     """
 
@@ -283,7 +323,21 @@ async def analyze_with_openai(symbol, candles_1h, spot_depth, agg_trades, option
         return {"side":"none","confidence":0,"reason":f"AI_CALL_ERROR: {str(e)}"}
 
 
-# ---------------- Utility Functions ----------------
+# ---------------- Utility Functions (UPDATED) ----------------
+
+def rsi(prices, period=14):
+    """Calculates Relative Strength Index (RSI) using Pandas for standalone calculation."""
+    if len(prices) < period: return 50.0
+    df = pd.DataFrame(prices, columns=['Close'])
+    delta = df['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
+    
+    # Handle division by zero for rs (when loss is 0)
+    rs = np.divide(gain, loss, out=np.full_like(gain, np.inf), where=loss != 0)
+    
+    rsi_val = 100 - (100 / (1 + rs))
+    return rsi_val.iloc[-1] if not rsi_val.empty else 50.0
 
 def atr(highs, lows, closes, period=14):
     if len(closes) < period: return 0.0
@@ -300,7 +354,8 @@ def atr(highs, lows, closes, period=14):
 def fmt_price(p): return f"{p:.4f}" if abs(p)<1 else f"{p:.2f}"
 
 def parse_ai_signal(ai_output, symbol, current_atr):
-    signal = {"side": "none", "confidence": 0, "reason": ai_output, "entry": 0, "sl": 0, "tp": 0}
+    # Added 'tp2' to the default signal dictionary
+    signal = {"side": "none", "confidence": 0, "reason": ai_output, "entry": 0, "sl": 0, "tp": 0, "tp2": 0} 
     
     conf_match = re.search(r'CONF:(\d+)%', ai_output, re.IGNORECASE)
     if conf_match:
@@ -310,6 +365,7 @@ def parse_ai_signal(ai_output, symbol, current_atr):
     entry_match = re.search(r'ENTRY:([\d.]+)', ai_output, re.IGNORECASE)
     sl_match = re.search(r'SL:([\d.]+)', ai_output, re.IGNORECASE)
     tp_match = re.search(r'TP:([\d.]+)', ai_output, re.IGNORECASE)
+    tp2_match = re.search(r'TP2:([\d.]+)', ai_output, re.IGNORECASE) # New TP2 parsing
     reason_match = re.search(r'REASON:(.*?)(\s*-\s*CONF:|\s*$)', ai_output, re.IGNORECASE | re.DOTALL)
     
     if action_match:
@@ -321,8 +377,10 @@ def parse_ai_signal(ai_output, symbol, current_atr):
                 entry = float(entry_match.group(1)) if entry_match else 0
                 sl = float(sl_match.group(1)) if sl_match else 0
                 tp = float(tp_match.group(1)) if tp_match else 0
+                tp2 = float(tp2_match.group(1)) if tp2_match else 0 # New TP2
                 
                 if entry == 0: 
+                    # Attempt to extract price from reason if entry is missing
                     price_match = re.search(r'Current Price: ([\d.]+)', signal['reason'])
                     if price_match: entry = float(price_match.group(1))
                     else: entry = 0
@@ -331,12 +389,14 @@ def parse_ai_signal(ai_output, symbol, current_atr):
 
                 if side == "BUY":
                     signal['entry'] = entry
-                    signal['sl'] = sl if sl > 0 and sl < entry else entry - (current_atr * 1.5)
-                    signal['tp'] = tp if tp > entry else entry + (current_atr * 3.0)
+                    signal['sl'] = sl if sl > 0 and sl < entry else entry - (current_atr * 1.5) # Default SL
+                    signal['tp'] = tp if tp > entry else entry + (current_atr * 3.0) # Default TP1
+                    signal['tp2'] = tp2 if tp2 > entry else entry + (current_atr * 4.5) # Default TP2 (Macro/Longer ATR)
                 elif side == "SELL":
                     signal['entry'] = entry
-                    signal['sl'] = sl if sl > entry else entry + (current_atr * 1.5)
-                    signal['tp'] = tp if tp < entry and tp > 0 else entry - (current_atr * 3.0)
+                    signal['sl'] = sl if sl > entry else entry + (current_atr * 1.5) # Default SL
+                    signal['tp'] = tp if tp < entry and tp > 0 else entry - (current_atr * 3.0) # Default TP1
+                    signal['tp2'] = tp2 if tp2 < entry and tp2 > 0 else entry - (current_atr * 4.5) # Default TP2 (Macro/Longer ATR)
                 
             except Exception as e:
                 signal['reason'] += f" | (Parsing Error: {e})"
@@ -347,7 +407,7 @@ def parse_ai_signal(ai_output, symbol, current_atr):
         
     return signal
 
-# ---------------- Professional Candlestick Chart (FIXED FUNCTION) ----------------
+# ---------------- Professional Candlestick Chart (UNCHANGED FIX) ----------------
 
 def plot_signal_chart(symbol, candles, signal):
     
@@ -361,6 +421,7 @@ def plot_signal_chart(symbol, candles, signal):
     df_candles['SMA200'] = df_candles['Close'].rolling(window=200).mean()
     
     # *** FIX: Filter the DataFrame to the last 300 points for consistent plotting ***
+    # Using 300 points for plot stability, even if 999 are fetched for analysis.
     df_plot = df_candles.iloc[-300:] 
 
     apds = [
@@ -368,11 +429,12 @@ def plot_signal_chart(symbol, candles, signal):
         mpf.make_addplot(df_plot['SMA200'], color='#FFA500', panel=0, width=1.0, secondary_y=False), 
     ]
 
-    # 3. Prepare horizontal lines for signals
+    # 3. Prepare horizontal lines for signals (TP2 added here)
     hlines = []
     colors = []; linestyles = []
     
     if signal["side"] in ["BUY", "SELL"]:
+        # Only plot Entry, SL, and TP1 (TP2 is often far away and clutters the short-term chart)
         hlines.extend([signal["entry"], signal["sl"], signal["tp"]])
         colors = ['blue', 'red', 'green']
         linestyles = ['-', '--', '--'] 
@@ -404,7 +466,7 @@ def plot_signal_chart(symbol, candles, signal):
 
     # 6. Add 'Flying Raijin' Logo/Watermark
     ax = axlist[0] 
-    logo_text = "⚡ Flying Raijin ⚡"
+    logo_text = "⚡ Flying Raijin - Multi-TF Model ⚡"
     
     ax.text(
         0.99, 0.01, logo_text, transform=ax.transAxes, fontsize=14, fontweight='bold',
@@ -418,7 +480,7 @@ def plot_signal_chart(symbol, candles, signal):
     plt.close(fig)
     return tmp.name
 
-# ---------------- Fetch & Telegram ----------------
+# ---------------- Fetch & Telegram (No changes) ----------------
 async def fetch_json(session,url):
     try:
         async with session.get(url,timeout=20) as r:
@@ -448,7 +510,7 @@ async def send_photo(session,caption,path):
     except Exception as e: print("send_photo error:", e)
 
 
-# ---------------- Main loop ----------------
+# ---------------- Main loop (UPDATED) ----------------
 async def advanced_options_loop():
     if not client:
         print("🔴 ERROR: OpenAI API Key (OPENAI_API_KEY) not set. AI analysis will not work.")
@@ -457,7 +519,7 @@ async def advanced_options_loop():
     init_redis_plain() 
     
     async with aiohttp.ClientSession() as session:
-        startup=f"🤖 Advanced BTC/ETH Bot Started (Options, 720H Candles, GPT-4o-mini) • Poll {POLL_INTERVAL//60}min"
+        startup=f"🤖 Advanced BTC/ETH Bot Started (Multi-TF/OI Analysis, GPT-4o-mini) • Poll {POLL_INTERVAL//60}min"
         print(startup); await send_text(session,startup)
         
         while True:
@@ -470,7 +532,11 @@ async def advanced_options_loop():
                 tasks[f"{sym}_24h"] = fetch_json(session, TICKER_24H_URL.format(symbol=sym))
                 tasks[f"{sym}_depth"] = fetch_json(session, DEPTH_URL.format(symbol=sym))
                 tasks[f"{sym}_aggTrades"] = fetch_json(session, AGGT_URL.format(symbol=sym))
+                
+                # Fetch 1H (Short Term) and 4H (Long Term) Candles (999 limit)
                 tasks[f"{sym}_1h"] = fetch_json(session, CANDLE_URL.format(symbol=sym, tf="1h", limit=CANDLE_LIMITS["1h"]))
+                tasks[f"{sym}_4h"] = fetch_json(session, CANDLE_URL.format(symbol=sym, tf="4h", limit=CANDLE_LIMITS["4h"]))
+                
                 tasks[f"{sym}_options"] = get_options_data_for_symbol(session, sym) 
 
             
@@ -486,20 +552,24 @@ async def advanced_options_loop():
             for sym in SYMBOLS:
                 try:
                     data = fetched_data.get(sym, {})
-                    c1h = data.get("1h"); spot_depth = data.get("depth"); agg_data = data.get("aggTrades"); options_data = data.get("options")
+                    c1h = data.get("1h"); 
+                    spot_depth = data.get("depth"); agg_data = data.get("aggTrades"); 
+                    options_data = data.get("options"); 
+                    candles_4h = data.get("4h");
 
                     if not all([c1h, spot_depth, agg_data]):
                         print(f"{sym}: Missing critical data (1H Candle/Spot Depth/AggTrades), skipping"); continue
                     
-                    # 1. Run Advanced AI Analysis
-                    final_signal = await analyze_with_openai(sym, c1h, spot_depth, agg_data, options_data)
+                    # 1. Run Advanced AI Analysis (passing entire data dict)
+                    final_signal = await analyze_with_openai(sym, data)
                     
                     if final_signal["side"] in ["BUY", "SELL"]:
                         
                         if final_signal["confidence"] >= SIGNAL_CONF_THRESHOLD:
                             store_signal(sym, final_signal)
 
-                            msg=f"**🔥 Advanced AI Signal ({final_signal['confidence']}%)**\n\n**Asset:** {sym}\n**Action:** {final_signal['side']}\n**Entry:** `{fmt_price(final_signal['entry'])}`\n**SL:** `{fmt_price(final_signal['sl'])}` | **TP:** `{fmt_price(final_signal['tp'])}`\n\n**AI Logic:** {final_signal['reason']}"
+                            # Message updated to include TP1 and TP2
+                            msg=f"**🔥 Advanced AI Signal ({final_signal['confidence']}%)**\n\n**Asset:** {sym}\n**Action:** {final_signal['side']}\n**Entry:** `{fmt_price(final_signal['entry'])}`\n**SL:** `{fmt_price(final_signal['sl'])}`\n**TP1:** `{fmt_price(final_signal['tp'])}` | **TP2 (Macro):** `{fmt_price(final_signal['tp2'])}`\n\n**AI Logic:** {final_signal['reason']}"
                             
                             chart=plot_signal_chart(sym, c1h, final_signal)
                             await send_photo(session,msg,chart)

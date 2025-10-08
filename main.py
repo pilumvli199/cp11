@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # main.py - Professional BTC/ETH Bot (Options Chain, Deep Candlesticks, GPT-4o-mini Analysis)
-# FIXES: 1. mpfinance 'linestyles' to 'linestyle'. 2. Robust options depth fetching.
+# FIXES: 1. mpfinance 'linestyles' to 'linestyle'. 2. Robust options data fetching.
+# NEW: Auto-selects the NEXT nearest non-expired Option Contract.
 
 import os, json, asyncio, traceback, time
 import numpy as np
@@ -10,6 +11,7 @@ from dotenv import load_dotenv
 import aiohttp
 from tempfile import NamedTemporaryFile
 import re 
+from typing import Optional, Dict, Any, List
 
 # plotting (server-safe)
 import matplotlib
@@ -46,7 +48,7 @@ AGGT_URL = BASE_URL + "/api/v3/aggTrades?symbol={symbol}&limit=100"
 
 # Options Endpoints
 OPTIONS_EXCHANGE_INFO_URL = OPTIONS_BASE_URL + "/eapi/v1/exchangeInfo"
-# Changed limit to 100 for depth, 500 might be too large and cause 400 on some contracts
+OPTIONS_TICKER_URL = OPTIONS_BASE_URL + "/eapi/v1/ticker" # Ticker for OI/IV
 OPTIONS_DEPTH_URL = OPTIONS_BASE_URL + "/eapi/v1/depth?symbol={symbol}&limit=100" 
 
 CANDLE_LIMITS = {"1h": 720, "4h": 200, "1d": 200}
@@ -58,8 +60,6 @@ REDIS = None
 def init_redis_plain():
     global REDIS
     host = os.getenv("REDIS_HOST")
-    # ... (rest of redis init)
-    # [Code for Redis Init]
     port = int(os.getenv("REDIS_PORT")) if os.getenv("REDIS_PORT") else None
     user = os.getenv("REDIS_USER") or None
     password = os.getenv("REDIS_PASSWORD") or None
@@ -77,7 +77,6 @@ def init_redis_plain():
             REDIS.ping()
             return
         except Exception: REDIS = None
-    # [End of Redis Init]
 
 def safe_call(fn, *args, **kwargs):
     try:
@@ -90,61 +89,110 @@ def safe_hset(h, field, val):
 
 def store_signal(symbol, signal): safe_hset("signals:advanced", symbol, json.dumps(signal))
 
-# ---------------- Options Chain Analysis (FIXED FUNCTION) ----------------
-async def get_options_data_for_symbol(session, base_symbol):
-    data = {"exchange_info": None, "put_call_ratio": "N/A", "implied_volatility": "N/A", "near_term_symbol": None}
+# ---------------- Options Chain Analysis (Updated for Next Expiry) ----------------
+
+async def get_options_data_for_symbol(session, base_symbol) -> Dict[str, Any]:
+    data = {"options_sentiment": "Neutral", "oi_summary": "N/A", "near_term_symbol": None}
     
-    exchange_info = await fetch_json(session, OPTIONS_EXCHANGE_INFO_URL)
-    if not exchange_info or 'optionSymbols' not in exchange_info: 
+    current_time_ms = int(time.time() * 1000) # Current time in milliseconds
+    
+    # 1. Fetch ALL Options Tickers (Includes OI, IV, and Expiry info)
+    all_tickers = await fetch_json(session, OPTIONS_TICKER_URL)
+    if not all_tickers or not isinstance(all_tickers, list): return data
+    
+    # 2. Filter Tickers for the specific asset (e.g., BTCUSDT)
+    target_tickers = [t for t in all_tickers if t.get('underlying') == base_symbol]
+    
+    if not target_tickers: return data
+
+    # 3. Find the NEXT NEAREST NON-EXPIRED CONTRACT
+    
+    # Collect all unique expiry dates
+    all_expiries = sorted(list(set(t.get('expiryDate', 0) for t in target_tickers)))
+    
+    # Find the first expiry date that is >= current time
+    next_expiry_date_ms = next(
+        (exp for exp in all_expiries if exp > current_time_ms), 
+        None
+    )
+    
+    if not next_expiry_date_ms:
+        data['oi_summary'] = f"Warning: No future option expiries found for {base_symbol}."
         return data
-    
-    data["exchange_info"] = exchange_info
-    
-    # Filter using 'underlying', which is the base trading pair (e.g., BTCUSDT)
-    matching_contracts = [
-        sym for sym in exchange_info.get('optionSymbols', [])
-        if sym.get('underlying') == base_symbol
+
+    # 4. Filter all contracts belonging to the next nearest expiry
+    next_expiry_contracts = [
+        t for t in target_tickers 
+        if t.get('expiryDate') == next_expiry_date_ms
     ]
     
-    if not matching_contracts: 
-        return data
+    if not next_expiry_contracts: return data
+
+    # --- Start Global OI and IV Calculation for the Next Expiry Chain ---
+    total_call_oi = 0
+    total_put_oi = 0
+    total_contracts = 0
+    all_ivs = []
     
-    # Sort by expiry to find the nearest term
-    matching_contracts.sort(key=lambda x: x['expiryDate'])
+    for ticker in next_expiry_contracts:
+        try:
+            oi = float(ticker.get('openInterest', 0))
+            iv = float(ticker.get('impliedVolatility', 0))
+            total_contracts += 1
+            
+            # Infer Option Type
+            option_type = ticker.get('optionType') 
+            if not option_type:
+                symbol_name = ticker.get('symbol', '')
+                if symbol_name.endswith('-C'): option_type = 'CALL'
+                elif symbol_name.endswith('-P'): option_type = 'PUT'
+            
+            if option_type == 'CALL':
+                total_call_oi += oi
+            elif option_type == 'PUT':
+                total_put_oi += oi
+
+            if iv > 0:
+                all_ivs.append(iv)
+                
+        except Exception:
+            continue 
+
+    # 5. Synthesize Sentiment
+    total_oi = total_call_oi + total_put_oi
+    pcr = total_put_oi / total_call_oi if total_call_oi > 0 else 0
+    avg_iv = np.mean(all_ivs) if all_ivs else 0
     
-    # We will only process the first contract (nearest expiry) for liquidity check
-    near_term_symbol = matching_contracts[0]['symbol']
-    data["near_term_symbol"] = near_term_symbol
-    
-    # 2. Get Option Chain Depth (Order Book) for the near-term contract
-    # Using try-except for depth call to handle 400 errors gracefully
-    option_depth = await fetch_json(session, OPTIONS_DEPTH_URL.format(symbol=near_term_symbol))
-    
-    if option_depth and 'bids' in option_depth and 'asks' in option_depth:
-        # Simplified PCR Logic 
-        total_bid_volume = sum([float(b[1]) for b in option_depth['bids']])
-        total_ask_volume = sum([float(a[1]) for a in option_depth['asks']])
-        
-        data["options_liquidity_info"] = {
-            "near_term_symbol": near_term_symbol,
-            "bid_volume": total_bid_volume,
-            "ask_volume": total_ask_volume,
-            "bids_count": len(option_depth['bids']),
-            "asks_count": len(option_depth['asks'])
-        }
+    if total_oi == 0:
+        sentiment = "No Open Interest."
+    elif pcr < 0.7:
+        sentiment = "Strong Call Bias (Bullish sentiment) - PCR < 0.7."
+    elif pcr > 1.2:
+        sentiment = "Strong Put Bias (Bearish/Hedging sentiment) - PCR > 1.2."
     else:
-        # If depth call failed (e.g. API Error 400), return zero liquidity info
-        print(f"Warning: Could not fetch valid depth data for {near_term_symbol}. Using zero liquidity.")
+        sentiment = f"Neutral to Moderate Sentiment (PCR: {pcr:.2f})."
         
+    # 6. Prepare Output for GPT-4o mini
+    data["options_sentiment"] = sentiment
+    data["oi_summary"] = (
+        f"Next Expiry Date: {datetime.fromtimestamp(next_expiry_date_ms/1000).strftime('%Y-%m-%d %H:%M')}. "
+        f"Contracts Analyzed: {total_contracts}. "
+        f"Total OI: {total_oi:.2f}. Call OI: {total_call_oi:.2f}. Put OI: {total_put_oi:.2f}. "
+        f"Put/Call Ratio (PCR): {pcr:.2f}. "
+        f"Average Implied Volatility (IV): {avg_iv * 100:.2f}%."
+    )
+    
+    data["near_term_symbol"] = next_expiry_contracts[0]['symbol'] if next_expiry_contracts else 'N/A'
+
     return data
 
 
-# ---------------- GPT-4o-mini Analysis (No significant changes needed) ----------------
+# ---------------- GPT-4o-mini Analysis (Updated Prompt) ----------------
 
 async def analyze_with_openai(symbol, candles_1h, spot_depth, agg_trades, options_data):
     if not client: return {"side":"none","confidence":0,"reason":"NO_AI_KEY"}
     
-    # ... (Data preparation and prompt construction remain the same)
+    # 1. Prepare Data Summary (No change in core data prep)
     df_1h = pd.DataFrame(candles_1h, columns=['OpenTime', 'Open', 'High', 'Low', 'Close', 'Volume', 'CloseTime', 'QuoteAssetVolume', 'NumberOfTrades', 'TakerBuyBaseAssetVolume', 'TakerBuyQuoteAssetVolume', 'Ignore'])
     df_1h = df_1h[['Open', 'High', 'Low', 'Close', 'Volume']].astype(float)
     
@@ -169,17 +217,17 @@ async def analyze_with_openai(symbol, candles_1h, spot_depth, agg_trades, option
     sell_vol_agg = sum([float(t['q']) for t in agg_trades if t['m']])
     agg_imbalance = (buy_vol_agg - sell_vol_agg) / (buy_vol_agg + sell_vol_agg) * 100 if (buy_vol_agg + sell_vol_agg) > 0 else 0
     
-    # Options Data Summary 
-    opt_info = options_data.get('options_liquidity_info', {})
-    opt_bid_vol = opt_info.get('bid_volume', 0)
-    opt_ask_vol = opt_info.get('ask_volume', 0)
+    # Options Data Summary (Updated to use new OI/IV structure)
+    opt_info = options_data
+    opt_summary = opt_info.get('oi_summary', 'No Open Interest Data.')
+    opt_sentiment = opt_info.get('options_sentiment', 'Neutral')
     opt_symbol = opt_info.get('near_term_symbol', 'N/A')
     
     # ATR for Risk Management
     highs = df_1h['High'].to_numpy(); lows = df_1h['Low'].to_numpy(); closes = df_1h['Close'].to_numpy()
     current_atr = atr(highs, lows, closes) 
 
-    # 2. Construct the Detailed Prompt
+    # 2. Construct the Detailed Prompt (Updated Options Section)
     sys_prompt = (
         "You are a sophisticated quantitative crypto analyst using a comprehensive multi-factor model. "
         "Your task is to analyze the provided market data and generate a high-conviction trading signal "
@@ -200,11 +248,11 @@ async def analyze_with_openai(symbol, candles_1h, spot_depth, agg_trades, option
     - Spot Depth Imbalance (50 levels): {spot_imbalance:.2f}% (Positive=Buy Pressure, Negative=Sell Pressure)
     - Aggressive Trades Imbalance (Last 100 trades): {agg_imbalance:.2f}% (Positive=Aggressive Buying, Negative=Aggressive Selling)
     
-    **3. Options Chain Analysis (Vanilla Options):**
-    - Nearest Expiry Contract Symbol: {opt_symbol}
-    - Options Bid Volume (Near-Term): {opt_bid_vol:.2f} (Implied Demand/Call side)
-    - Options Ask Volume (Near-Term): {opt_ask_vol:.2f} (Implied Supply/Put side)
-    - **Interpretation Hint:** High Call liquidity/demand (Bid Vol) suggests bullish expectations; High Put liquidity/supply (Ask Vol) suggests bearish expectations/hedging.
+    **3. Options Chain Deep Analysis (Vanilla Options - Next Nearest Expiry):**
+    - Nearest Expiry Contract Symbol (Reference): {opt_symbol}
+    - **Global OI Summary:** {opt_summary}
+    - **Synthesized Sentiment:** {opt_sentiment}
+    - **Interpretation Hint:** Use PCR (Put/Call Ratio) and OI distribution to gauge institutional positioning and future expectations. High Call OI/low PCR is bullish; High Put OI/high PCR suggests hedging or bearish pressure.
     
     **4. Instructions:**
     - Analyze the long-term trend from the 720 candles.
@@ -235,7 +283,6 @@ async def analyze_with_openai(symbol, candles_1h, spot_depth, agg_trades, option
         return signal
         
     except Exception as e:
-        # ... (Error handling remains the same)
         print(f"OpenAI analysis error for {symbol}: {e}")
         return {"side":"none","confidence":0,"reason":f"AI_CALL_ERROR: {str(e)}"}
 
@@ -243,7 +290,6 @@ async def analyze_with_openai(symbol, candles_1h, spot_depth, agg_trades, option
 # ---------------- Utility Functions (No changes needed) ----------------
 
 def atr(highs, lows, closes, period=14):
-    # ... (ATR calculation remains the same)
     if len(closes) < period: return 0.0
     tr = []
     for i in range(1, len(closes)):
@@ -258,7 +304,6 @@ def atr(highs, lows, closes, period=14):
 def fmt_price(p): return f"{p:.4f}" if abs(p)<1 else f"{p:.2f}"
 
 def parse_ai_signal(ai_output, symbol, current_atr):
-    # ... (Signal parsing logic remains the same)
     signal = {"side": "none", "confidence": 0, "reason": ai_output, "entry": 0, "sl": 0, "tp": 0}
     
     conf_match = re.search(r'CONF:(\d+)%', ai_output, re.IGNORECASE)
@@ -306,8 +351,8 @@ def parse_ai_signal(ai_output, symbol, current_atr):
         
     return signal
 
-# ---------------- Professional Candlestick Chart (FIXED FUNCTION) ----------------
-# FIX: Changed 'linestyles' to 'linestyle' in mpf.plot hlines dict.
+# ---------------- Professional Candlestick Chart (Fixed 'linestyles') ----------------
+
 def plot_signal_chart(symbol, candles, signal):
     
     # 1. Prepare Data for mplfinance (Pandas DataFrame)
@@ -316,7 +361,6 @@ def plot_signal_chart(symbol, candles, signal):
     df_candles = df_candles.set_index(pd.DatetimeIndex(df_candles['OpenTime']))
     df_candles = df_candles[['Open', 'High', 'Low', 'Close', 'Volume']].astype(float)
 
-    # Add SMA 200 for long-term trend
     df_candles['SMA200'] = df_candles['Close'].rolling(window=200).mean()
 
     apds = [
@@ -330,7 +374,7 @@ def plot_signal_chart(symbol, candles, signal):
     if signal["side"] in ["BUY", "SELL"]:
         hlines.extend([signal["entry"], signal["sl"], signal["tp"]])
         colors = ['blue', 'red', 'green']
-        linestyles = ['-', '--', '--'] # Use as values for linestyle parameter
+        linestyles = ['-', '--', '--'] 
         
     # 4. Define the chart style 
     s = mpf.make_mpf_style(
@@ -354,7 +398,7 @@ def plot_signal_chart(symbol, candles, signal):
         addplot=apds,           
         figscale=1.5,           
         returnfig=True,         
-        # >>> FIX IS HERE: linestyles changed to linestyle
+        # FIX IS HERE: linestyles changed to linestyle
         hlines=dict(hlines=hlines, colors=colors, linestyle=linestyles, linewidths=1.5, alpha=0.9), 
     )
 
@@ -374,7 +418,7 @@ def plot_signal_chart(symbol, candles, signal):
     plt.close(fig)
     return tmp.name
 
-# ---------------- Fetch & Telegram (Added API Error Handling) ----------------
+# ---------------- Fetch & Telegram (No changes needed) ----------------
 async def fetch_json(session,url):
     try:
         async with session.get(url,timeout=20) as r:
@@ -385,7 +429,7 @@ async def fetch_json(session,url):
     except Exception as e:
         print("fetch_json error:", e)
         return None
-# ... (send_text and send_photo remain the same)
+
 async def send_text(session,text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print(text); return
@@ -404,7 +448,7 @@ async def send_photo(session,caption,path):
     except Exception as e: print("send_photo error:", e)
 
 
-# ---------------- Main loop (No changes needed) ----------------
+# ---------------- Main loop ----------------
 async def advanced_options_loop():
     if not client:
         print("🔴 ERROR: OpenAI API Key (OPENAI_API_KEY) not set. AI analysis will not work.")
@@ -444,8 +488,11 @@ async def advanced_options_loop():
                     data = fetched_data.get(sym, {})
                     c1h = data.get("1h"); spot_depth = data.get("depth"); agg_data = data.get("aggTrades"); options_data = data.get("options")
 
-                    if not all([c1h, spot_depth, agg_data, options_data]):
-                        print(f"{sym}: Missing critical data (1H Candle/Spot Depth/AggTrades/Options), skipping"); continue
+                    if not all([c1h, spot_depth, agg_data]):
+                        print(f"{sym}: Missing critical data (1H Candle/Spot Depth/AggTrades), skipping"); continue
+                    
+                    # The Options data fetch might return incomplete data if no contracts are found, 
+                    # but the bot should not stop, the analysis prompt handles "No Open Interest Data."
 
                     # 1. Run Advanced AI Analysis
                     final_signal = await analyze_with_openai(sym, c1h, spot_depth, agg_data, options_data)

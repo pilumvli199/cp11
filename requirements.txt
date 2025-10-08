@@ -1,7 +1,7 @@
 # Core Libraries for Data Processing and AI
 pandas==2.2.2
 numpy==1.26.4
-openai==1.30.4
+openai==0.28.1    <--- (IMPORTANT CHANGE HERE)
 python-dotenv==1.0.1
 redis==5.0.4
 
@@ -9,6 +9,5 @@ redis==5.0.4
 aiohttp==3.9.5
 
 # Libraries for Charting and Plotting (Crucial)
-# mplfinance relies on matplotlib
 matplotlib==3.8.4
 mplfinance==0.12.9b0

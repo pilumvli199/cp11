@@ -18,7 +18,9 @@ import matplotlib.pyplot as plt
 import mplfinance as mpf 
 
 # OpenAI client
-from openai import OpenAI
+# === FIX for ImportError with openai v0.28.1: Change import structure ===
+import openai 
+# ------------------------------------------------------------------------
 
 # Redis (non-TLS)
 import redis
@@ -51,13 +53,18 @@ OPTIONS_TICKER_URL = OPTIONS_BASE_URL + "/eapi/v1/ticker"
 CANDLE_LIMITS = {"1h": 999, "4h": 999, "1d": 999} 
 
 # --- STABLE PROXY FIX: Remove environment variables that might pass 'proxies' argument automatically ---
-# This prevents the TypeError: Client.__init__() got an unexpected keyword argument 'proxies'
 for var in ['http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY']:
     if var in os.environ:
         del os.environ[var]
 # ----------------------------------------------------------------------------------------------------
 
-client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+# === FIX for client initialization (Uses openai v0.x Client) ===
+if OPENAI_API_KEY:
+    # In v0.x, the client is accessed via openai.Client
+    client = openai.Client(api_key=OPENAI_API_KEY)
+else:
+    client = None
+# --------------------------------------------------------------
 
 # --- Redis Init/Helpers (No changes) ---
 REDIS = None
@@ -226,7 +233,7 @@ async def analyze_with_openai(symbol, data):
     agg_imbalance = (buy_vol_agg - sell_vol_agg) / (buy_vol_agg + sell_vol_agg) * 100 if (buy_vol_agg + sell_vol_agg) > 0 else 0
     
     # 3. Options Data Summary 
-    opt_info = options_data
+    opt_info = data.get('options')
     opt_summary = opt_info.get('oi_summary', 'No Open Interest Data.')
     opt_sentiment = opt_info.get('options_sentiment', 'Neutral')
     opt_symbol = opt_info.get('near_term_symbol', 'N/A')
@@ -277,7 +284,8 @@ async def analyze_with_openai(symbol, data):
     try:
         loop = asyncio.get_running_loop()
         def call(): 
-            return client.chat.completions.create(
+            # In v0.x, use completion.create for chat endpoint compatibility
+            return openai.ChatCompletion.create(
                 model=OPENAI_MODEL,
                 messages=[
                     {"role": "system", "content": sys_prompt},
@@ -286,6 +294,7 @@ async def analyze_with_openai(symbol, data):
                 max_tokens=600,
                 temperature=0.3
             )
+        # Note: v0.x client methods are not bound to the client instance for ChatCompletion
         resp = await loop.run_in_executor(None, call)
         ai_output = resp.choices[0].message.content.strip()
         

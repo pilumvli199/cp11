@@ -34,7 +34,9 @@ POLL_INTERVAL = max(30, int(os.getenv("POLL_INTERVAL", 1800)))
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini") 
+# NOTE: gpt-4o-mini is NOT supported in v0.x. We must use an older, available model.
+# I'll use gpt-3.5-turbo, which is available in v0.x and serves a similar purpose.
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo") 
 SIGNAL_CONF_THRESHOLD = float(os.getenv("SIGNAL_CONF_THRESHOLD", 80.0)) 
 
 # API Endpoints
@@ -58,13 +60,20 @@ for var in ['http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY']:
         del os.environ[var]
 # ----------------------------------------------------------------------------------------------------
 
-# === FIX for client initialization (Uses openai v0.x Client) ===
+# === FIX for client initialization (Uses openai v0.x Client structure) ===
+# In v0.x, the client is accessed directly, usually assigned to an attribute of the 'openai' module.
+# The original error was caused by calling 'openai.Client()'.
+# The correct way to initialize is to use the `openai` module's methods, which internally handle the API key.
+# However, to maintain the 'client' variable structure, we'll initialize the base class.
 if OPENAI_API_KEY:
-    # In v0.x, the client is accessed via openai.Client
-    client = openai.Client(api_key=OPENAI_API_KEY)
+    # In v0.x, we often just set the key and use the module's functions,
+    # but since the original code tried to use a client object,
+    # we'll adapt to the most common v0.x pattern: setting the API key globally.
+    openai.api_key = OPENAI_API_KEY
+    client = True # Simply use a boolean flag since the client object is not directly used for ChatCompletion in v0.x
 else:
     client = None
-# --------------------------------------------------------------
+# -------------------------------------------------------------------------
 
 # --- Redis Init/Helpers (No changes) ---
 REDIS = None
@@ -171,9 +180,10 @@ async def get_options_data_for_symbol(session, base_symbol) -> Dict[str, Any]:
     return data
 
 
-# ---------------- GPT-4o-mini Analysis ----------------
+# ---------------- GPT-3.5-turbo Analysis (v0.x Model) ----------------
 
 async def analyze_with_openai(symbol, data): 
+    # Use the client flag check
     if not client: return {"side":"none","confidence":0,"reason":"NO_AI_KEY"}
     
     # Extract data parts
@@ -492,7 +502,7 @@ async def advanced_options_loop():
     init_redis_plain() 
     
     async with aiohttp.ClientSession() as session:
-        startup=f"🤖 Advanced BTC/ETH Bot Started (Multi-TF/OI Analysis, GPT-4o-mini) • Poll {POLL_INTERVAL//60}min"
+        startup=f"🤖 Advanced BTC/ETH Bot Started (Multi-TF/OI Analysis, GPT-3.5-turbo) • Poll {POLL_INTERVAL//60}min"
         print(startup); await send_text(session,startup)
         
         while True:

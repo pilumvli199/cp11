@@ -103,7 +103,6 @@ def store_signal(symbol, signal): safe_hset("signals:advanced", symbol, json.dum
 
 # ---------------- Options Chain Analysis (Unchanged) ----------------
 async def get_options_data_for_symbol(session, base_symbol) -> Dict[str, Any]:
-    # (Function body is the same as the previous correct implementation)
     data = {"options_sentiment": "Neutral", "oi_summary": "N/A", "near_term_symbol": None}
     current_time_ms = int(time.time() * 1000) 
     
@@ -165,6 +164,152 @@ async def get_options_data_for_symbol(session, base_symbol) -> Dict[str, Any]:
     data["near_term_symbol"] = next_expiry_contracts[0]['symbol'] if next_expiry_contracts else 'N/A'
     return data
 
+# ---------------- Utility Functions (FIXED: Moved to be defined before use) ----------------
+
+def rsi(prices, period=14):
+    """Calculates Relative Strength Index (RSI)."""
+    delta = pd.Series(prices).diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(com=period - 1, adjust=False).mean()
+    avg_loss = loss.ewm(com=period - 1, adjust=False).mean()
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs)).iloc[-1]
+
+def atr(highs, lows, closes, period=14):
+    """Calculates Average True Range (ATR)."""
+    high = pd.Series(highs)
+    low = pd.Series(lows)
+    close = pd.Series(closes).shift(1)
+    
+    tr1 = high - low
+    tr2 = abs(high - close)
+    tr3 = abs(low - close)
+    true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    
+    atr = true_range.ewm(span=period, adjust=False, min_periods=period).mean()
+    return atr.iloc[-1]
+
+def fmt_price(p): 
+    """Formats price based on magnitude."""
+    return f"{p:.4f}" if abs(p) < 1 else f"{p:.2f}"
+
+def parse_ai_signal(ai_output, symbol, current_atr):
+    """Parses the structured output from the AI model."""
+    signal = {"side": "none", "confidence": 0.0, "reason": "AI did not adhere to the format."}
+    
+    try:
+        # Regex to extract structured data
+        match = re.search(
+            r"ACTION:\s*([A-Z]+)\s*-\s*ENTRY:([\d.]+)\s*-\s*SL:([\d.]+)\s*-\s*TP:([\d.]+)\s*-\s*TP2:([\d.]+)\s*-\s*REASON:(.*)\s*-\s*CONF:(\d+\.?\d*)%",
+            ai_output, re.IGNORECASE | re.DOTALL
+        )
+        
+        if not match:
+             # Fallback: Extract action, reason, and confidence if structured format failed
+            action_match = re.search(r"ACTION:\s*([A-Z]+)", ai_output, re.IGNORECASE)
+            conf_match = re.search(r"CONF:(\d+\.?\d*)%", ai_output, re.IGNORECASE)
+            reason_match = re.search(r"REASON:(.*)", ai_output, re.IGNORECASE | re.DOTALL)
+
+            fallback_action = action_match.group(1).upper().strip() if action_match else 'NONE'
+            fallback_conf = float(conf_match.group(1).strip()) if conf_match else 0.0
+            fallback_reason = reason_match.group(1).strip() if reason_match else 'Format error. Logic is in raw output.'
+
+            # If action is BUY/SELL but missing parameters, use fallback calculation
+            if fallback_action in ['BUY', 'SELL'] and fallback_conf >= SIGNAL_CONF_THRESHOLD:
+                # Use simple logic based on current price and ATR for fallback
+                current_price_match = re.search(r"Current Price:\s*([\d.]+)", ai_output)
+                current_price = float(current_price_match.group(1)) if current_price_match else 0.0
+                
+                if current_price > 0:
+                    multiplier = 1.5 * current_atr
+                    signal["side"] = fallback_action
+                    signal["confidence"] = fallback_conf
+                    signal["reason"] = "Fallback Calculation: " + fallback_reason
+                    signal["entry"] = current_price
+                    if fallback_action == 'BUY':
+                        signal["sl"] = current_price - multiplier
+                        signal["tp"] = current_price + 2 * multiplier
+                        signal["tp2"] = current_price + 4 * multiplier 
+                    else: # SELL
+                        signal["sl"] = current_price + multiplier
+                        signal["tp"] = current_price - 2 * multiplier
+                        signal["tp2"] = current_price - 4 * multiplier 
+                    return signal
+            
+            signal["side"] = fallback_action
+            signal["confidence"] = fallback_conf
+            signal["reason"] = fallback_reason
+            return signal
+        
+        # Successful structured parsing
+        action = match.group(1).upper().strip()
+        signal["side"] = action
+        signal["entry"] = float(match.group(2).strip())
+        signal["sl"] = float(match.group(3).strip())
+        signal["tp"] = float(match.group(4).strip())
+        signal["tp2"] = float(match.group(5).strip())
+        signal["reason"] = match.group(6).strip()
+        signal["confidence"] = float(match.group(7).strip())
+        
+        # Quick validation of BUY/SELL entries
+        if action == "BUY" and signal["entry"] >= signal["sl"]: pass # Basic check
+        elif action == "SELL" and signal["entry"] <= signal["sl"]: pass # Basic check
+        elif action in ["BUY", "SELL"]:
+            print(f"Warning: {symbol} SL/Entry validation failed. Setting action to HOLD.")
+            signal["side"] = "HOLD"
+            
+    except Exception as e:
+        signal["reason"] += f" | Parsing Exception: {e}"
+
+    return signal
+
+def plot_signal_chart(symbol, candles, signal):
+    df_candles = pd.DataFrame(candles, columns=['OpenTime', 'Open', 'High', 'Low', 'Close', 'Volume', 'CloseTime', 'QuoteAssetVolume', 'NumberOfTrades', 'TakerBuyBaseAssetVolume', 'TakerBuyQuoteAssetVolume', 'Ignore'])
+    df_candles['OpenTime'] = pd.to_datetime(df_candles['OpenTime'], unit='ms')
+    df_candles = df_candles.set_index(pd.DatetimeIndex(df_candles['OpenTime']))
+    df_candles = df_candles[['Open', 'High', 'Low', 'Close', 'Volume']].astype(float)
+
+    df_candles['SMA200'] = df_candles['Close'].rolling(window=200).mean()
+    df_plot = df_candles.iloc[-300:] 
+
+    apds = [
+        mpf.make_addplot(df_plot['SMA200'], color='#FFA500', panel=0, width=1.0, secondary_y=False), 
+    ]
+    hlines = []; colors = []; linestyles = []
+    
+    if signal["side"] in ["BUY", "SELL"]:
+        # Only plot lines if they are plausible numbers
+        if signal.get('entry', 0) > 0: hlines.append(signal["entry"]); colors.append('blue'); linestyles.append('-')
+        if signal.get('sl', 0) > 0: hlines.append(signal["sl"]); colors.append('red'); linestyles.append('--')
+        if signal.get('tp', 0) > 0: hlines.append(signal["tp"]); colors.append('green'); linestyles.append('--')
+        
+    s = mpf.make_mpf_style(
+        base_mpf_style='yahoo', gridcolor='#e0e0e0', facecolor='#ffffff', figcolor='#ffffff', y_on_right=False,
+        marketcolors=mpf.make_marketcolors(up='g', down='r', edge='inherit', wick='inherit', volume='inherit')
+    )
+
+    fig, axlist = mpf.plot(
+        df_plot, type='candle', style=s,
+        title=f"{symbol} 1H Advanced Signal ({signal.get('side','?')}) | Conf {signal.get('confidence',0)}% | Model: {signal.get('model', 'N/A')}",
+        ylabel='Price', addplot=apds, figscale=1.5, returnfig=True,         
+        hlines=dict(hlines=hlines, colors=colors, linestyle=linestyles, linewidths=1.5, alpha=0.9), 
+    )
+
+    ax = axlist[0] 
+    logo_text = "⚡ Flying Raijin - Multi-TF Model ⚡"
+    ax.text(
+        0.99, 0.01, logo_text, transform=ax.transAxes, fontsize=14, fontweight='bold',
+        color='#FFD700', ha='right', va='bottom', alpha=0.8,
+        bbox=dict(facecolor='#333333', alpha=0.7, edgecolor='#FFD700', linewidth=1, boxstyle='round,pad=0.5')
+    )
+
+    # Use NamedTemporaryFile to ensure unique path and safe file handling
+    tmp = NamedTemporaryFile(delete=False, suffix=f"_{symbol}.png")
+    fig.savefig(tmp.name, bbox_inches='tight')
+    plt.close(fig)
+    return tmp.name
+
 # ---------------- Hybrid GPT Analysis Function ----------------
 
 async def analyze_with_openai(symbol, data, chart_path=None): 
@@ -193,6 +338,8 @@ async def analyze_with_openai(symbol, data, chart_path=None):
         pattern_summary = "Possible Bearish Engulfing/Evening Star formation."
         
     highs = df_1h['High'].to_numpy(); lows = df_1h['Low'].to_numpy(); closes = df_1h['Close'].to_numpy()
+    
+    # FIXED: atr is now defined before this function
     current_atr = atr(highs, lows, closes) 
     
     # 4H Data
@@ -200,7 +347,10 @@ async def analyze_with_openai(symbol, data, chart_path=None):
         df_4h = pd.DataFrame(candles_4h, columns=['OpenTime', 'Open', 'High', 'Low', 'Close', 'Volume', 'CloseTime', 'QuoteAssetVolume', 'NumberOfTrades', 'TakerBuyBaseAssetVolume', 'TakerBuyQuoteAssetVolume', 'Ignore'])
         df_4h = df_4h[['Open', 'High', 'Low', 'Close']].astype(float)
         long_term_ema = df_4h['Close'].ewm(span=200, adjust=False).mean().iloc[-1]
+        
+        # FIXED: rsi is now defined before this function
         long_term_rsi = df_4h['Close'].rolling(window=14).apply(lambda x: rsi(x), raw=True).iloc[-1]
+        
         if current_price > long_term_ema:
             long_term_trend = f"BULLISH (Price above 4H EMA 200: {long_term_ema:.2f})"
         else:
@@ -234,7 +384,7 @@ async def analyze_with_openai(symbol, data, chart_path=None):
         "Your task is to analyze the provided market data and generate a high-conviction trading signal "
         "(BUY/SELL/HOLD) for the next 24-48 hours. Use ALL data points below, especially combining Macro (4H/OI) "
         "with Short-Term (1H/Flow) to formulate your logic. "
-        f"Strictly adhere to the output format: 'SYMBOL - ACTION - ENTRY:x - SL:y - TP:z - TP2:w - REASON:.. - CONF:n%'"
+        f"Strictly adhere to the output format: 'ACTION:ACTION_TYPE - ENTRY:x - SL:y - TP:z - TP2:w - REASON:.. - CONF:n%'"
     )
     
     # --- Message Content (TEXT PART) ---
@@ -298,6 +448,9 @@ async def analyze_with_openai(symbol, data, chart_path=None):
     try:
         loop = asyncio.get_running_loop()
         def call(): 
+            # Using the new OpenAI v1.x client structure for better compatibility
+            # This requires a slight change in the calling mechanism if you update to the new client
+            # For the old structure, this should work:
             return openai.ChatCompletion.create(
                 model=model_to_use,
                 messages=messages,
@@ -315,56 +468,8 @@ async def analyze_with_openai(symbol, data, chart_path=None):
         
     except Exception as e:
         print(f"OpenAI analysis error for {symbol} (Model: {model_to_use}): {e}")
+        traceback.print_exc()
         return {"side":"none","confidence":0,"reason":f"AI_CALL_ERROR ({model_to_use}): {str(e)}", "model": model_to_use}
-
-# ---------------- Utility Functions (Unchanged) ----------------
-# rsi, atr, fmt_price, parse_ai_signal (These remain the same as they handle math and output formatting)
-
-# --- plot_signal_chart (Minor change for dynamic filename/cleanup) ---
-def plot_signal_chart(symbol, candles, signal):
-    df_candles = pd.DataFrame(candles, columns=['OpenTime', 'Open', 'High', 'Low', 'Close', 'Volume', 'CloseTime', 'QuoteAssetVolume', 'NumberOfTrades', 'TakerBuyBaseAssetVolume', 'TakerBuyQuoteAssetVolume', 'Ignore'])
-    df_candles['OpenTime'] = pd.to_datetime(df_candles['OpenTime'], unit='ms')
-    df_candles = df_candles.set_index(pd.DatetimeIndex(df_candles['OpenTime']))
-    df_candles = df_candles[['Open', 'High', 'Low', 'Close', 'Volume']].astype(float)
-
-    df_candles['SMA200'] = df_candles['Close'].rolling(window=200).mean()
-    df_plot = df_candles.iloc[-300:] 
-
-    apds = [
-        mpf.make_addplot(df_plot['SMA200'], color='#FFA500', panel=0, width=1.0, secondary_y=False), 
-    ]
-    hlines = []; colors = []; linestyles = []
-    
-    if signal["side"] in ["BUY", "SELL"]:
-        hlines.extend([signal["entry"], signal["sl"], signal["tp"]])
-        colors = ['blue', 'red', 'green']
-        linestyles = ['-', '--', '--'] 
-        
-    s = mpf.make_mpf_style(
-        base_mpf_style='yahoo', gridcolor='#e0e0e0', facecolor='#ffffff', figcolor='#ffffff', y_on_right=False,
-        marketcolors=mpf.make_marketcolors(up='g', down='r', edge='inherit', wick='inherit', volume='inherit')
-    )
-
-    fig, axlist = mpf.plot(
-        df_plot, type='candle', style=s,
-        title=f"{symbol} 1H Advanced Signal ({signal.get('side','?')}) | Conf {signal.get('confidence',0)}% | Model: {signal.get('model', 'N/A')}",
-        ylabel='Price', addplot=apds, figscale=1.5, returnfig=True,         
-        hlines=dict(hlines=hlines, colors=colors, linestyle=linestyles, linewidths=1.5, alpha=0.9), 
-    )
-
-    ax = axlist[0] 
-    logo_text = "⚡ Flying Raijin - Multi-TF Model ⚡"
-    ax.text(
-        0.99, 0.01, logo_text, transform=ax.transAxes, fontsize=14, fontweight='bold',
-        color='#FFD700', ha='right', va='bottom', alpha=0.8,
-        bbox=dict(facecolor='#333333', alpha=0.7, edgecolor='#FFD700', linewidth=1, boxstyle='round,pad=0.5')
-    )
-
-    # Use NamedTemporaryFile to ensure unique path and safe file handling
-    tmp = NamedTemporaryFile(delete=False, suffix=f"_{symbol}.png")
-    fig.savefig(tmp.name, bbox_inches='tight')
-    plt.close(fig)
-    return tmp.name
 
 # ---------------- Fetch & Telegram (Unchanged) ----------------
 async def fetch_json(session,url):
@@ -436,33 +541,35 @@ async def advanced_options_loop():
                         print(f"{sym}: Missing critical data, skipping"); continue
 
                     # 1. Generate Chart Image if Vision is enabled for the symbol
+                    # We pass a placeholder signal here; the real signal will be passed to re-plot later.
                     if sym in VISION_SYMBOLS:
-                        # Temporary signal object just to generate chart with title (side/conf will be updated later)
                         chart_path = plot_signal_chart(sym, c1h, {"side":"N/A", "confidence":0, "model": VISION_MODEL})
 
                     # 2. Run Hybrid AI Analysis
                     final_signal = await analyze_with_openai(sym, data, chart_path)
                     
-                    # 3. Re-plot chart with final signal if it was a Vision analysis (to update title/lines)
-                    # For a hybrid setup, re-plotting is crucial if the initial plot didn't contain the final signal.
-                    # We will re-plot if a signal was generated, regardless of model, to get correct SL/TP lines on chart.
-                    
-                    # 4. Process the Signal
+                    # 3. Process the Signal
                     if final_signal["side"] in ["BUY", "SELL"] and final_signal["confidence"] >= SIGNAL_CONF_THRESHOLD:
                         store_signal(sym, final_signal)
                         
                         # Use the correct model name in the final Telegram message
                         model_used = final_signal.get('model', TEXT_MODEL)
                         
-                        msg=f"**🔥 Advanced AI Signal ({final_signal['confidence']}%)**\n\n**Asset:** {sym} *(Model: {model_used})*\n**Action:** {final_signal['side']}\n**Entry:** `{fmt_price(final_signal['entry'])}`\n**SL:** `{fmt_price(final_signal['sl'])}`\n**TP1:** `{fmt_price(final_signal['tp'])}` | **TP2 (Macro):** `{fmt_price(final_signal['tp2'])}`\n\n**AI Logic:** {final_signal['reason']}"
+                        msg=f"**🔥 Advanced AI Signal ({final_signal['confidence']:.2f}%)**\n\n**Asset:** {sym} *(Model: {model_used})*\n**Action:** {final_signal['side']}\n**Entry:** `{fmt_price(final_signal['entry'])}`\n**SL:** `{fmt_price(final_signal['sl'])}`\n**TP1:** `{fmt_price(final_signal['tp'])}` | **TP2 (Macro):** `{fmt_price(final_signal['tp2'])}`\n\n**AI Logic:** {final_signal['reason']}"
                         
                         # Re-plot the chart with the final calculated lines and model info in title
-                        chart_path = plot_signal_chart(sym, c1h, final_signal)
+                        chart_path_final = plot_signal_chart(sym, c1h, final_signal)
                         
-                        await send_photo(session,msg,chart_path)
-                        print("⚡",msg.replace('\n', ' '))
+                        await send_photo(session,msg,chart_path_final)
+                        print(f"⚡ {sym}: {final_signal['side']} @ {final_signal['entry']:.2f} Conf {final_signal['confidence']:.2f}%")
+                        
+                        # Clean up the original chart path if a new one was created
+                        if chart_path != chart_path_final and chart_path and os.path.exists(chart_path):
+                             os.remove(chart_path)
+                        chart_path = chart_path_final
+                        
                     else:
-                        print(f"{sym}: AI suggested HOLD/NONE or Confidence too low ({final_signal['confidence']}%). Model: {final_signal.get('model', 'N/A')}. Reason: {final_signal['reason'][:50]}...")
+                        print(f"{sym}: AI suggested HOLD/NONE or Confidence too low ({final_signal['confidence']:.2f}%). Model: {final_signal.get('model', 'N/A')}. Reason: {final_signal['reason'][:50]}...")
                         
                 except Exception as e:
                     print(f"Error processing {sym}: {e}")

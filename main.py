@@ -208,7 +208,7 @@ async def analyze_with_openai(symbol, data):
         
         long_term_ema = df_4h['Close'].ewm(span=200, adjust=False).mean().iloc[-1]
         
-        # === FIX: Removed .values because raw=True passes numpy.ndarray ===
+        # === RSI Calculation (uses raw=True) ===
         long_term_rsi = df_4h['Close'].rolling(window=14).apply(lambda x: rsi(x), raw=True).iloc[-1]
         
         if current_price > long_term_ema:
@@ -279,8 +279,8 @@ async def analyze_with_openai(symbol, data):
     - **TP1 (Short-Term):** Must be based on the current ATR and short-term 1H momentum (3x ATR default).
     - **TP2 (Long-Term/Macro):** Must be set based on **4H Key S/R levels** or the **strongest unbreached Options OI Wall**.
     - **Fake Breakout Check:** If the current price is near or breaking {recent_4h_high:.2f} or {recent_4h_low:.2f}, confirm the move with strong **Aggressive Flow** (> 20%) and **OI confirmation**. If confirmation is missing, signal HOLD/NONE or suggest a reversal.
+    - **CRITICAL RULE (High Confirmation Requirement):** If your combined analysis leads to a confidence of less than {int(SIGNAL_CONF_THRESHOLD)}%, the **ACTION MUST be 'HOLD' or 'NONE'**, regardless of the market direction.
     - **If Confidence is ≥ {int(SIGNAL_CONF_THRESHOLD)}%**, provide a specific **BUY/SELL** signal with calculated ENTRY, SL, TP, and TP2.
-    - **If Confidence is < {int(SIGNAL_CONF_THRESHOLD)}%**, the action must be **HOLD** or **NONE**.
     """
 
     try:
@@ -325,7 +325,6 @@ def rsi(prices, period=14):
     loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
     
     # Check for division by zero before calculating rs
-    # If loss is zero, rs should be infinity (or a large number) for rsi to be 100
     rs = np.divide(gain, loss, out=np.full_like(gain, np.inf), where=loss != 0)
     
     rsi_val = 100 - (100 / (1 + rs))
@@ -378,7 +377,7 @@ def parse_ai_signal(ai_output, symbol, current_atr):
                 if entry == 0: raise ValueError("Entry price could not be determined.")
 
                 # --- ATR Safety Check Configuration ---
-                # Max acceptable SL/Entry difference (e.g., 4 times the current ATR)
+                # Max acceptable SL/Entry difference (4 times the current ATR is the max safe limit)
                 max_acceptable_sl_diff = current_atr * 4.0 
                 default_sl_diff = current_atr * 1.5
                 default_tp1_diff = current_atr * 3.0
@@ -388,12 +387,12 @@ def parse_ai_signal(ai_output, symbol, current_atr):
                 if side == "BUY":
                     signal['entry'] = entry
                     
-                    # SL Check: Use AI's SL only if it's tighter than max_acceptable_sl_diff 
+                    # SL Check: Use AI's SL only if it's within the safe ATR range AND on the correct side
                     # (sl > 0: ensure value exists; sl < entry: correct side for BUY)
                     if sl > 0 and sl < entry and (entry - sl) < max_acceptable_sl_diff:
                         signal['sl'] = sl 
                     else:
-                        signal['sl'] = entry - default_sl_diff
+                        signal['sl'] = entry - default_sl_diff # Default ATR SL
                         
                     signal['tp'] = tp if tp > entry else entry + default_tp1_diff
                     signal['tp2'] = tp2 if tp2 > entry else entry + default_tp2_diff
@@ -401,12 +400,12 @@ def parse_ai_signal(ai_output, symbol, current_atr):
                 elif side == "SELL":
                     signal['entry'] = entry
 
-                    # SL Check: Use AI's SL only if it's tighter than max_acceptable_sl_diff
+                    # SL Check: Use AI's SL only if it's within the safe ATR range AND on the correct side
                     # (sl > entry: correct side for SELL)
                     if sl > entry and (sl - entry) < max_acceptable_sl_diff:
                         signal['sl'] = sl 
                     else:
-                        signal['sl'] = entry + default_sl_diff
+                        signal['sl'] = entry + default_sl_diff # Default ATR SL
 
                     signal['tp'] = tp if tp < entry and tp > 0 else entry - default_tp1_diff
                     signal['tp2'] = tp2 if tp2 < entry and tp2 > 0 else entry - default_tp2_diff
@@ -565,6 +564,7 @@ async def advanced_options_loop():
                     # 1. Run Advanced AI Analysis (passing entire data dict)
                     final_signal = await analyze_with_openai(sym, data)
                     
+                    # IMPORTANT: Only process signals that meet the minimum confidence threshold
                     if final_signal["side"] in ["BUY", "SELL"]:
                         
                         if final_signal["confidence"] >= SIGNAL_CONF_THRESHOLD:
@@ -577,7 +577,8 @@ async def advanced_options_loop():
                             await send_photo(session,msg,chart)
                             print("⚡",msg.replace('\n', ' '))
                         else:
-                             print(f"{sym}: AI signal generated but confidence too low ({final_signal['confidence']}%) - Action: {final_signal['side']}")
+                             # This block is now less likely to hit due to prompt change, but remains for safety
+                             print(f"{sym}: AI signal generated but confidence too low ({final_signal['confidence']}%) - Action: {final_signal['side']}. SKIPPED by BOT.")
                     else:
                         print(f"{sym}: AI suggested HOLD/NONE. Conf: {final_signal['confidence']}%. Reason: {final_signal['reason'][:50]}...")
                         

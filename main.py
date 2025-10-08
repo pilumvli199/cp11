@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# main.py - Advanced Multi-Timeframe BTC/ETH Bot (999 Candles, 4H/1H Analysis, GPT-4o-mini)
+# main.py - Advanced Multi-Timeframe BTC/ETH Bot (999 Candles, 4H/1H Analysis, GPT-3.5-turbo)
 
 import os, json, asyncio, traceback, time
 import numpy as np
@@ -18,9 +18,7 @@ import matplotlib.pyplot as plt
 import mplfinance as mpf 
 
 # OpenAI client
-# === FIX for ImportError with openai v0.28.1: Change import structure ===
 import openai 
-# ------------------------------------------------------------------------
 
 # Redis (non-TLS)
 import redis
@@ -34,9 +32,7 @@ POLL_INTERVAL = max(30, int(os.getenv("POLL_INTERVAL", 1800)))
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-# NOTE: gpt-4o-mini is NOT supported in v0.x. We must use an older, available model.
-# I'll use gpt-3.5-turbo, which is available in v0.x and serves a similar purpose.
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo") 
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo") # Changed to v0.x supported model
 SIGNAL_CONF_THRESHOLD = float(os.getenv("SIGNAL_CONF_THRESHOLD", 80.0)) 
 
 # API Endpoints
@@ -61,16 +57,10 @@ for var in ['http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY']:
 # ----------------------------------------------------------------------------------------------------
 
 # === FIX for client initialization (Uses openai v0.x Client structure) ===
-# In v0.x, the client is accessed directly, usually assigned to an attribute of the 'openai' module.
-# The original error was caused by calling 'openai.Client()'.
-# The correct way to initialize is to use the `openai` module's methods, which internally handle the API key.
-# However, to maintain the 'client' variable structure, we'll initialize the base class.
 if OPENAI_API_KEY:
-    # In v0.x, we often just set the key and use the module's functions,
-    # but since the original code tried to use a client object,
-    # we'll adapt to the most common v0.x pattern: setting the API key globally.
+    # Set the key globally for v0.x functions
     openai.api_key = OPENAI_API_KEY
-    client = True # Simply use a boolean flag since the client object is not directly used for ChatCompletion in v0.x
+    client = True # Flag to check if the key is available
 else:
     client = None
 # -------------------------------------------------------------------------
@@ -217,7 +207,9 @@ async def analyze_with_openai(symbol, data):
         df_4h = df_4h[['Open', 'High', 'Low', 'Close']].astype(float)
         
         long_term_ema = df_4h['Close'].ewm(span=200, adjust=False).mean().iloc[-1]
-        long_term_rsi = df_4h['Close'].rolling(window=14).apply(lambda x: rsi(x.values), raw=True).iloc[-1]
+        
+        # === FIX: Removed .values because raw=True passes numpy.ndarray ===
+        long_term_rsi = df_4h['Close'].rolling(window=14).apply(lambda x: rsi(x), raw=True).iloc[-1]
         
         if current_price > long_term_ema:
             long_term_trend = f"BULLISH (Price above 4H EMA 200: {long_term_ema:.2f})"
@@ -322,12 +314,18 @@ async def analyze_with_openai(symbol, data):
 
 def rsi(prices, period=14):
     """Calculates Relative Strength Index (RSI) using Pandas for standalone calculation."""
+    # Ensure prices is a pandas Series for the original logic to work correctly inside the standalone RSI function
+    if not isinstance(prices, pd.Series):
+        prices = pd.Series(prices)
+        
     if len(prices) < period: return 50.0
     df = pd.DataFrame(prices, columns=['Close'])
     delta = df['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(period).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
     
+    # Check for division by zero before calculating rs
+    # If loss is zero, rs should be infinity (or a large number) for rsi to be 100
     rs = np.divide(gain, loss, out=np.full_like(gain, np.inf), where=loss != 0)
     
     rsi_val = 100 - (100 / (1 + rs))

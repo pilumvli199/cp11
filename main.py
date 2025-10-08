@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# updated_main_advanced_btc_eth.py - Professional BTC/ETH Bot (Options Chain, Deep Candlesticks, GPT-4o-mini Analysis)
+# main.py - Professional BTC/ETH Bot (Options Chain, Deep Candlesticks, GPT-4o-mini Analysis)
 # 'Flying Raijin' Logo Included
 
 import os, json, asyncio, traceback, time
@@ -15,7 +15,6 @@ import re # For simple signal parsing
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.dates import date2num
 import mplfinance as mpf 
 
 # OpenAI client
@@ -24,13 +23,14 @@ from openai import OpenAI
 # Redis (non-TLS)
 import redis
 
+# Load environment variables (API keys, tokens, etc.)
 load_dotenv()
 
 # ---------------- CONFIG ----------------
 # Bot will ONLY focus on BTC and ETH for Options Chain Analysis
 SYMBOLS = ["BTCUSDT", "ETHUSDT"] 
 
-POLL_INTERVAL = max(30, int(os.getenv("POLL_INTERVAL", 180))) # Reduced polling for comprehensive analysis
+POLL_INTERVAL = max(30, int(os.getenv("POLL_INTERVAL", 1800))) # Reduced polling for comprehensive analysis (30 minutes)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -38,7 +38,6 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini") # Using GPT-4o-mini as r
 SIGNAL_CONF_THRESHOLD = float(os.getenv("SIGNAL_CONF_THRESHOLD", 80.0)) # Higher confidence needed
 
 # API Endpoints
-# Note: Options API uses a different base URL (e.g., api.binance.com is for Spot, eapi.binance.com is for Options)
 BASE_URL = "https://api.binance.com" 
 OPTIONS_BASE_URL = "https://eapi.binance.com" # Vanilla Options
 
@@ -53,11 +52,10 @@ OPTIONS_DEPTH_URL = OPTIONS_BASE_URL + "/eapi/v1/depth?symbol={symbol}&limit=500
 
 # Candles config: 720 candles for 1h TF
 CANDLE_LIMITS = {"1h": 720, "4h": 200, "1d": 200}
-TIME_FRAMES = ["1h", "4h", "1d"] # Focus on 1h deep data
 
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-# --- Redis Init/Helpers (Keep as is) ---
+# --- Redis Init/Helpers (For state management) ---
 REDIS = None
 def init_redis_plain():
     global REDIS
@@ -69,21 +67,16 @@ def init_redis_plain():
 
     if host and port:
         try:
-            print("Connecting to Redis (plain host/port)...")
             REDIS = redis.Redis(host=host, port=port, username=user, password=password, decode_responses=True)
             REDIS.ping()
             return
         except Exception: REDIS = None
     if url and not REDIS:
         try:
-            print("Trying redis.from_url() fallback...")
             REDIS = redis.Redis.from_url(url, decode_responses=True)
             REDIS.ping()
             return
         except Exception: REDIS = None
-    print("Redis not available; continuing without Redis.")
-
-init_redis_plain()
 
 def safe_call(fn, *args, **kwargs):
     try:
@@ -91,34 +84,36 @@ def safe_call(fn, *args, **kwargs):
     except Exception as e: print("Redis error:", e)
     return None
 
-def safe_setex(key, ttl, val):
-    return safe_call(REDIS.setex, key, ttl, val) if REDIS else None
-
 def safe_hset(h, field, val):
     return safe_call(REDIS.hset, h, field, val) if REDIS else None
 
 def store_signal(symbol, signal): safe_hset("signals:advanced", symbol, json.dumps(signal))
 
-# ---------------- Options Chain Analysis (New Function) ----------------
-# This function fetches all current option contracts for the base symbol (e.g., BTC, ETH)
-# And then fetches the depth for one near-term contract to analyze put/call ratio and IV
+# ---------------- Options Chain Analysis (FIXED FUNCTION) ----------------
+# FIX: Changed filtering logic from 'baseAsset' to 'underlying' to prevent KeyError.
 async def get_options_data_for_symbol(session, base_symbol):
     data = {"exchange_info": None, "put_call_ratio": "N/A", "implied_volatility": "N/A", "near_term_symbol": None}
     
     # 1. Get all available options symbols for the base asset (e.g., BTCUSDT)
     exchange_info = await fetch_json(session, OPTIONS_EXCHANGE_INFO_URL)
-    if not exchange_info or 'optionSymbols' not in exchange_info: return data
+    if not exchange_info or 'optionSymbols' not in exchange_info: 
+        return data
     
     data["exchange_info"] = exchange_info
     
-    # Filter for contracts based on the base symbol and get the nearest expiry
+    # Use the 'underlying' key for filtering, which is the correct symbol (e.g., BTCUSDT) 
+    # for contract symbols in Binance Options API.
     matching_contracts = [
-        sym for sym in exchange_info['optionSymbols'] 
-        if sym['baseAsset'] == base_symbol.replace('USDT', '') 
-        and sym['quoteAsset'] == 'USDT'
+        sym for sym in exchange_info.get('optionSymbols', [])
+        if sym.get('underlying') == base_symbol
     ]
     
+    if not matching_contracts: 
+        # No matching contracts found
+        return data
+    
     # Sort by expiry to find the nearest term
+    # Use the first contract's expiryDate (timestamp) as the key for sorting
     matching_contracts.sort(key=lambda x: x['expiryDate'])
     
     if not matching_contracts: return data
@@ -131,21 +126,10 @@ async def get_options_data_for_symbol(session, base_symbol):
     option_depth = await fetch_json(session, OPTIONS_DEPTH_URL.format(symbol=near_term_symbol))
     
     if option_depth and 'bids' in option_depth and 'asks' in option_depth:
-        # Simple PCR calculation from depth (volume of puts vs calls)
-        # Note: In Binance's Vanilla Options Depth, bids/asks are for the *option* price, not the underlying.
-        # We need to distinguish between CALL and PUT symbols.
-        
-        # A proper PCR requires parsing the 'optionSymbols' list to sum up all PUT open interest (OI)
-        # and all CALL open interest (OI) for a given expiry. Since the depth API doesn't directly
-        # provide OI, we'll simplify this for the prompt.
-        
-        # --- Simplified PCR Logic (for GPT prompt context) ---
+        # Simplified PCR Logic (for GPT prompt context)
         total_bid_volume = sum([float(b[1]) for b in option_depth['bids']])
         total_ask_volume = sum([float(a[1]) for a in option_depth['asks']])
         
-        # In a real scenario, we'd fetch all Tickers for OI/IV, but for this code, we focus on depth data presence.
-        
-        # For the GPT prompt, we'll just indicate the *available* depth/liquidity for the near-term contract.
         data["options_liquidity_info"] = {
             "near_term_symbol": near_term_symbol,
             "bid_volume": total_bid_volume,
@@ -300,10 +284,17 @@ def parse_ai_signal(ai_output, symbol, current_atr):
                 sl = float(sl_match.group(1)) if sl_match else 0
                 tp = float(tp_match.group(1)) if tp_match else 0
                 
-                if entry == 0: # Use current price if entry is not specified
-                    entry = float(re.search(r'Current Price: ([\d.]+)', signal['reason']).group(1))
-                
-                # ATR fallback for SL/TP if parsing fails or values are zero
+                # Check for Current Price from the AI's reason field if ENTRY is missing
+                if entry == 0: 
+                    price_match = re.search(r'Current Price: ([\d.]+)', signal['reason'])
+                    if price_match:
+                        entry = float(price_match.group(1))
+                    else: # Fallback to 0 if Current Price is not found, which will fail the check below
+                        entry = 0
+
+                if entry == 0: raise ValueError("Entry price could not be determined.")
+
+                # ATR fallback for SL/TP if parsing fails or values are unreasonable
                 if side == "BUY":
                     signal['entry'] = entry
                     signal['sl'] = sl if sl > 0 and sl < entry else entry - (current_atr * 1.5)
@@ -323,8 +314,6 @@ def parse_ai_signal(ai_output, symbol, current_atr):
     return signal
 
 # ---------------- Professional Candlestick Chart (with Flying Raijin Logo) ----------------
-# The plot_signal_chart function remains the same as in the previous professional version, 
-# ensuring the 'Flying Raijin' logo is displayed.
 
 def plot_signal_chart(symbol, candles, signal):
     
@@ -334,11 +323,6 @@ def plot_signal_chart(symbol, candles, signal):
     df_candles = df_candles.set_index(pd.DatetimeIndex(df_candles['OpenTime']))
     df_candles = df_candles[['Open', 'High', 'Low', 'Close', 'Volume']].astype(float)
 
-    # 2. Prepare EMAs as `addplot` (Simple EMAs for context)
-    closes = df_candles['Close'].to_numpy()
-    ema_9_vals = pd.Series([None] * len(closes), index=df_candles.index) # Simplified for space on 720 candles
-    ema_21_vals = pd.Series([None] * len(closes), index=df_candles.index)
-    
     # Add SMA 200 for long-term trend
     df_candles['SMA200'] = df_candles['Close'].rolling(window=200).mean()
 
@@ -411,7 +395,9 @@ def plot_signal_chart(symbol, candles, signal):
 async def fetch_json(session,url):
     try:
         async with session.get(url,timeout=20) as r:
-            if r.status!=200: return None
+            if r.status!=200: 
+                print(f"API Error ({r.status}): {url}")
+                return None
             return await r.json()
     except Exception as e:
         print("fetch_json error:", e)
@@ -441,8 +427,10 @@ async def advanced_options_loop():
         print("🔴 ERROR: OpenAI API Key (OPENAI_API_KEY) not set. AI analysis will not work.")
         return
         
+    init_redis_plain() # Initialize Redis at the start
+    
     async with aiohttp.ClientSession() as session:
-        startup=f"🤖 Advanced BTC/ETH Bot Started (Options, 720H Candles, GPT-4o-mini) • Poll {POLL_INTERVAL}s"
+        startup=f"🤖 Advanced BTC/ETH Bot Started (Options, 720H Candles, GPT-4o-mini) • Poll {POLL_INTERVAL//60}min"
         print(startup); await send_text(session,startup)
         
         while True:
@@ -502,5 +490,7 @@ async def advanced_options_loop():
             await asyncio.sleep(POLL_INTERVAL)
 
 if __name__=="__main__":
-    try: asyncio.run(advanced_options_loop())
+    try: 
+        print("Connecting to Redis...")
+        asyncio.run(advanced_options_loop())
     except KeyboardInterrupt: print("Stopped by user")

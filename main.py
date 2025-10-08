@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # main.py - Professional BTC/ETH Bot (Options Chain, Deep Candlesticks, GPT-4o-mini Analysis)
-# FIXES: 1. mpfinance 'linestyles' to 'linestyle'. 2. Robust options data fetching.
-# NEW: Auto-selects the NEXT nearest non-expired Option Contract.
+# FIXES: 1. mpfinance 'linestyles' to 'linestyle'. 2. Robust options data fetching. 
+# 3. Fixed ValueError: x and y must have same first dimension (SMA200 now filtered to 300 points).
 
 import os, json, asyncio, traceback, time
 import numpy as np
@@ -89,14 +89,14 @@ def safe_hset(h, field, val):
 
 def store_signal(symbol, signal): safe_hset("signals:advanced", symbol, json.dumps(signal))
 
-# ---------------- Options Chain Analysis (Updated for Next Expiry) ----------------
+# ---------------- Options Chain Analysis ----------------
 
 async def get_options_data_for_symbol(session, base_symbol) -> Dict[str, Any]:
     data = {"options_sentiment": "Neutral", "oi_summary": "N/A", "near_term_symbol": None}
     
-    current_time_ms = int(time.time() * 1000) # Current time in milliseconds
+    current_time_ms = int(time.time() * 1000) 
     
-    # 1. Fetch ALL Options Tickers (Includes OI, IV, and Expiry info)
+    # 1. Fetch ALL Options Tickers
     all_tickers = await fetch_json(session, OPTIONS_TICKER_URL)
     if not all_tickers or not isinstance(all_tickers, list): return data
     
@@ -106,11 +106,8 @@ async def get_options_data_for_symbol(session, base_symbol) -> Dict[str, Any]:
     if not target_tickers: return data
 
     # 3. Find the NEXT NEAREST NON-EXPIRED CONTRACT
-    
-    # Collect all unique expiry dates
     all_expiries = sorted(list(set(t.get('expiryDate', 0) for t in target_tickers)))
     
-    # Find the first expiry date that is >= current time
     next_expiry_date_ms = next(
         (exp for exp in all_expiries if exp > current_time_ms), 
         None
@@ -140,7 +137,6 @@ async def get_options_data_for_symbol(session, base_symbol) -> Dict[str, Any]:
             iv = float(ticker.get('impliedVolatility', 0))
             total_contracts += 1
             
-            # Infer Option Type
             option_type = ticker.get('optionType') 
             if not option_type:
                 symbol_name = ticker.get('symbol', '')
@@ -187,12 +183,12 @@ async def get_options_data_for_symbol(session, base_symbol) -> Dict[str, Any]:
     return data
 
 
-# ---------------- GPT-4o-mini Analysis (Updated Prompt) ----------------
+# ---------------- GPT-4o-mini Analysis ----------------
 
 async def analyze_with_openai(symbol, candles_1h, spot_depth, agg_trades, options_data):
     if not client: return {"side":"none","confidence":0,"reason":"NO_AI_KEY"}
     
-    # 1. Prepare Data Summary (No change in core data prep)
+    # 1. Prepare Data Summary
     df_1h = pd.DataFrame(candles_1h, columns=['OpenTime', 'Open', 'High', 'Low', 'Close', 'Volume', 'CloseTime', 'QuoteAssetVolume', 'NumberOfTrades', 'TakerBuyBaseAssetVolume', 'TakerBuyQuoteAssetVolume', 'Ignore'])
     df_1h = df_1h[['Open', 'High', 'Low', 'Close', 'Volume']].astype(float)
     
@@ -217,7 +213,7 @@ async def analyze_with_openai(symbol, candles_1h, spot_depth, agg_trades, option
     sell_vol_agg = sum([float(t['q']) for t in agg_trades if t['m']])
     agg_imbalance = (buy_vol_agg - sell_vol_agg) / (buy_vol_agg + sell_vol_agg) * 100 if (buy_vol_agg + sell_vol_agg) > 0 else 0
     
-    # Options Data Summary (Updated to use new OI/IV structure)
+    # Options Data Summary 
     opt_info = options_data
     opt_summary = opt_info.get('oi_summary', 'No Open Interest Data.')
     opt_sentiment = opt_info.get('options_sentiment', 'Neutral')
@@ -227,7 +223,7 @@ async def analyze_with_openai(symbol, candles_1h, spot_depth, agg_trades, option
     highs = df_1h['High'].to_numpy(); lows = df_1h['Low'].to_numpy(); closes = df_1h['Close'].to_numpy()
     current_atr = atr(highs, lows, closes) 
 
-    # 2. Construct the Detailed Prompt (Updated Options Section)
+    # 2. Construct the Detailed Prompt
     sys_prompt = (
         "You are a sophisticated quantitative crypto analyst using a comprehensive multi-factor model. "
         "Your task is to analyze the provided market data and generate a high-conviction trading signal "
@@ -287,7 +283,7 @@ async def analyze_with_openai(symbol, candles_1h, spot_depth, agg_trades, option
         return {"side":"none","confidence":0,"reason":f"AI_CALL_ERROR: {str(e)}"}
 
 
-# ---------------- Utility Functions (No changes needed) ----------------
+# ---------------- Utility Functions ----------------
 
 def atr(highs, lows, closes, period=14):
     if len(closes) < period: return 0.0
@@ -351,7 +347,7 @@ def parse_ai_signal(ai_output, symbol, current_atr):
         
     return signal
 
-# ---------------- Professional Candlestick Chart (Fixed 'linestyles') ----------------
+# ---------------- Professional Candlestick Chart (FIXED FUNCTION) ----------------
 
 def plot_signal_chart(symbol, candles, signal):
     
@@ -361,10 +357,15 @@ def plot_signal_chart(symbol, candles, signal):
     df_candles = df_candles.set_index(pd.DatetimeIndex(df_candles['OpenTime']))
     df_candles = df_candles[['Open', 'High', 'Low', 'Close', 'Volume']].astype(float)
 
+    # Add SMA 200 for long-term trend
     df_candles['SMA200'] = df_candles['Close'].rolling(window=200).mean()
+    
+    # *** FIX: Filter the DataFrame to the last 300 points for consistent plotting ***
+    df_plot = df_candles.iloc[-300:] 
 
     apds = [
-        mpf.make_addplot(df_candles['SMA200'], color='#FFA500', panel=0, width=1.0, secondary_y=False), 
+        # Use the filtered df_plot['SMA200'] which is now length 300
+        mpf.make_addplot(df_plot['SMA200'], color='#FFA500', panel=0, width=1.0, secondary_y=False), 
     ]
 
     # 3. Prepare horizontal lines for signals
@@ -390,7 +391,7 @@ def plot_signal_chart(symbol, candles, signal):
 
     # 5. Plot the chart
     fig, axlist = mpf.plot(
-        df_candles.iloc[-300:], 
+        df_plot, # Use the filtered DataFrame (df_plot)
         type='candle',
         style=s,
         title=f"{symbol} 1H Advanced Signal ({signal.get('side','?')}) | Conf {signal.get('confidence',0)}%",
@@ -398,7 +399,6 @@ def plot_signal_chart(symbol, candles, signal):
         addplot=apds,           
         figscale=1.5,           
         returnfig=True,         
-        # FIX IS HERE: linestyles changed to linestyle
         hlines=dict(hlines=hlines, colors=colors, linestyle=linestyles, linewidths=1.5, alpha=0.9), 
     )
 
@@ -418,7 +418,7 @@ def plot_signal_chart(symbol, candles, signal):
     plt.close(fig)
     return tmp.name
 
-# ---------------- Fetch & Telegram (No changes needed) ----------------
+# ---------------- Fetch & Telegram ----------------
 async def fetch_json(session,url):
     try:
         async with session.get(url,timeout=20) as r:
@@ -491,9 +491,6 @@ async def advanced_options_loop():
                     if not all([c1h, spot_depth, agg_data]):
                         print(f"{sym}: Missing critical data (1H Candle/Spot Depth/AggTrades), skipping"); continue
                     
-                    # The Options data fetch might return incomplete data if no contracts are found, 
-                    # but the bot should not stop, the analysis prompt handles "No Open Interest Data."
-
                     # 1. Run Advanced AI Analysis
                     final_signal = await analyze_with_openai(sym, c1h, spot_depth, agg_data, options_data)
                     

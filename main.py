@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-# main.py - Hybrid GPT-4V (Vision) + GPT-3.5-turbo (Text) Multi-Timeframe Bot
+# main.py - FULL Hybrid GPT-4V (Vision) + GPT-3.5-turbo (Text) Multi-Timeframe Bot
+# Scan interval set to 1 hour (3600 seconds)
 
 import os, json, asyncio, traceback, time
 import numpy as np
@@ -18,7 +19,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import mplfinance as mpf
 
-# OpenAI client (v0.x client structure, works with both chat and vision)
+# OpenAI client (v0.x client structure)
 import openai
 
 # Redis (non-TLS)
@@ -27,24 +28,26 @@ import redis
 # Load environment variables
 load_dotenv()
 
-# ---------------- CONFIG (Hybrid Mode Setup) ----------------
+# ---------------- CONFIG (Hybrid Mode Setup & 1 Hour Scan) ----------------
 # Symbols: BTC and ETH for analysis
 SYMBOLS = ["BTCUSDT", "ETHUSDT"] 
 
 # Symbols that require the more expensive GPT-4 VISION (image analysis). 
-# We are currently ONLY using BTCUSDT for Vision analysis to control cost.
-VISION_SYMBOLS = ["BTCUSDT"] 
+# Both are now included for full advanced analysis.
+VISION_SYMBOLS = ["BTCUSDT", "ETHUSDT"] 
 # Ensure GPT-4 model is used for vision/hybrid analysis
 VISION_MODEL = os.getenv("VISION_MODEL", "gpt-4-turbo") 
-TEXT_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo") # Cheaper model for text/ETH analysis
+TEXT_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo") # Cheaper model for text/Options analysis
 
-POLL_INTERVAL = max(30, int(os.getenv("POLL_INTERVAL", 1800))) # Default 30 mins (1800s)
+# SET SCAN INTERVAL TO 1 HOUR (3600 seconds)
+POLL_INTERVAL = max(60, int(os.getenv("POLL_INTERVAL", 3600))) 
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 SIGNAL_CONF_THRESHOLD = float(os.getenv("SIGNAL_CONF_THRESHOLD", 80.0))
 
-# API Endpoints (Unchanged)
+# API Endpoints 
 BASE_URL = "https://api.binance.com"
 OPTIONS_BASE_URL = "https://eapi.binance.com"
 CANDLE_URL = BASE_URL + "/api/v3/klines?symbol={symbol}&interval={tf}&limit={limit}"
@@ -54,12 +57,12 @@ AGGT_URL = BASE_URL + "/api/v3/aggTrades?symbol={symbol}&limit=100"
 OPTIONS_TICKER_URL = OPTIONS_BASE_URL + "/eapi/v1/ticker"
 CANDLE_LIMITS = {"1h": 999, "4h": 999, "1d": 999}
 
-# --- STABLE PROXY FIX (Unchanged) ---
+# --- STABLE PROXY FIX ---
 for var in ['http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY']:
     if var in os.environ:
         del os.environ[var]
 
-# === OpenAI Client Initialization (Unchanged) ===
+# === OpenAI Client Initialization ===
 if OPENAI_API_KEY:
     openai.api_key = OPENAI_API_KEY
     client = True
@@ -67,7 +70,7 @@ else:
     client = None
 # -------------------------------------------------------------------------
 
-# --- Redis Init/Helpers (Unchanged) ---
+# --- Redis Init/Helpers ---
 REDIS = None
 def init_redis_plain():
     global REDIS
@@ -101,7 +104,7 @@ def safe_hset(h, field, val):
 
 def store_signal(symbol, signal): safe_hset("signals:advanced", symbol, json.dumps(signal))
 
-# ---------------- Options Chain Analysis (Unchanged) ----------------
+# ---------------- Options Chain Analysis ----------------
 async def get_options_data_for_symbol(session, base_symbol) -> Dict[str, Any]:
     data = {"options_sentiment": "Neutral", "oi_summary": "N/A", "near_term_symbol": None}
     current_time_ms = int(time.time() * 1000) 
@@ -164,7 +167,7 @@ async def get_options_data_for_symbol(session, base_symbol) -> Dict[str, Any]:
     data["near_term_symbol"] = next_expiry_contracts[0]['symbol'] if next_expiry_contracts else 'N/A'
     return data
 
-# ---------------- Utility Functions (FIXED: Moved to be defined before use) ----------------
+# ---------------- Utility Functions (FIXED: Defined before use) ----------------
 
 def rsi(prices, period=14):
     """Calculates Relative Strength Index (RSI)."""
@@ -199,12 +202,20 @@ def parse_ai_signal(ai_output, symbol, current_atr):
     signal = {"side": "none", "confidence": 0.0, "reason": "AI did not adhere to the format."}
     
     try:
-        # Regex to extract structured data
+        # Regex to extract structured data (SYMBOL - ACTION - ENTRY:x - SL:y - TP:z - TP2:w - REASON:.. - CONF:n%)
         match = re.search(
-            r"ACTION:\s*([A-Z]+)\s*-\s*ENTRY:([\d.]+)\s*-\s*SL:([\d.]+)\s*-\s*TP:([\d.]+)\s*-\s*TP2:([\d.]+)\s*-\s*REASON:(.*)\s*-\s*CONF:(\d+\.?\d*)%",
+            r"(?:{})\s*-\s*(BUY|SELL|HOLD|NONE)\s*-\s*ENTRY:([\d.]+)\s*-\s*SL:([\d.]+)\s*-\s*TP:([\d.]+)\s*-\s*TP2:([\d.]+)\s*-\s*REASON:(.*?)\s*-\s*CONF:(\d+\.?\d*)%".format(symbol.replace('USDT', '')),
             ai_output, re.IGNORECASE | re.DOTALL
         )
         
+        # If the full, strict format fails, try a slightly looser format matching the prompt structure
+        if not match:
+             match = re.search(
+                r"ACTION:\s*(BUY|SELL|HOLD|NONE)\s*-\s*ENTRY:([\d.]+)\s*-\s*SL:([\d.]+)\s*-\s*TP:([\d.]+)\s*-\s*TP2:([\d.]+)\s*-\s*REASON:(.*?)\s*-\s*CONF:(\d+\.?\d*)%",
+                ai_output, re.IGNORECASE | re.DOTALL
+            )
+
+
         if not match:
              # Fallback: Extract action, reason, and confidence if structured format failed
             action_match = re.search(r"ACTION:\s*([A-Z]+)", ai_output, re.IGNORECASE)
@@ -243,6 +254,10 @@ def parse_ai_signal(ai_output, symbol, current_atr):
             return signal
         
         # Successful structured parsing
+        # The group indices need to be adjusted based on the regex structure (if we used the second/simpler one)
+        # Using the second regex: r"ACTION:\s*(BUY|SELL|HOLD|NONE)\s*-\s*ENTRY:([\d.]+)\s*-\s*SL:([\d.]+)\s*-\s*TP:([\d.]+)\s*-\s*TP2:([\d.]+)\s*-\s*REASON:(.*?)\s*-\s*CONF:(\d+\.?\d*)%"
+        
+        # The groups are 1:ACTION, 2:ENTRY, 3:SL, 4:TP, 5:TP2, 6:REASON, 7:CONF
         action = match.group(1).upper().strip()
         signal["side"] = action
         signal["entry"] = float(match.group(2).strip())
@@ -291,7 +306,7 @@ def plot_signal_chart(symbol, candles, signal):
 
     fig, axlist = mpf.plot(
         df_plot, type='candle', style=s,
-        title=f"{symbol} 1H Advanced Signal ({signal.get('side','?')}) | Conf {signal.get('confidence',0)}% | Model: {signal.get('model', 'N/A')}",
+        title=f"{symbol} 1H Advanced Signal ({signal.get('side','?')}) | Conf {signal.get('confidence',0):.2f}% | Model: {signal.get('model', 'N/A')}",
         ylabel='Price', addplot=apds, figscale=1.5, returnfig=True,         
         hlines=dict(hlines=hlines, colors=colors, linestyle=linestyles, linewidths=1.5, alpha=0.9), 
     )
@@ -319,7 +334,7 @@ async def analyze_with_openai(symbol, data, chart_path=None):
     is_vision_symbol = symbol in VISION_SYMBOLS
     model_to_use = VISION_MODEL if is_vision_symbol else TEXT_MODEL
     
-    # --- Data Preparation (Same as before) ---
+    # --- Data Preparation ---
     c1h = data.get("1h")
     candles_4h = data.get("4h")
     spot_depth = data.get("depth")
@@ -338,8 +353,6 @@ async def analyze_with_openai(symbol, data, chart_path=None):
         pattern_summary = "Possible Bearish Engulfing/Evening Star formation."
         
     highs = df_1h['High'].to_numpy(); lows = df_1h['Low'].to_numpy(); closes = df_1h['Close'].to_numpy()
-    
-    # FIXED: atr is now defined before this function
     current_atr = atr(highs, lows, closes) 
     
     # 4H Data
@@ -347,10 +360,7 @@ async def analyze_with_openai(symbol, data, chart_path=None):
         df_4h = pd.DataFrame(candles_4h, columns=['OpenTime', 'Open', 'High', 'Low', 'Close', 'Volume', 'CloseTime', 'QuoteAssetVolume', 'NumberOfTrades', 'TakerBuyBaseAssetVolume', 'TakerBuyQuoteAssetVolume', 'Ignore'])
         df_4h = df_4h[['Open', 'High', 'Low', 'Close']].astype(float)
         long_term_ema = df_4h['Close'].ewm(span=200, adjust=False).mean().iloc[-1]
-        
-        # FIXED: rsi is now defined before this function
         long_term_rsi = df_4h['Close'].rolling(window=14).apply(lambda x: rsi(x), raw=True).iloc[-1]
-        
         if current_price > long_term_ema:
             long_term_trend = f"BULLISH (Price above 4H EMA 200: {long_term_ema:.2f})"
         else:
@@ -448,9 +458,6 @@ async def analyze_with_openai(symbol, data, chart_path=None):
     try:
         loop = asyncio.get_running_loop()
         def call(): 
-            # Using the new OpenAI v1.x client structure for better compatibility
-            # This requires a slight change in the calling mechanism if you update to the new client
-            # For the old structure, this should work:
             return openai.ChatCompletion.create(
                 model=model_to_use,
                 messages=messages,
@@ -504,7 +511,8 @@ async def advanced_options_loop():
     init_redis_plain() 
     
     async with aiohttp.ClientSession() as session:
-        startup=f"🤖 Hybrid Bot Started (BTC: {VISION_MODEL} Vision | ETH: {TEXT_MODEL}) • Poll {POLL_INTERVAL//60}min"
+        # Inform user about the new scan frequency
+        startup=f"🤖 FULL Hybrid Bot Started (BTC/ETH: {VISION_MODEL} Vision) • Scan Interval: 1 Hour ({POLL_INTERVAL//60}min)"
         print(startup); await send_text(session,startup)
         
         while True:
@@ -540,20 +548,18 @@ async def advanced_options_loop():
                     if not all([c1h, spot_depth, agg_data]):
                         print(f"{sym}: Missing critical data, skipping"); continue
 
-                    # 1. Generate Chart Image if Vision is enabled for the symbol
-                    # We pass a placeholder signal here; the real signal will be passed to re-plot later.
+                    # 1. Generate Chart Image (for Vision Analysis for both symbols)
                     if sym in VISION_SYMBOLS:
                         chart_path = plot_signal_chart(sym, c1h, {"side":"N/A", "confidence":0, "model": VISION_MODEL})
 
-                    # 2. Run Hybrid AI Analysis
+                    # 2. Run Hybrid AI Analysis (Will use VISION_MODEL for both)
                     final_signal = await analyze_with_openai(sym, data, chart_path)
                     
                     # 3. Process the Signal
                     if final_signal["side"] in ["BUY", "SELL"] and final_signal["confidence"] >= SIGNAL_CONF_THRESHOLD:
                         store_signal(sym, final_signal)
                         
-                        # Use the correct model name in the final Telegram message
-                        model_used = final_signal.get('model', TEXT_MODEL)
+                        model_used = final_signal.get('model', VISION_MODEL)
                         
                         msg=f"**🔥 Advanced AI Signal ({final_signal['confidence']:.2f}%)**\n\n**Asset:** {sym} *(Model: {model_used})*\n**Action:** {final_signal['side']}\n**Entry:** `{fmt_price(final_signal['entry'])}`\n**SL:** `{fmt_price(final_signal['sl'])}`\n**TP1:** `{fmt_price(final_signal['tp'])}` | **TP2 (Macro):** `{fmt_price(final_signal['tp2'])}`\n\n**AI Logic:** {final_signal['reason']}"
                         
@@ -563,7 +569,6 @@ async def advanced_options_loop():
                         await send_photo(session,msg,chart_path_final)
                         print(f"⚡ {sym}: {final_signal['side']} @ {final_signal['entry']:.2f} Conf {final_signal['confidence']:.2f}%")
                         
-                        # Clean up the original chart path if a new one was created
                         if chart_path != chart_path_final and chart_path and os.path.exists(chart_path):
                              os.remove(chart_path)
                         chart_path = chart_path_final
@@ -580,7 +585,13 @@ async def advanced_options_loop():
                         os.remove(chart_path)
                 
             print(f"Processing time: {time.time() - start_time:.2f}s")
-            await asyncio.sleep(POLL_INTERVAL)
+            # Wait for the remaining time in the poll interval
+            time_to_wait = POLL_INTERVAL - (time.time() - start_time)
+            if time_to_wait > 0:
+                print(f"Sleeping for {time_to_wait:.0f} seconds (Total interval: 1 hour).")
+                await asyncio.sleep(time_to_wait)
+            else:
+                print("Warning: Processing took longer than 1 hour. Starting next scan immediately.")
 
 if __name__=="__main__":
     try: 

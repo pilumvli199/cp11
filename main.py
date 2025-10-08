@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 # main.py - Advanced Multi-Timeframe BTC/ETH Bot (999 Candles, 4H/1H Analysis, GPT-4o-mini)
-# FIXES: 1. Max Candle Limit set to 999 for all TFs. 2. Added 4H EMA/RSI analysis. 
-# 3. GPT Prompt updated to request TP1 (Short-Term) and TP2 (Macro/OI Walls).
 
 import os, json, asyncio, traceback, time
 import numpy as np
@@ -11,7 +9,7 @@ from dotenv import load_dotenv
 import aiohttp
 from tempfile import NamedTemporaryFile
 import re 
-from typing import Optional, Dict, Any, List
+from typing import Dict, Any
 
 # plotting (server-safe)
 import matplotlib
@@ -47,12 +45,15 @@ DEPTH_URL = BASE_URL + "/api/v3/depth?symbol={symbol}&limit=50"
 AGGT_URL = BASE_URL + "/api/v3/aggTrades?symbol={symbol}&limit=100" 
 
 # Options Endpoints
-OPTIONS_EXCHANGE_INFO_URL = OPTIONS_BASE_URL + "/eapi/v1/exchangeInfo"
-OPTIONS_TICKER_URL = OPTIONS_BASE_URL + "/eapi/v1/ticker" # Ticker for OI/IV
-OPTIONS_DEPTH_URL = OPTIONS_BASE_URL + "/eapi/v1/depth?symbol={symbol}&limit=100" 
+OPTIONS_TICKER_URL = OPTIONS_BASE_URL + "/eapi/v1/ticker" 
 
-# Set all Timeframes to the maximum robust limit of 999 klines
+# Set all Timeframes to the maximum robust limit of 999 klines (Binance API limit is 1000)
 CANDLE_LIMITS = {"1h": 999, "4h": 999, "1d": 999} 
+
+# --- PROXY FIX: Remove environment variables that might pass 'proxies' argument automatically ---
+for var in ['http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY']:
+    if var in os.environ:
+        del os.environ[var]
 
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
@@ -91,72 +92,50 @@ def safe_hset(h, field, val):
 def store_signal(symbol, signal): safe_hset("signals:advanced", symbol, json.dumps(signal))
 
 # ---------------- Options Chain Analysis ----------------
-# (Function get_options_data_for_symbol remains the same, it is robust)
 
 async def get_options_data_for_symbol(session, base_symbol) -> Dict[str, Any]:
     data = {"options_sentiment": "Neutral", "oi_summary": "N/A", "near_term_symbol": None}
     
     current_time_ms = int(time.time() * 1000) 
     
-    # 1. Fetch ALL Options Tickers
     all_tickers = await fetch_json(session, OPTIONS_TICKER_URL)
     if not all_tickers or not isinstance(all_tickers, list): return data
     
-    # 2. Filter Tickers for the specific asset (e.g., BTCUSDT)
     target_tickers = [t for t in all_tickers if t.get('underlying') == base_symbol]
-    
     if not target_tickers: return data
 
-    # 3. Find the NEXT NEAREST NON-EXPIRED CONTRACT
     all_expiries = sorted(list(set(t.get('expiryDate', 0) for t in target_tickers)))
-    
     next_expiry_date_ms = next(
         (exp for exp in all_expiries if exp > current_time_ms), 
         None
     )
-    
     if not next_expiry_date_ms:
         data['oi_summary'] = f"Warning: No future option expiries found for {base_symbol}."
         return data
 
-    # 4. Filter all contracts belonging to the next nearest expiry
     next_expiry_contracts = [
         t for t in target_tickers 
         if t.get('expiryDate') == next_expiry_date_ms
     ]
-    
     if not next_expiry_contracts: return data
 
-    # --- Start Global OI and IV Calculation for the Next Expiry Chain ---
     total_call_oi = 0
     total_put_oi = 0
-    total_contracts = 0
     all_ivs = []
     
     for ticker in next_expiry_contracts:
         try:
             oi = float(ticker.get('openInterest', 0))
             iv = float(ticker.get('impliedVolatility', 0))
-            total_contracts += 1
             
             option_type = ticker.get('optionType') 
-            if not option_type:
-                symbol_name = ticker.get('symbol', '')
-                if symbol_name.endswith('-C'): option_type = 'CALL'
-                elif symbol_name.endswith('-P'): option_type = 'PUT'
             
-            if option_type == 'CALL':
-                total_call_oi += oi
-            elif option_type == 'PUT':
-                total_put_oi += oi
-
-            if iv > 0:
-                all_ivs.append(iv)
+            if option_type == 'CALL': total_call_oi += oi
+            elif option_type == 'PUT': total_put_oi += oi
+            if iv > 0: all_ivs.append(iv)
                 
-        except Exception:
-            continue 
+        except Exception: continue 
 
-    # 5. Synthesize Sentiment
     total_oi = total_call_oi + total_put_oi
     pcr = total_put_oi / total_call_oi if total_call_oi > 0 else 0
     avg_iv = np.mean(all_ivs) if all_ivs else 0
@@ -170,11 +149,9 @@ async def get_options_data_for_symbol(session, base_symbol) -> Dict[str, Any]:
     else:
         sentiment = f"Neutral to Moderate Sentiment (PCR: {pcr:.2f})."
         
-    # 6. Prepare Output for GPT-4o mini
     data["options_sentiment"] = sentiment
     data["oi_summary"] = (
         f"Next Expiry Date: {datetime.fromtimestamp(next_expiry_date_ms/1000).strftime('%Y-%m-%d %H:%M')}. "
-        f"Contracts Analyzed: {total_contracts}. "
         f"Total OI: {total_oi:.2f}. Call OI: {total_call_oi:.2f}. Put OI: {total_put_oi:.2f}. "
         f"Put/Call Ratio (PCR): {pcr:.2f}. "
         f"Average Implied Volatility (IV): {avg_iv * 100:.2f}%."
@@ -185,9 +162,9 @@ async def get_options_data_for_symbol(session, base_symbol) -> Dict[str, Any]:
     return data
 
 
-# ---------------- GPT-4o-mini Analysis (UPDATED) ----------------
+# ---------------- GPT-4o-mini Analysis ----------------
 
-async def analyze_with_openai(symbol, data): # Now accepts full data dictionary
+async def analyze_with_openai(symbol, data): 
     if not client: return {"side":"none","confidence":0,"reason":"NO_AI_KEY"}
     
     # Extract data parts
@@ -220,17 +197,14 @@ async def analyze_with_openai(symbol, data): # Now accepts full data dictionary
         df_4h = pd.DataFrame(candles_4h, columns=['OpenTime', 'Open', 'High', 'Low', 'Close', 'Volume', 'CloseTime', 'QuoteAssetVolume', 'NumberOfTrades', 'TakerBuyBaseAssetVolume', 'TakerBuyQuoteAssetVolume', 'Ignore'])
         df_4h = df_4h[['Open', 'High', 'Low', 'Close']].astype(float)
         
-        # Calculate Long-Term Indicators
         long_term_ema = df_4h['Close'].ewm(span=200, adjust=False).mean().iloc[-1]
         long_term_rsi = df_4h['Close'].rolling(window=14).apply(lambda x: rsi(x.values), raw=True).iloc[-1]
         
-        # Determine Trend
         if current_price > long_term_ema:
             long_term_trend = f"BULLISH (Price above 4H EMA 200: {long_term_ema:.2f})"
         else:
             long_term_trend = f"BEARISH (Price below 4H EMA 200: {long_term_ema:.2f})"
             
-        # Identify recent key S/R levels (4H) for breakout context
         recent_4h_high = df_4h['High'].iloc[-50:].max()
         recent_4h_low = df_4h['Low'].iloc[-50:].min()
     else:
@@ -293,7 +267,7 @@ async def analyze_with_openai(symbol, data): # Now accepts full data dictionary
     **5. Trading Instructions (Set TP1 and TP2):**
     - **TP1 (Short-Term):** Must be based on the current ATR and short-term 1H momentum (3x ATR default).
     - **TP2 (Long-Term/Macro):** Must be set based on **4H Key S/R levels** or the **strongest unbreached Options OI Wall**.
-    - **Fake Breakout Check:** If the current price is near or breaking {recent_4h_high:.2f} or {recent_4h_low:.2f}, confirm the move with strong **Aggressive Flow** (> 20%) and **OI confirmation** (OI building in the direction of the break). If confirmation is missing, signal HOLD/NONE or suggest a reversal.
+    - **Fake Breakout Check:** If the current price is near or breaking {recent_4h_high:.2f} or {recent_4h_low:.2f}, confirm the move with strong **Aggressive Flow** (> 20%) and **OI confirmation**. If confirmation is missing, signal HOLD/NONE or suggest a reversal.
     - **If Confidence is ≥ {int(SIGNAL_CONF_THRESHOLD)}%**, provide a specific **BUY/SELL** signal with calculated ENTRY, SL, TP, and TP2.
     - **If Confidence is < {int(SIGNAL_CONF_THRESHOLD)}%**, the action must be **HOLD** or **NONE**.
     """
@@ -323,7 +297,7 @@ async def analyze_with_openai(symbol, data): # Now accepts full data dictionary
         return {"side":"none","confidence":0,"reason":f"AI_CALL_ERROR: {str(e)}"}
 
 
-# ---------------- Utility Functions (UPDATED) ----------------
+# ---------------- Utility Functions ----------------
 
 def rsi(prices, period=14):
     """Calculates Relative Strength Index (RSI) using Pandas for standalone calculation."""
@@ -333,7 +307,6 @@ def rsi(prices, period=14):
     gain = (delta.where(delta > 0, 0)).rolling(period).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
     
-    # Handle division by zero for rs (when loss is 0)
     rs = np.divide(gain, loss, out=np.full_like(gain, np.inf), where=loss != 0)
     
     rsi_val = 100 - (100 / (1 + rs))
@@ -354,7 +327,6 @@ def atr(highs, lows, closes, period=14):
 def fmt_price(p): return f"{p:.4f}" if abs(p)<1 else f"{p:.2f}"
 
 def parse_ai_signal(ai_output, symbol, current_atr):
-    # Added 'tp2' to the default signal dictionary
     signal = {"side": "none", "confidence": 0, "reason": ai_output, "entry": 0, "sl": 0, "tp": 0, "tp2": 0} 
     
     conf_match = re.search(r'CONF:(\d+)%', ai_output, re.IGNORECASE)
@@ -365,7 +337,7 @@ def parse_ai_signal(ai_output, symbol, current_atr):
     entry_match = re.search(r'ENTRY:([\d.]+)', ai_output, re.IGNORECASE)
     sl_match = re.search(r'SL:([\d.]+)', ai_output, re.IGNORECASE)
     tp_match = re.search(r'TP:([\d.]+)', ai_output, re.IGNORECASE)
-    tp2_match = re.search(r'TP2:([\d.]+)', ai_output, re.IGNORECASE) # New TP2 parsing
+    tp2_match = re.search(r'TP2:([\d.]+)', ai_output, re.IGNORECASE) 
     reason_match = re.search(r'REASON:(.*?)(\s*-\s*CONF:|\s*$)', ai_output, re.IGNORECASE | re.DOTALL)
     
     if action_match:
@@ -377,10 +349,9 @@ def parse_ai_signal(ai_output, symbol, current_atr):
                 entry = float(entry_match.group(1)) if entry_match else 0
                 sl = float(sl_match.group(1)) if sl_match else 0
                 tp = float(tp_match.group(1)) if tp_match else 0
-                tp2 = float(tp2_match.group(1)) if tp2_match else 0 # New TP2
+                tp2 = float(tp2_match.group(1)) if tp2_match else 0 
                 
                 if entry == 0: 
-                    # Attempt to extract price from reason if entry is missing
                     price_match = re.search(r'Current Price: ([\d.]+)', signal['reason'])
                     if price_match: entry = float(price_match.group(1))
                     else: entry = 0
@@ -389,14 +360,14 @@ def parse_ai_signal(ai_output, symbol, current_atr):
 
                 if side == "BUY":
                     signal['entry'] = entry
-                    signal['sl'] = sl if sl > 0 and sl < entry else entry - (current_atr * 1.5) # Default SL
-                    signal['tp'] = tp if tp > entry else entry + (current_atr * 3.0) # Default TP1
-                    signal['tp2'] = tp2 if tp2 > entry else entry + (current_atr * 4.5) # Default TP2 (Macro/Longer ATR)
+                    signal['sl'] = sl if sl > 0 and sl < entry else entry - (current_atr * 1.5)
+                    signal['tp'] = tp if tp > entry else entry + (current_atr * 3.0) 
+                    signal['tp2'] = tp2 if tp2 > entry else entry + (current_atr * 4.5) # Default TP2
                 elif side == "SELL":
                     signal['entry'] = entry
-                    signal['sl'] = sl if sl > entry else entry + (current_atr * 1.5) # Default SL
-                    signal['tp'] = tp if tp < entry and tp > 0 else entry - (current_atr * 3.0) # Default TP1
-                    signal['tp2'] = tp2 if tp2 < entry and tp2 > 0 else entry - (current_atr * 4.5) # Default TP2 (Macro/Longer ATR)
+                    signal['sl'] = sl if sl > entry else entry + (current_atr * 1.5) 
+                    signal['tp'] = tp if tp < entry and tp > 0 else entry - (current_atr * 3.0) 
+                    signal['tp2'] = tp2 if tp2 < entry and tp2 > 0 else entry - (current_atr * 4.5) # Default TP2
                 
             except Exception as e:
                 signal['reason'] += f" | (Parsing Error: {e})"
@@ -407,39 +378,33 @@ def parse_ai_signal(ai_output, symbol, current_atr):
         
     return signal
 
-# ---------------- Professional Candlestick Chart (UNCHANGED FIX) ----------------
+# ---------------- Professional Candlestick Chart ----------------
 
 def plot_signal_chart(symbol, candles, signal):
     
-    # 1. Prepare Data for mplfinance (Pandas DataFrame)
     df_candles = pd.DataFrame(candles, columns=['OpenTime', 'Open', 'High', 'Low', 'Close', 'Volume', 'CloseTime', 'QuoteAssetVolume', 'NumberOfTrades', 'TakerBuyBaseAssetVolume', 'TakerBuyQuoteAssetVolume', 'Ignore'])
     df_candles['OpenTime'] = pd.to_datetime(df_candles['OpenTime'], unit='ms')
     df_candles = df_candles.set_index(pd.DatetimeIndex(df_candles['OpenTime']))
     df_candles = df_candles[['Open', 'High', 'Low', 'Close', 'Volume']].astype(float)
 
-    # Add SMA 200 for long-term trend
     df_candles['SMA200'] = df_candles['Close'].rolling(window=200).mean()
     
-    # *** FIX: Filter the DataFrame to the last 300 points for consistent plotting ***
-    # Using 300 points for plot stability, even if 999 are fetched for analysis.
+    # Filter to the last 300 points for stable chart plotting
     df_plot = df_candles.iloc[-300:] 
 
     apds = [
-        # Use the filtered df_plot['SMA200'] which is now length 300
         mpf.make_addplot(df_plot['SMA200'], color='#FFA500', panel=0, width=1.0, secondary_y=False), 
     ]
 
-    # 3. Prepare horizontal lines for signals (TP2 added here)
     hlines = []
     colors = []; linestyles = []
     
     if signal["side"] in ["BUY", "SELL"]:
-        # Only plot Entry, SL, and TP1 (TP2 is often far away and clutters the short-term chart)
+        # Only plot Entry, SL, and TP1 on the chart
         hlines.extend([signal["entry"], signal["sl"], signal["tp"]])
         colors = ['blue', 'red', 'green']
         linestyles = ['-', '--', '--'] 
         
-    # 4. Define the chart style 
     s = mpf.make_mpf_style(
         base_mpf_style='yahoo', 
         gridcolor='#e0e0e0',    
@@ -451,9 +416,8 @@ def plot_signal_chart(symbol, candles, signal):
         )
     )
 
-    # 5. Plot the chart
     fig, axlist = mpf.plot(
-        df_plot, # Use the filtered DataFrame (df_plot)
+        df_plot, 
         type='candle',
         style=s,
         title=f"{symbol} 1H Advanced Signal ({signal.get('side','?')}) | Conf {signal.get('confidence',0)}%",
@@ -464,7 +428,6 @@ def plot_signal_chart(symbol, candles, signal):
         hlines=dict(hlines=hlines, colors=colors, linestyle=linestyles, linewidths=1.5, alpha=0.9), 
     )
 
-    # 6. Add 'Flying Raijin' Logo/Watermark
     ax = axlist[0] 
     logo_text = "⚡ Flying Raijin - Multi-TF Model ⚡"
     
@@ -474,13 +437,12 @@ def plot_signal_chart(symbol, candles, signal):
         bbox=dict(facecolor='#333333', alpha=0.7, edgecolor='#FFD700', linewidth=1, boxstyle='round,pad=0.5')
     )
 
-    # 7. Save the chart
     tmp = NamedTemporaryFile(delete=False, suffix=".png")
     fig.savefig(tmp.name, bbox_inches='tight')
     plt.close(fig)
     return tmp.name
 
-# ---------------- Fetch & Telegram (No changes) ----------------
+# ---------------- Fetch & Telegram ----------------
 async def fetch_json(session,url):
     try:
         async with session.get(url,timeout=20) as r:
@@ -510,7 +472,7 @@ async def send_photo(session,caption,path):
     except Exception as e: print("send_photo error:", e)
 
 
-# ---------------- Main loop (UPDATED) ----------------
+# ---------------- Main loop ----------------
 async def advanced_options_loop():
     if not client:
         print("🔴 ERROR: OpenAI API Key (OPENAI_API_KEY) not set. AI analysis will not work.")
@@ -554,11 +516,9 @@ async def advanced_options_loop():
                     data = fetched_data.get(sym, {})
                     c1h = data.get("1h"); 
                     spot_depth = data.get("depth"); agg_data = data.get("aggTrades"); 
-                    options_data = data.get("options"); 
-                    candles_4h = data.get("4h");
-
+                    
                     if not all([c1h, spot_depth, agg_data]):
-                        print(f"{sym}: Missing critical data (1H Candle/Spot Depth/AggTrades), skipping"); continue
+                        print(f"{sym}: Missing critical data, skipping"); continue
                     
                     # 1. Run Advanced AI Analysis (passing entire data dict)
                     final_signal = await analyze_with_openai(sym, data)

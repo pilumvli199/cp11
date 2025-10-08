@@ -19,7 +19,6 @@ import mplfinance as mpf
 
 # OpenAI client
 from openai import OpenAI
-from openai import _client # Required for the patch
 
 # Redis (non-TLS)
 import redis
@@ -51,23 +50,12 @@ OPTIONS_TICKER_URL = OPTIONS_BASE_URL + "/eapi/v1/ticker"
 # Set all Timeframes to the maximum robust limit of 999 klines (Binance API limit is 1000)
 CANDLE_LIMITS = {"1h": 999, "4h": 999, "1d": 999} 
 
-# --- PROXY FIX: Remove environment variables that might pass 'proxies' argument automatically ---
-# This is the original fix, but we need the dynamic patch below for robustness.
+# --- STABLE PROXY FIX: Remove environment variables that might pass 'proxies' argument automatically ---
+# This prevents the TypeError: Client.__init__() got an unexpected keyword argument 'proxies'
 for var in ['http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY']:
     if var in os.environ:
         del os.environ[var]
-
-# === FINAL FIX FOR: TypeError: Client.__init__() got an unexpected keyword argument 'proxies' ===
-# This dynamic patch forces the OpenAI client to ignore the 'proxies' argument.
-def patched_client_init(self, **kwargs):
-    kwargs.pop('proxies', None) 
-    self.__original_init__(**kwargs) 
-
-if hasattr(_client.Client, '__init__'):
-    _client.Client.__original_init__ = _client.Client.__init__
-    _client.Client.__init__ = patched_client_init
-
-# ==============================================================================================
+# ----------------------------------------------------------------------------------------------------
 
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 

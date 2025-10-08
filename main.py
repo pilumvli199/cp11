@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-# updated_main.py - Professional Crypto Bot (MTF, ATR, Depth, AggTrades, Candlestick Chart)
+# updated_main.py - Professional Crypto Bot (MTF, ATR, Depth, AggTrades, Advanced Candlestick Chart)
+# 'Flying Raijin' Logo Added
 
 import os, json, asyncio, traceback, time
 import numpy as np
+import pandas as pd # Added pandas import for mplfinance
 from datetime import datetime
 from dotenv import load_dotenv
 import aiohttp
@@ -13,7 +15,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.dates import date2num
-from mplfinance.original_flavor import candlestick_ohlc # For professional charts
+import mplfinance as mpf 
 
 # OpenAI client (optional)
 from openai import OpenAI
@@ -29,7 +31,7 @@ SYMBOLS = [
     "TRXUSDT","DOGEUSDT","BNBUSDT","ADAUSDT","LTCUSDT","LINKUSDT"
 ]
 
-POLL_INTERVAL = max(15, int(os.getenv("POLL_INTERVAL", 60))) # Polling every 60s
+POLL_INTERVAL = max(15, int(os.getenv("POLL_INTERVAL", 60)))
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -39,8 +41,8 @@ SIGNAL_CONF_THRESHOLD = float(os.getenv("SIGNAL_CONF_THRESHOLD", 75.0))
 # API Endpoints
 CANDLE_URL = "https://api.binance.com/api/v3/klines?symbol={symbol}&interval={tf}&limit={limit}"
 TICKER_24H_URL = "https://api.binance.com/api/v3/ticker/24hr?symbol={symbol}"
-DEPTH_URL = "https://api.binance.com/api/v3/depth?symbol={symbol}&limit=50" # Top 50 Bids/Asks
-AGGT_URL = "https://api.binance.com/api/v3/aggTrades?symbol={symbol}&limit=100" # Last 100 Trades
+DEPTH_URL = "https://api.binance.com/api/v3/depth?symbol={symbol}&limit=50"
+AGGT_URL = "https://api.binance.com/api/v3/aggTrades?symbol={symbol}&limit=100" 
 
 CANDLE_LIMITS = {"30m": 100, "1h": 100, "4h": 100, "1d": 200}
 TIME_FRAMES = ["30m", "1h", "4h", "1d"]
@@ -52,7 +54,6 @@ client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 REDIS = None
 def init_redis_plain():
     global REDIS
-    # ... (Redis connection logic - unchanged)
     host = os.getenv("REDIS_HOST")
     port = int(os.getenv("REDIS_PORT")) if os.getenv("REDIS_PORT") else None
     user = os.getenv("REDIS_USER") or None
@@ -77,7 +78,7 @@ def init_redis_plain():
 
 init_redis_plain()
 
-# ---------------- Redis helpers (Updated for Depth/AggTrades) ----------------
+# ---------------- Redis helpers ----------------
 def safe_call(fn, *args, **kwargs):
     try:
         if REDIS: return fn(*args, **kwargs)
@@ -107,14 +108,11 @@ def store_24h(symbol, stats):
         try: REDIS.setex(f"crypto:24h:{symbol}", 300, json.dumps(stats))
         except Exception as e: print("store_24h error:", e)
 
-# NEW: Store Market Depth Data
 def store_depth(symbol, depth_data):
-    # Store with short TTL as depth changes fast
     if REDIS:
         try: REDIS.setex(f"crypto:depth:{symbol}", 15, json.dumps(depth_data))
         except Exception as e: print("store_depth error:", e)
 
-# NEW: Store Aggregated Trades Data (as a temporary set)
 def store_aggtrades(symbol, agg_data):
     if REDIS:
         try: REDIS.setex(f"crypto:aggtrades:{symbol}", 15, json.dumps(agg_data))
@@ -126,7 +124,7 @@ def store_candle(symbol, tf, candle):
 
 def store_signal(symbol, signal): safe_hset("signals:active", symbol, json.dumps(signal))
 
-# ---------------- Utils & indicators (Unchanged) ----------------
+# ---------------- Utils & indicators ----------------
 def fmt_price(p): return f"{p:.6f}" if abs(p)<1 else f"{p:.2f}"
 
 def ema(values, period):
@@ -160,57 +158,32 @@ def rsi(closes, period=14):
         rsi_vals.append(100. - 100. / (1. + rs))
     return rsi_vals[-1] if rsi_vals else None
 
-# ---------------- New Analysis Logic ----------------
+# ---------------- Analysis Logic ----------------
 
 def analyze_depth_pressure(depth_data):
     if not depth_data or 'bids' not in depth_data or 'asks' not in depth_data: return 0, 0
-    
-    # Calculate cumulative volume for top N bids and asks
     bid_volume = sum([float(b[1]) for b in depth_data['bids']])
     ask_volume = sum([float(a[1]) for a in depth_data['asks']])
-    
     total_volume = bid_volume + ask_volume
     if total_volume == 0: return 0, 0
-    
-    # Pressure is the ratio of Bid Volume to Total Volume
-    # > 0.5 means more buying pressure, < 0.5 means more selling pressure
     pressure_ratio = bid_volume / total_volume 
-    
-    # Calculate imbalance: how much bigger is one side than the other (percentage difference)
     imbalance_pct = (bid_volume - ask_volume) / total_volume * 100
-    
     return pressure_ratio, imbalance_pct
 
 def analyze_aggtrades_momentum(agg_data):
     if not agg_data: return 0, 0
-    
-    buy_vol = 0
-    sell_vol = 0
-    
-    # AggTrades: 'm' is True if the buyer is the market maker (i.e., it was a SELL trade)
-    # 'M' is False if the seller is the market maker (i.e., it was a BUY trade)
+    buy_vol = 0; sell_vol = 0
     for trade in agg_data:
-        qty = float(trade['q'])
-        is_sell_trade = trade['m'] # True if it was a sell trade (Taker is buyer)
-        
-        if not is_sell_trade: # Taker is BUYER (Aggressive Buy)
-            buy_vol += qty
-        else: # Taker is SELLER (Aggressive Sell)
-            sell_vol += qty
-            
+        qty = float(trade['q']); is_sell_trade = trade['m'] 
+        if not is_sell_trade: buy_vol += qty
+        else: sell_vol += qty
     total_vol = buy_vol + sell_vol
     if total_vol == 0: return 0, 0
-    
-    # Momentum is the ratio of Aggressive Buy Volume to Total Aggressive Volume
     momentum_ratio = buy_vol / total_vol
-    
-    # Imbalance: how much aggressive buying vs selling
     imbalance_pct = (buy_vol - sell_vol) / total_vol * 100
-    
     return momentum_ratio, imbalance_pct
 
 def analyze_trade_logic(candles_30m, candles_1h, candles_4h, depth_data, agg_data, rr_min=RISK_REWARD_RATIO):
-    # (Existing Kline Data Extraction & Indicator Calculation - Unchanged)
     closes = np.array([float(c[4]) for c in candles_30m]); highs = np.array([float(c[2]) for c in candles_30m]); lows = np.array([float(c[3]) for c in candles_30m]); volumes = np.array([float(c[5]) for c in candles_30m])
     if len(closes) < 30: return {"side":"none","confidence":0,"reason":"Not enough 30m data"}
     
@@ -225,25 +198,17 @@ def analyze_trade_logic(candles_30m, candles_1h, candles_4h, depth_data, agg_dat
     conf = 50; reasons = []
     side = "none"
     
-    # NEW: Order Book & AggTrades Analysis
     depth_ratio, depth_imbalance = analyze_depth_pressure(depth_data)
     agg_ratio, agg_imbalance = analyze_aggtrades_momentum(agg_data)
 
     # --- BUY Signal Logic ---
     if price > es_9 and es_9 > es_21 and trend == "up":
         if current_rsi and 40 <= current_rsi <= 70:
-            
-            # ATR-based SL/TP
             sl_dist = current_atr * 1.5; tp_dist = current_atr * (1.5 * rr_min)
-            entry, stop = price, price - sl_dist
-            tgt = price + tp_dist
+            entry, stop = price, price - sl_dist; tgt = price + tp_dist
             
-            # Additional Confirmation Checks (Confidence Boost)
-            if depth_imbalance > 10: # More than 10% more Bid volume
-                conf += 10; reasons.append(f"Strong Bid Pressure ({depth_imbalance:.1f}%)")
-            
-            if agg_imbalance > 15: # More than 15% Aggressive Buy volume
-                conf += 10; reasons.append(f"Aggressive Buying Momentum ({agg_imbalance:.1f}%)")
+            if depth_imbalance > 10: conf += 10; reasons.append(f"Strong Bid Pressure ({depth_imbalance:.1f}%)")
+            if agg_imbalance > 15: conf += 10; reasons.append(f"Aggressive Buying Momentum ({agg_imbalance:.1f}%)")
                 
             conf += 15; reasons.append(f"Uptrend confirmed by {trend} MTF, EMAs crossed up, RSI is {current_rsi:.2f}")
             side = "BUY"
@@ -251,18 +216,11 @@ def analyze_trade_logic(candles_30m, candles_1h, candles_4h, depth_data, agg_dat
     # --- SELL Signal Logic ---
     elif price < es_9 and es_9 < es_21 and trend == "down":
         if current_rsi and 30 <= current_rsi <= 60:
-            
-            # ATR-based SL/TP
             sl_dist = current_atr * 1.5; tp_dist = current_atr * (1.5 * rr_min)
-            entry, stop = price, price + sl_dist
-            tgt = price - tp_dist
+            entry, stop = price, price + sl_dist; tgt = price - tp_dist
             
-            # Additional Confirmation Checks (Confidence Boost)
-            if depth_imbalance < -10: # More than 10% more Ask volume (selling)
-                conf += 10; reasons.append(f"Strong Ask Pressure ({abs(depth_imbalance):.1f}%)")
-            
-            if agg_imbalance < -15: # More than 15% Aggressive Sell volume
-                conf += 10; reasons.append(f"Aggressive Selling Momentum ({abs(agg_imbalance):.1f}%)")
+            if depth_imbalance < -10: conf += 10; reasons.append(f"Strong Ask Pressure ({abs(depth_imbalance):.1f}%)")
+            if agg_imbalance < -15: conf += 10; reasons.append(f"Aggressive Selling Momentum ({abs(agg_imbalance):.1f}%)")
                 
             conf += 15; reasons.append(f"Downtrend confirmed by {trend} MTF, EMAs crossed down, RSI is {current_rsi:.2f}")
             side = "SELL"
@@ -272,54 +230,89 @@ def analyze_trade_logic(candles_30m, candles_1h, candles_4h, depth_data, agg_dat
         
     return {"side":"none","confidence":conf,"reason":"No strong setup. MTF trend: "+trend}
 
-# ---------------- Professional Candlestick Chart ----------------
+# ---------------- Professional Candlestick Chart (Updated for Flying Raijin Logo) ----------------
 def plot_signal_chart(symbol, candles, signal):
-    dates = [datetime.utcfromtimestamp(int(x[0])/1000) for x in candles]
     
-    # Convert data to OHLC format for mplfinance: (date_num, open, high, low, close)
-    ohlc = []
-    for i, c in enumerate(candles):
-        # [0] open time, [1] open, [2] high, [3] low, [4] close, [5] volume
-        ohlc.append([date2num(dates[i]), float(c[1]), float(c[2]), float(c[3]), float(c[4])])
-    
-    # Prepare EMAs for plotting
-    closes = np.array([float(x[4]) for x in candles])
-    ema_9 = ema(closes, 9)
-    ema_21 = ema(closes, 21)
-    
-    # Create subplots
-    fig, ax = plt.subplots(figsize=(14, 7))
-    ax.grid(True)
-    ax.set_facecolor('#f0f0f0') 
-    
-    # 1. Plot Candlesticks
-    candlestick_ohlc(ax, ohlc, width=0.0008, colorup='g', colordown='r', alpha=0.9)
-    
-    # 2. Plot EMAs
-    ax.plot(date2num(dates), ema_9, label='EMA 9', color='#FFC300', linewidth=1.5) # Yellow/Gold
-    ax.plot(date2num(dates), ema_21, label='EMA 21', color='#DAF7A6', linewidth=1.5) # Light Green
+    # 1. Prepare Data for mplfinance (Pandas DataFrame)
+    df_candles = pd.DataFrame(candles, columns=['OpenTime', 'Open', 'High', 'Low', 'Close', 'Volume', 'CloseTime', 'QuoteAssetVolume', 'NumberOfTrades', 'TakerBuyBaseAssetVolume', 'TakerBuyQuoteAssetVolume', 'Ignore'])
+    df_candles['OpenTime'] = pd.to_datetime(df_candles['OpenTime'], unit='ms')
+    df_candles = df_candles.set_index(pd.DatetimeIndex(df_candles['OpenTime']))
+    df_candles = df_candles[['Open', 'High', 'Low', 'Close', 'Volume']].astype(float)
 
-    # 3. Plot Signal Levels (Horizontal Lines)
-    try:
-        # Use price formatting for labels
-        ax.axhline(signal["entry"], color="blue", ls="-", linewidth=2, label=f"Entry: {fmt_price(signal['entry'])}")
-        ax.axhline(signal["sl"], color="red", ls="--", linewidth=2, label=f"SL: {fmt_price(signal['sl'])}")
-        ax.axhline(signal["tp"], color="green", ls="--", linewidth=2, label=f"TP: {fmt_price(signal['tp'])}")
-    except Exception:
-        pass
+    # 2. Prepare EMAs as `addplot`
+    closes = df_candles['Close'].to_numpy()
+    ema_9_vals = ema(closes, 9)
+    ema_21_vals = ema(closes, 21)
+
+    ema_9_series = pd.Series(ema_9_vals, index=df_candles.index)
+    ema_21_series = pd.Series(ema_21_vals, index=df_candles.index)
+
+    apds = [
+        mpf.make_addplot(ema_9_series, color='#FFC300', panel=0, width=1.0, secondary_y=False), 
+        mpf.make_addplot(ema_21_series, color='#DAF7A6', panel=0, width=1.0, secondary_y=False),
+    ]
+
+    # 3. Prepare horizontal lines for signals
+    hlines = []
+    if signal["side"] != "none":
+        hlines.extend([signal["entry"], signal["sl"], signal["tp"]])
         
-    # Format the X-axis (dates)
-    ax.xaxis_date(); ax.autoscale_view()
-    ax.set_title(f"{symbol} 30M Signal ({signal.get('side','?')}) | Conf {signal.get('confidence',0)}% - MTF, ATR, Depth Confirmed", fontsize=16)
-    ax.legend(loc='best', fontsize=10)
+    # 4. Define the chart style 
+    s = mpf.make_mpf_style(
+        base_mpf_style='yahoo', 
+        gridcolor='#e0e0e0',    
+        facecolor='#ffffff',    
+        figcolor='#ffffff',     
+        y_on_right=False,       
+        marketcolors=mpf.make_marketcolors(
+            up='g',             
+            down='r',           
+            edge='inherit',     
+            wick='inherit',     
+            volume='inherit'    
+        )
+    )
+
+    # 5. Plot the chart
+    fig, axlist = mpf.plot(
+        df_candles,
+        type='candle',
+        style=s,
+        title=f"{symbol} 30M Signal ({signal.get('side','?')}) | Conf {signal.get('confidence',0)}%",
+        ylabel='Price',
+        addplot=apds,           
+        figscale=1.5,           
+        returnfig=True,         
+        hlines=dict(hlines=hlines, colors=['blue', 'red', 'green'], linestyles=['-', '--', '--'], linewidths=1.5, alpha=0.9),
+    )
+
+    # 6. Add 'Flying Raijin' Logo/Watermark
+    ax = axlist[0] # Get the main candlestick axes
     
-    # Save the chart
+    # Customized text effects for 'Flying Raijin'
+    logo_text = "⚡ Flying Raijin ⚡"
+    
+    ax.text(
+        0.99, 0.01,             # Position: Bottom Right
+        logo_text,              
+        transform=ax.transAxes, 
+        fontsize=14,
+        fontweight='bold',
+        color='#FFD700',        # Gold color for striking effect
+        ha='right',             
+        va='bottom',            
+        alpha=0.8,
+        # Adding a subtle shadow/outline effect
+        bbox=dict(facecolor='#333333', alpha=0.7, edgecolor='#FFD700', linewidth=1, boxstyle='round,pad=0.5')
+    )
+
+    # 7. Save the chart
     tmp = NamedTemporaryFile(delete=False, suffix=".png")
     fig.savefig(tmp.name, bbox_inches='tight')
     plt.close(fig)
     return tmp.name
 
-# ---------------- Fetch & AI (Unchanged) ----------------
+# ---------------- Fetch & AI ----------------
 async def fetch_json(session,url):
     try:
         async with session.get(url,timeout=20) as r:
@@ -345,7 +338,7 @@ async def ask_openai_for_signals(symbol, latest_30m, summary):
         print("ask_openai_for_signals error:", e)
         return "NO_AI_RESPONSE_ERROR"
 
-# ---------------- Telegram (Unchanged) ----------------
+# ---------------- Telegram ----------------
 async def send_text(session,text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print(text); return
@@ -363,7 +356,7 @@ async def send_photo(session,caption,path):
             await session.post(url,data=data)
     except Exception as e: print("send_photo error:", e)
 
-# ---------------- Main loop (Updated Fetching) ----------------
+# ---------------- Main loop ----------------
 async def enhanced_loop():
     async with aiohttp.ClientSession() as session:
         startup=f"🤖 Professional Bot Started (MTF, ATR, Depth, AggTrades) • {len(SYMBOLS)} symbols • Poll {POLL_INTERVAL}s"
@@ -376,8 +369,8 @@ async def enhanced_loop():
             tasks = {}
             for sym in SYMBOLS:
                 tasks[f"{sym}_24h"] = fetch_json(session, TICKER_24H_URL.format(symbol=sym))
-                tasks[f"{sym}_depth"] = fetch_json(session, DEPTH_URL.format(symbol=sym)) # NEW
-                tasks[f"{sym}_aggTrades"] = fetch_json(session, AGGT_URL.format(symbol=sym)) # NEW
+                tasks[f"{sym}_depth"] = fetch_json(session, DEPTH_URL.format(symbol=sym))
+                tasks[f"{sym}_aggTrades"] = fetch_json(session, AGGT_URL.format(symbol=sym))
                 for tf in TIME_FRAMES:
                     limit = CANDLE_LIMITS[tf]
                     tasks[f"{sym}_{tf}"] = fetch_json(session, CANDLE_URL.format(symbol=sym, tf=tf, limit=limit))
@@ -403,8 +396,8 @@ async def enhanced_loop():
                     # Store data to Redis
                     store_ltp(sym, float(c30[-1][4]), int(datetime.now().timestamp()));
                     if stats24h: store_24h(sym, stats24h);
-                    store_depth(sym, depth_data); # Store Depth
-                    store_aggtrades(sym, agg_data); # Store AggTrades
+                    store_depth(sym, depth_data);
+                    store_aggtrades(sym, agg_data);
 
                     for tf, candles in [("30m", c30), ("1h", c1h), ("4h", c4h), ("1d", data.get("1d"))]:
                         if candles:
@@ -423,7 +416,7 @@ async def enhanced_loop():
                     
                     if final_signal["side"] != "none":
                         # Confidence Boost if AI supports the signal
-                        if final_signal["side"] in ai_prediction:
+                        if final_signal["side"] in ai_prediction: # Simple check for AI agreement
                              final_signal["confidence"] = min(99, final_signal["confidence"] + 5)
                              
                         if final_signal["confidence"] >= SIGNAL_CONF_THRESHOLD:

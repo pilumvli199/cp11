@@ -1,7 +1,7 @@
 # Core Libraries for Data Processing and AI
 pandas==2.2.2
 numpy==1.26.4
-openai==0.28.1    <--- (IMPORTANT CHANGE HERE)
+openai==0.28.1  # IMPORTANT CHANGE HERE
 python-dotenv==1.0.1
 redis==5.0.4
 

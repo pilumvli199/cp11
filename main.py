@@ -32,7 +32,7 @@ POLL_INTERVAL = max(30, int(os.getenv("POLL_INTERVAL", 1800)))
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo") # Changed to v0.x supported model
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo") # v0.x supported model
 SIGNAL_CONF_THRESHOLD = float(os.getenv("SIGNAL_CONF_THRESHOLD", 80.0)) 
 
 # API Endpoints
@@ -377,16 +377,39 @@ def parse_ai_signal(ai_output, symbol, current_atr):
 
                 if entry == 0: raise ValueError("Entry price could not be determined.")
 
+                # --- ATR Safety Check Configuration ---
+                # Max acceptable SL/Entry difference (e.g., 4 times the current ATR)
+                max_acceptable_sl_diff = current_atr * 4.0 
+                default_sl_diff = current_atr * 1.5
+                default_tp1_diff = current_atr * 3.0
+                default_tp2_diff = current_atr * 4.5
+                # ------------------------------------
+
                 if side == "BUY":
                     signal['entry'] = entry
-                    signal['sl'] = sl if sl > 0 and sl < entry else entry - (current_atr * 1.5)
-                    signal['tp'] = tp if tp > entry else entry + (current_atr * 3.0) 
-                    signal['tp2'] = tp2 if tp2 > entry else entry + (current_atr * 4.5) # Default TP2
+                    
+                    # SL Check: Use AI's SL only if it's tighter than max_acceptable_sl_diff 
+                    # (sl > 0: ensure value exists; sl < entry: correct side for BUY)
+                    if sl > 0 and sl < entry and (entry - sl) < max_acceptable_sl_diff:
+                        signal['sl'] = sl 
+                    else:
+                        signal['sl'] = entry - default_sl_diff
+                        
+                    signal['tp'] = tp if tp > entry else entry + default_tp1_diff
+                    signal['tp2'] = tp2 if tp2 > entry else entry + default_tp2_diff
+                    
                 elif side == "SELL":
                     signal['entry'] = entry
-                    signal['sl'] = sl if sl > entry else entry + (current_atr * 1.5) 
-                    signal['tp'] = tp if tp < entry and tp > 0 else entry - (current_atr * 3.0) 
-                    signal['tp2'] = tp2 if tp2 < entry and tp2 > 0 else entry - (current_atr * 4.5) # Default TP2
+
+                    # SL Check: Use AI's SL only if it's tighter than max_acceptable_sl_diff
+                    # (sl > entry: correct side for SELL)
+                    if sl > entry and (sl - entry) < max_acceptable_sl_diff:
+                        signal['sl'] = sl 
+                    else:
+                        signal['sl'] = entry + default_sl_diff
+
+                    signal['tp'] = tp if tp < entry and tp > 0 else entry - default_tp1_diff
+                    signal['tp2'] = tp2 if tp2 < entry and tp2 > 0 else entry - default_tp2_diff
                 
             except Exception as e:
                 signal['reason'] += f" | (Parsing Error: {e})"
@@ -500,7 +523,7 @@ async def advanced_options_loop():
     init_redis_plain() 
     
     async with aiohttp.ClientSession() as session:
-        startup=f"🤖 Advanced BTC/ETH Bot Started (Multi-TF/OI Analysis, GPT-3.5-turbo) • Poll {POLL_INTERVAL//60}min"
+        startup=f"🤖 Advanced BTC/ETH Bot Started (Multi-TF/OI Analysis, {OPENAI_MODEL}) • Poll {POLL_INTERVAL//60}min"
         print(startup); await send_text(session,startup)
         
         while True:

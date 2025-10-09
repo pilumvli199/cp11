@@ -21,6 +21,7 @@ CRYPTO_PAIRS = [
 ]
 TIMEFRAME = "1h"  # 1m, 5m, 15m, 1h, 4h, 1d
 SCAN_INTERVAL = 60  # 60 seconds = 1 minute per crypto
+GEMINI_MODEL = "gemini-1.5-flash-latest"  # flash = faster + more free requests
 
 # ==================== BINANCE DATA FETCH ====================
 def fetch_binance_data(symbol, interval="1h", limit=999):
@@ -100,9 +101,9 @@ def create_chart(df, symbol, timeframe):
 
 # ==================== GEMINI ANALYSIS ====================
 def analyze_chart_with_gemini(chart_file, ohlc_data, symbol):
-    """Gemini 1.5 Pro use karun chart analysis karto"""
+    """Gemini 1.5 Flash use karun chart analysis karto"""
     genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel('gemini-1.5-pro')
+    model = genai.GenerativeModel(GEMINI_MODEL)
     
     # Analysis prompt
     prompt = f"""

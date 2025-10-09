@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# main.py - FULL Hybrid Gemini 1.5 Flash (Vision + Text) Multi-Timeframe Bot
+# main.py - FULL Hybrid Gemini Vision + Gemini Pro (Text) Multi-Timeframe Bot
 # Scan interval set to 30 minutes (1800 seconds)
 
 import os, json, asyncio, traceback, time
@@ -34,11 +34,12 @@ SYMBOLS = ["BTCUSDT", "ETHUSDT"]
 
 # Symbols that require Gemini Vision (image analysis).
 VISION_SYMBOLS = ["BTCUSDT", "ETHUSDT"]
-# Using latest models for best performance
-GEMINI_VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-1.5-flash-latest")
-GEMINI_TEXT_MODEL = os.getenv("GEMINI_TEXT_MODEL", "gemini-1.0-pro")
 
-# *** CHANGED: SET SCAN INTERVAL TO 30 MINUTES (1800 seconds) ***
+# *** CHANGED: Using stable, compatible models to avoid API errors ***
+GEMINI_VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-pro-vision")
+GEMINI_TEXT_MODEL = os.getenv("GEMINI_TEXT_MODEL", "gemini-pro")
+
+# SET SCAN INTERVAL TO 30 MINUTES (1800 seconds)
 POLL_INTERVAL = max(60, int(os.getenv("POLL_INTERVAL", 1800)))
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -253,8 +254,7 @@ async def analyze_with_gemini(symbol, data, chart_path=None):
     current_atr = atr(highs, lows, closes)
     last_10_candles_raw = df_1h.tail(10).to_string()
 
-    # --- *** UPDATED PROMPT FOR GEMINI AI *** ---
-    # This prompt now specifically asks the AI to focus on chart patterns and candlestick analysis from the image.
+    # --- Prompt for Gemini AI (Focus on Chart Patterns) ---
     text_prompt = (
         f"You are an expert crypto trading analyst. Your task is to find a high-probability trade setup for {symbol} for the next 24-48 hours. "
         "Your entire analysis MUST be based on the provided chart image combined with the raw text data and option chain data below.\n\n"

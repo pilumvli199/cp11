@@ -1,8 +1,8 @@
-python-telegram-bot>=21.0
-requests>=2.32.0
-pandas>=2.2.0
-mplfinance>=0.12.10b0
-pillow>=11.0.0
-google-generativeai>=0.8.0
-numpy>=2.0.0
-matplotlib>=3.9.0
+# Core Libraries
+pandas
+mplfinance
+python-telegram-bot
+google-generativeai
+Pillow
+python-dotenv
+aiohttp

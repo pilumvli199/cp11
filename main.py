@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# main.py - FULL Hybrid Gemini Pro Vision (Vision) + Gemini Pro (Text) Multi-Timeframe Bot
-# Scan interval set to 1 hour (3600 seconds)
+# main.py - FULL Hybrid Gemini 1.5 Flash (Vision + Text) Multi-Timeframe Bot
+# Scan interval set to 30 minutes (1800 seconds)
 
 import os, json, asyncio, traceback, time
 import numpy as np
@@ -28,23 +28,22 @@ import redis
 # Load environment variables
 load_dotenv()
 
-# ---------------- CONFIG (Gemini Hybrid Mode & 1 Hour Scan) ----------------
+# ---------------- CONFIG (Gemini Hybrid Mode & 30 Min Scan) ----------------
 # Symbols: BTC and ETH for analysis
 SYMBOLS = ["BTCUSDT", "ETHUSDT"]
 
-# Symbols that require the more expensive Gemini Pro VISION (image analysis).
-# Both are now included for full advanced analysis.
+# Symbols that require Gemini Vision (image analysis).
 VISION_SYMBOLS = ["BTCUSDT", "ETHUSDT"]
-# Ensure Gemini models are used for vision/hybrid analysis
-GEMINI_VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-pro-vision")
-GEMINI_TEXT_MODEL = os.getenv("GEMINI_TEXT_MODEL", "gemini-pro")
+# Using latest models for best performance
+GEMINI_VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-1.5-flash-latest")
+GEMINI_TEXT_MODEL = os.getenv("GEMINI_TEXT_MODEL", "gemini-1.0-pro")
 
-# SET SCAN INTERVAL TO 1 HOUR (3600 seconds)
-POLL_INTERVAL = max(60, int(os.getenv("POLL_INTERVAL", 3600)))
+# *** CHANGED: SET SCAN INTERVAL TO 30 MINUTES (1800 seconds) ***
+POLL_INTERVAL = max(60, int(os.getenv("POLL_INTERVAL", 1800)))
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") # <-- IMPORTANT: Use your Gemini API Key
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 SIGNAL_CONF_THRESHOLD = float(os.getenv("SIGNAL_CONF_THRESHOLD", 80.0))
 
 # API Endpoints
@@ -55,7 +54,7 @@ TICKER_24H_URL = BASE_URL + "/api/v3/ticker/24hr?symbol={symbol}"
 DEPTH_URL = BASE_URL + "/api/v3/depth?symbol={symbol}&limit=50"
 AGGT_URL = BASE_URL + "/api/v3/aggTrades?symbol={symbol}&limit=100"
 OPTIONS_TICKER_URL = OPTIONS_BASE_URL + "/eapi/v1/ticker"
-CANDLE_LIMITS = {"1h": 999, "4h": 999, "1d": 999}
+CANDLE_LIMITS = {"1h": 999, "4h": 999, "1d": 999} # Fetches 999 candles
 
 # --- STABLE PROXY FIX ---
 for var in ['http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY']:
@@ -109,7 +108,7 @@ def safe_hset(h, field, val):
 
 def store_signal(symbol, signal): safe_hset("signals:advanced", symbol, json.dumps(signal))
 
-# ---------------- Options Chain Analysis (Unchanged) ----------------
+# ---------------- Options Chain Analysis ----------------
 async def get_options_data_for_symbol(session, base_symbol) -> Dict[str, Any]:
     data = {"options_sentiment": "Neutral", "oi_summary": "N/A", "near_term_symbol": None}
     current_time_ms = int(time.time() * 1000)
@@ -133,9 +132,7 @@ async def get_options_data_for_symbol(session, base_symbol) -> Dict[str, Any]:
     next_expiry_contracts = [t for t in target_tickers if t.get('expiryDate') == next_expiry_date_ms]
     if not next_expiry_contracts: return data
 
-    total_call_oi = 0
-    total_put_oi = 0
-    all_ivs = []
+    total_call_oi = 0; total_put_oi = 0; all_ivs = []
 
     for ticker in next_expiry_contracts:
         try:
@@ -146,36 +143,29 @@ async def get_options_data_for_symbol(session, base_symbol) -> Dict[str, Any]:
             if option_type == 'CALL': total_call_oi += oi
             elif option_type == 'PUT': total_put_oi += oi
             if iv > 0: all_ivs.append(iv)
-
         except Exception: continue
 
     total_oi = total_call_oi + total_put_oi
     pcr = total_put_oi / total_call_oi if total_call_oi > 0 else 0
     avg_iv = np.mean(all_ivs) if all_ivs else 0
 
-    if total_oi == 0:
-        sentiment = "No Open Interest."
-    elif pcr < 0.7:
-        sentiment = "Strong Call Bias (Bullish sentiment) - PCR < 0.7."
-    elif pcr > 1.2:
-        sentiment = "Strong Put Bias (Bearish/Hedging sentiment) - PCR > 1.2."
-    else:
-        sentiment = f"Neutral to Moderate Sentiment (PCR: {pcr:.2f})."
+    if total_oi == 0: sentiment = "No Open Interest."
+    elif pcr < 0.7: sentiment = "Strong Call Bias (Bullish sentiment) - PCR < 0.7."
+    elif pcr > 1.2: sentiment = "Strong Put Bias (Bearish/Hedging sentiment) - PCR > 1.2."
+    else: sentiment = f"Neutral to Moderate Sentiment (PCR: {pcr:.2f})."
 
     data["options_sentiment"] = sentiment
     data["oi_summary"] = (
-        f"Next Expiry Date: {datetime.fromtimestamp(next_expiry_date_ms/1000).strftime('%Y-%m-%d %H:%M')}. "
-        f"Total OI: {total_oi:.2f}. Call OI: {total_call_oi:.2f}. Put OI: {total_put_oi:.2f}. "
-        f"Put/Call Ratio (PCR): {pcr:.2f}. "
-        f"Average Implied Volatility (IV): {avg_iv * 100:.2f}%."
+        f"Next Expiry: {datetime.fromtimestamp(next_expiry_date_ms/1000).strftime('%Y-%m-%d')}, "
+        f"Total OI: {total_oi:.2f}, Call OI: {total_call_oi:.2f}, Put OI: {total_put_oi:.2f}, "
+        f"PCR: {pcr:.2f}, Avg IV: {avg_iv * 100:.2f}%."
     )
     data["near_term_symbol"] = next_expiry_contracts[0]['symbol'] if next_expiry_contracts else 'N/A'
     return data
 
-# ---------------- Utility Functions (Unchanged) ----------------
+# ---------------- Utility Functions ----------------
 
 def rsi(prices, period=14):
-    """Calculates Relative Strength Index (RSI)."""
     delta = pd.Series(prices).diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
@@ -185,99 +175,40 @@ def rsi(prices, period=14):
     return 100 - (100 / (1 + rs)).iloc[-1]
 
 def atr(highs, lows, closes, period=14):
-    """Calculates Average True Range (ATR)."""
-    high = pd.Series(highs)
-    low = pd.Series(lows)
-    close = pd.Series(closes).shift(1)
-
-    tr1 = high - low
-    tr2 = abs(high - close)
-    tr3 = abs(low - close)
+    high = pd.Series(highs); low = pd.Series(lows); close = pd.Series(closes).shift(1)
+    tr1 = high - low; tr2 = abs(high - close); tr3 = abs(low - close)
     true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-
     atr = true_range.ewm(span=period, adjust=False, min_periods=period).mean()
     return atr.iloc[-1]
 
 def fmt_price(p):
-    """Formats price based on magnitude."""
     return f"{p:.4f}" if abs(p) < 1 else f"{p:.2f}"
 
 def parse_ai_signal(ai_output, symbol, current_atr):
-    """Parses the structured output from the AI model."""
     signal = {"side": "none", "confidence": 0.0, "reason": "AI did not adhere to the format."}
-
     try:
-        # Regex to extract structured data (SYMBOL - ACTION - ENTRY:x - SL:y - TP:z - TP2:w - REASON:.. - CONF:n%)
         match = re.search(
-            r"(?:{})\s*-\s*(BUY|SELL|HOLD|NONE)\s*-\s*ENTRY:([\d.]+)\s*-\s*SL:([\d.]+)\s*-\s*TP:([\d.]+)\s*-\s*TP2:([\d.]+)\s*-\s*REASON:(.*?)\s*-\s*CONF:(\d+\.?\d*)%".format(symbol.replace('USDT', '')),
-            ai_output, re.IGNORECASE | re.DOTALL
+             r"ACTION:\s*(BUY|SELL|HOLD|NONE)\s*-\s*ENTRY:([\d.]+)\s*-\s*SL:([\d.]+)\s*-\s*TP:([\d.]+)\s*-\s*TP2:([\d.]+)\s*-\s*REASON:(.*?)\s*-\s*CONF:(\d+\.?\d*)%",
+             ai_output, re.IGNORECASE | re.DOTALL
         )
-
-        # If the full, strict format fails, try a slightly looser format matching the prompt structure
         if not match:
-             match = re.search(
-                 r"ACTION:\s*(BUY|SELL|HOLD|NONE)\s*-\s*ENTRY:([\d.]+)\s*-\s*SL:([\d.]+)\s*-\s*TP:([\d.]+)\s*-\s*TP2:([\d.]+)\s*-\s*REASON:(.*?)\s*-\s*CONF:(\d+\.?\d*)%",
-                 ai_output, re.IGNORECASE | re.DOTALL
-             )
-
-        if not match:
-             # Fallback: Extract action, reason, and confidence if structured format failed
             action_match = re.search(r"ACTION:\s*([A-Z]+)", ai_output, re.IGNORECASE)
             conf_match = re.search(r"CONF:(\d+\.?\d*)%", ai_output, re.IGNORECASE)
             reason_match = re.search(r"REASON:(.*)", ai_output, re.IGNORECASE | re.DOTALL)
-
             fallback_action = action_match.group(1).upper().strip() if action_match else 'NONE'
             fallback_conf = float(conf_match.group(1).strip()) if conf_match else 0.0
-            fallback_reason = reason_match.group(1).strip() if reason_match else 'Format error. Logic is in raw output.'
-
-            # If action is BUY/SELL but missing parameters, use fallback calculation
-            if fallback_action in ['BUY', 'SELL'] and fallback_conf >= SIGNAL_CONF_THRESHOLD:
-                # Use simple logic based on current price and ATR for fallback
-                current_price_match = re.search(r"Current Price:\s*([\d.]+)", ai_output)
-                current_price = float(current_price_match.group(1)) if current_price_match else 0.0
-
-                if current_price > 0:
-                    multiplier = 1.5 * current_atr
-                    signal["side"] = fallback_action
-                    signal["confidence"] = fallback_conf
-                    signal["reason"] = "Fallback Calculation: " + fallback_reason
-                    signal["entry"] = current_price
-                    if fallback_action == 'BUY':
-                        signal["sl"] = current_price - multiplier
-                        signal["tp"] = current_price + 2 * multiplier
-                        signal["tp2"] = current_price + 4 * multiplier
-                    else: # SELL
-                        signal["sl"] = current_price + multiplier
-                        signal["tp"] = current_price - 2 * multiplier
-                        signal["tp2"] = current_price - 4 * multiplier
-                    return signal
-
-            signal["side"] = fallback_action
-            signal["confidence"] = fallback_conf
-            signal["reason"] = fallback_reason
+            fallback_reason = reason_match.group(1).strip() if reason_match else 'Format error.'
+            signal.update({"side": fallback_action, "confidence": fallback_conf, "reason": fallback_reason})
             return signal
 
-        # Successful structured parsing
-        # The groups are 1:ACTION, 2:ENTRY, 3:SL, 4:TP, 5:TP2, 6:REASON, 7:CONF
         action = match.group(1).upper().strip()
-        signal["side"] = action
-        signal["entry"] = float(match.group(2).strip())
-        signal["sl"] = float(match.group(3).strip())
-        signal["tp"] = float(match.group(4).strip())
-        signal["tp2"] = float(match.group(5).strip())
-        signal["reason"] = match.group(6).strip()
-        signal["confidence"] = float(match.group(7).strip())
-
-        # Quick validation of BUY/SELL entries
-        if action == "BUY" and signal["entry"] >= signal["sl"]: pass # Basic check
-        elif action == "SELL" and signal["entry"] <= signal["sl"]: pass # Basic check
-        elif action in ["BUY", "SELL"]:
-            print(f"Warning: {symbol} SL/Entry validation failed. Setting action to HOLD.")
-            signal["side"] = "HOLD"
-
+        signal.update({
+            "side": action, "entry": float(match.group(2).strip()), "sl": float(match.group(3).strip()),
+            "tp": float(match.group(4).strip()), "tp2": float(match.group(5).strip()),
+            "reason": match.group(6).strip(), "confidence": float(match.group(7).strip())
+        })
     except Exception as e:
         signal["reason"] += f" | Parsing Exception: {e}"
-
     return signal
 
 def plot_signal_chart(symbol, candles, signal):
@@ -285,289 +216,186 @@ def plot_signal_chart(symbol, candles, signal):
     df_candles['OpenTime'] = pd.to_datetime(df_candles['OpenTime'], unit='ms')
     df_candles = df_candles.set_index(pd.DatetimeIndex(df_candles['OpenTime']))
     df_candles = df_candles[['Open', 'High', 'Low', 'Close', 'Volume']].astype(float)
-
     df_candles['SMA200'] = df_candles['Close'].rolling(window=200).mean()
     df_plot = df_candles.iloc[-300:]
-
-    apds = [
-        mpf.make_addplot(df_plot['SMA200'], color='#FFA500', panel=0, width=1.0, secondary_y=False),
-    ]
-    hlines = []; colors = []; linestyles = []
-
+    apds = [mpf.make_addplot(df_plot['SMA200'], color='#FFA500', panel=0, width=1.0)]
+    hlines, colors, linestyles = [], [], []
     if signal["side"] in ["BUY", "SELL"]:
         if signal.get('entry', 0) > 0: hlines.append(signal["entry"]); colors.append('blue'); linestyles.append('-')
         if signal.get('sl', 0) > 0: hlines.append(signal["sl"]); colors.append('red'); linestyles.append('--')
         if signal.get('tp', 0) > 0: hlines.append(signal["tp"]); colors.append('green'); linestyles.append('--')
-
-    s = mpf.make_mpf_style(
-        base_mpf_style='yahoo', gridcolor='#e0e0e0', facecolor='#ffffff', figcolor='#ffffff', y_on_right=False,
-        marketcolors=mpf.make_marketcolors(up='g', down='r', edge='inherit', wick='inherit', volume='inherit')
-    )
-
+    s = mpf.make_mpf_style(base_mpf_style='yahoo', facecolor='#ffffff')
     fig, axlist = mpf.plot(
         df_plot, type='candle', style=s,
-        title=f"{symbol} 1H Advanced Signal ({signal.get('side','?')}) | Conf {signal.get('confidence',0):.2f}% | Model: {signal.get('model', 'N/A')}",
+        title=f"{symbol} 1H Signal | {signal.get('side','?')} | Conf {signal.get('confidence',0):.1f}% | Model: {signal.get('model', 'N/A')}",
         ylabel='Price', addplot=apds, figscale=1.5, returnfig=True,
-        hlines=dict(hlines=hlines, colors=colors, linestyle=linestyles, linewidths=1.5, alpha=0.9),
+        hlines=dict(hlines=hlines, colors=colors, linestyle=linestyles, linewidths=1.5, alpha=0.9)
     )
-
-    ax = axlist[0]
-    logo_text = "⚡ Flying Raijin - Multi-TF Model ⚡"
-    ax.text(
-        0.99, 0.01, logo_text, transform=ax.transAxes, fontsize=14, fontweight='bold',
-        color='#FFD700', ha='right', va='bottom', alpha=0.8,
-        bbox=dict(facecolor='#333333', alpha=0.7, edgecolor='#FFD700', linewidth=1, boxstyle='round,pad=0.5')
-    )
-
     tmp = NamedTemporaryFile(delete=False, suffix=f"_{symbol}.png")
     fig.savefig(tmp.name, bbox_inches='tight')
     plt.close(fig)
     return tmp.name
 
-# ---------------- Gemini AI Analysis Function (MODIFIED) ----------------
+# ---------------- Gemini AI Analysis Function ----------------
 
 async def analyze_with_gemini(symbol, data, chart_path=None):
     if not client: return {"side":"none","confidence":0,"reason":"NO_AI_KEY"}
 
-    # Select Model based on symbol
     is_vision_symbol = symbol in VISION_SYMBOLS
-    model_to_use = GEMINI_VISION_MODEL if is_vision_symbol else GEMINI_TEXT_MODEL
+    model_to_use = GEMINI_VISION_MODEL if is_vision_symbol and chart_path else GEMINI_TEXT_MODEL
 
-    # --- Data Preparation (Same as before) ---
-    c1h = data.get("1h")
-    candles_4h = data.get("4h")
-    spot_depth = data.get("depth")
-    agg_trades = data.get("aggTrades")
-
+    # --- Data Preparation ---
+    c1h = data.get("1h"); candles_4h = data.get("4h")
     df_1h = pd.DataFrame(c1h, columns=['OpenTime', 'Open', 'High', 'Low', 'Close', 'Volume', 'CloseTime', 'QuoteAssetVolume', 'NumberOfTrades', 'TakerBuyBaseAssetVolume', 'TakerBuyQuoteAssetVolume', 'Ignore'])
     df_1h = df_1h[['Open', 'High', 'Low', 'Close', 'Volume']].astype(float)
     current_price = df_1h['Close'].iloc[-1]
-
-    last_3_candles = df_1h.tail(3)
-    c1, c2, c3 = last_3_candles.iloc[-3], last_3_candles.iloc[-2], last_3_candles.iloc[-1]
-    pattern_summary = "No clear pattern."
-    if c3['Close'] > c3['Open'] and c2['Close'] < c2['Open'] and c1['Close'] < c1['Open'] and c3['Open'] > c2['Close']:
-        pattern_summary = "Possible Bullish Engulfing/Morning Star formation."
-    elif c3['Close'] < c3['Open'] and c2['Close'] > c2['Open'] and c1['Close'] > c1['Open'] and c3['Open'] < c2['Close']:
-        pattern_summary = "Possible Bearish Engulfing/Evening Star formation."
-
-    highs = df_1h['High'].to_numpy(); lows = df_1h['Low'].to_numpy(); closes = df_1h['Close'].to_numpy()
+    highs, lows, closes = df_1h['High'].to_numpy(), df_1h['Low'].to_numpy(), df_1h['Close'].to_numpy()
     current_atr = atr(highs, lows, closes)
+    last_10_candles_raw = df_1h.tail(10).to_string()
 
-    if candles_4h:
-        df_4h = pd.DataFrame(candles_4h, columns=['OpenTime', 'Open', 'High', 'Low', 'Close', 'Volume', 'CloseTime', 'QuoteAssetVolume', 'NumberOfTrades', 'TakerBuyBaseAssetVolume', 'TakerBuyQuoteAssetVolume', 'Ignore'])
-        df_4h = df_4h[['Open', 'High', 'Low', 'Close']].astype(float)
-        long_term_ema = df_4h['Close'].ewm(span=200, adjust=False).mean().iloc[-1]
-        long_term_rsi = df_4h['Close'].rolling(window=14).apply(lambda x: rsi(x), raw=True).iloc[-1]
-        long_term_trend = f"BULLISH (Price above 4H EMA 200: {long_term_ema:.2f})" if current_price > long_term_ema else f"BEARISH (Price below 4H EMA 200: {long_term_ema:.2f})"
-        recent_4h_high = df_4h['High'].iloc[-50:].max()
-        recent_4h_low = df_4h['Low'].iloc[-50:].min()
-    else:
-        long_term_trend = "4H Data Unavailable"; long_term_rsi = 50.0; recent_4h_high = current_price; recent_4h_low = current_price
-
-    bid_vol_spot = sum([float(b[1]) for b in spot_depth.get('bids', [])])
-    ask_vol_spot = sum([float(a[1]) for a in spot_depth.get('asks', [])])
-    spot_imbalance = (bid_vol_spot - ask_vol_spot) / (bid_vol_spot + ask_vol_spot) * 100 if (bid_vol_spot + ask_vol_spot) > 0 else 0
-    buy_vol_agg = sum([float(t['q']) for t in agg_trades if not t['m']])
-    sell_vol_agg = sum([float(t['q']) for t in agg_trades if t['m']])
-    agg_imbalance = (buy_vol_agg - sell_vol_agg) / (buy_vol_agg + sell_vol_agg) * 100 if (buy_vol_agg + sell_vol_agg) > 0 else 0
-
-    opt_info = data.get('options')
-    opt_summary = opt_info.get('oi_summary', 'No Open Interest Data.')
-    opt_sentiment = opt_info.get('options_sentiment', 'Neutral')
-    pcr_value = re.search(r'PCR:\s*([\d.]+)', opt_summary)
-    pcr_val = float(pcr_value.group(1)) if pcr_value else 0.0
-
-    # --- Construct the Detailed Prompt for Gemini ---
-    # The prompt structure is kept the same as it is very detailed and works well.
+    # --- *** UPDATED PROMPT FOR GEMINI AI *** ---
+    # This prompt now specifically asks the AI to focus on chart patterns and candlestick analysis from the image.
     text_prompt = (
-        "You are a sophisticated quantitative crypto analyst using a comprehensive multi-factor, multi-timeframe model. "
-        "Your task is to analyze the provided market data and generate a high-conviction trading signal "
-        "(BUY/SELL/HOLD) for the next 24-48 hours. Use ALL data points below, especially combining Macro (4H/OI) "
-        "with Short-Term (1H/Flow) to formulate your logic. "
-        f"Strictly adhere to the output format: 'ACTION:ACTION_TYPE - ENTRY:x - SL:y - TP:z - TP2:w - REASON:.. - CONF:n%'\n\n"
-        f"### {symbol} - Advanced Multi-Timeframe Analysis Request\n\n"
-        f"**1. Macro Trend (4H TF - Last 999 Candles):**\n"
-        f"- Long-Term Trend (EMA 200): {long_term_trend}\n"
-        f"- 4H RSI (14-period): {long_term_rsi:.2f} (Overbought > 70, Oversold < 30)\n"
-        f"- Recent 4H Key Resistance: {recent_4h_high:.2f} | Recent 4H Key Support: {recent_4h_low:.2f}\n\n"
-        f"**2. Price Action & Momentum (1H TF - Short Term):**\n"
-        f"- Current Price: {current_price:.2f}\n"
-        f"- Last 3 Candles (OHLCV): \n{last_3_candles.to_string()}\n"
-        f"- Recent Candlestick Pattern: {pattern_summary}\n"
-        f"- Current ATR (14-period): {current_atr:.4f} (Use this for SL/TP1 suggestions: SL ~1.5x ATR, TP1 ~3x ATR)\n\n"
-        f"**3. Spot Market Flow Analysis:**\n"
-        f"- Spot Depth Imbalance: {spot_imbalance:.2f}%\n"
-        f"- Aggressive Trades Imbalance: {agg_imbalance:.2f}%\n\n"
-        f"**4. Options Chain Deep Analysis (Macro Sentiment & Key Levels):**\n"
-        f"- Synthesized Sentiment: {opt_sentiment}\n"
-        f"- Put/Call Ratio (PCR): {pcr_val:.2f}.\n"
-        f"- OI Summary (Reference for Macro S/R/Expiry): {opt_summary}\n"
-        f"- **Crucial Interpretation Hint:** The strongest Call OI walls act as Major Resistance (potential TP2), and the strongest Put OI walls act as Major Support (potential SL).\n\n"
-        f"**5. Trading Instructions (Set TP1 and TP2):**\n"
-        f"- **TP1 (Short-Term):** Must be based on the current ATR and short-term 1H momentum (3x ATR default).\n"
-        f"- **TP2 (Long-Term/Macro):** Must be set based on **4H Key S/R levels** or the **strongest unbreached Options OI Wall**.\n"
-        f"- **Fake Breakout Check:** If the current price is near or breaking {recent_4h_high:.2f} or {recent_4h_low:.2f}, confirm the move with strong **Aggressive Flow** (> 20%) and **OI confirmation**. If confirmation is missing, signal HOLD/NONE or suggest a reversal.\n"
-        f"- **CRITICAL RULE (High Confirmation Requirement):** If your combined analysis leads to a confidence of less than {int(SIGNAL_CONF_THRESHOLD)}%, the **ACTION MUST be 'HOLD' or 'NONE'**, regardless of the market direction.\n"
-        f"- **If Confidence is ≥ {int(SIGNAL_CONF_THRESHOLD)}%**, provide a specific **BUY/SELL** signal with calculated ENTRY, SL, TP, and TP2."
+        f"You are an expert crypto trading analyst. Your task is to find a high-probability trade setup for {symbol} for the next 24-48 hours. "
+        "Your entire analysis MUST be based on the provided chart image combined with the raw text data and option chain data below.\n\n"
+        "**Primary Analysis Steps:**\n"
+        "1.  **Chart Pattern Analysis (from Image):** First, visually inspect the provided chart. Identify major chart patterns like **Head & Shoulders, Triangles, Channels, Flags, Wedges, and key Support/Resistance levels.**\n"
+        "2.  **Candlestick Pattern Analysis (from Image):** Look at the most recent candles on the chart. Identify patterns like **Doji, Engulfing, Hammer, or Morning/Evening Star.**\n"
+        "3.  **Data Confirmation (from Text):** Use the raw text data below to confirm your visual analysis with precise numbers (e.g., price levels, volume, RSI, Options OI).\n"
+        "4.  **Option Chain Sentiment:** Use the Option Chain data to understand the broader market sentiment. High Call OI walls act as resistance, and high Put OI walls act as support.\n\n"
+        "**Raw Market Data for Confirmation:**\n"
+        f"- **Current Price:** {current_price:.2f}\n"
+        f"- **1H ATR (for SL/TP):** {current_atr:.4f}\n"
+        f"- **Options Data:** {data.get('options', {}).get('oi_summary', 'N/A')}\n"
+        f"- **Last 10 1H Candles (Raw Data):\n**{last_10_candles_raw}\n\n"
+        "**Final Instruction:**\n"
+        f"Synthesize all the above points (visual chart patterns + text data + options sentiment) to form a trading decision. "
+        f"If confidence is less than {int(SIGNAL_CONF_THRESHOLD)}%, ACTION MUST be 'HOLD' or 'NONE'. "
+        f"Otherwise, provide a clear BUY or SELL signal. "
+        f"Strictly adhere to the output format: 'ACTION:ACTION_TYPE - ENTRY:x - SL:y - TP:z - TP2:w - REASON:.. - CONF:n%'"
     )
 
-    # --- Construct Prompt and Call Gemini API ---
     prompt_parts = []
-    if is_vision_symbol and chart_path:
+    if model_to_use == GEMINI_VISION_MODEL:
         try:
             img = Image.open(chart_path)
-            vision_prompt = "Analyze the following 1H Candlestick Chart (with 200 SMA) and combine its pattern recognition with the detailed market data below to generate the final signal. **Prioritize pattern confirmation from the chart.**\n\n--- DETAILED MARKET DATA ---\n" + text_prompt
-            prompt_parts = [vision_prompt, img]
+            prompt_parts = [text_prompt, img]
         except Exception as e:
-            print(f"Error reading chart image for {symbol}: {e}. Falling back to Text-Only mode.")
+            print(f"Error reading chart image for {symbol}: {e}. Falling back to text-only.")
             prompt_parts = [text_prompt]
-            model_to_use = GEMINI_TEXT_MODEL # Fallback
+            model_to_use = GEMINI_TEXT_MODEL
     else:
         prompt_parts = [text_prompt]
 
     try:
         model = genai.GenerativeModel(model_to_use)
-        generation_config = genai.types.GenerationConfig(
-            max_output_tokens=800,
-            temperature=0.3
-        )
+        generation_config = genai.types.GenerationConfig(max_output_tokens=800, temperature=0.3)
         loop = asyncio.get_running_loop()
-
-        # Run the synchronous Gemini call in an executor to avoid blocking the asyncio loop
         response = await loop.run_in_executor(
-            None,
-            lambda: model.generate_content(prompt_parts, generation_config=generation_config)
+            None, lambda: model.generate_content(prompt_parts, generation_config=generation_config)
         )
-        
-        # Check for blocked response
-        if not response.parts:
-             ai_output = f"ACTION:NONE - ENTRY:0 - SL:0 - TP:0 - TP2:0 - REASON:The response was blocked by Gemini's safety filters. Prompt Feedback: {response.prompt_feedback} - CONF:0%"
-        else:
-            ai_output = response.text
-
+        ai_output = response.text if response.parts else f"ACTION:NONE - REASON:Response blocked by safety filters. - CONF:0%"
         signal = parse_ai_signal(ai_output, symbol, current_atr)
-        signal['ai_raw_output'] = ai_output
-        signal['model'] = model_to_use
+        signal.update({'ai_raw_output': ai_output, 'model': model_to_use})
         return signal
-
     except Exception as e:
         print(f"Gemini analysis error for {symbol} (Model: {model_to_use}): {e}")
         traceback.print_exc()
-        return {"side":"none","confidence":0,"reason":f"AI_CALL_ERROR ({model_to_use}): {str(e)}", "model": model_to_use}
+        return {"side":"none", "confidence":0, "reason":f"AI_CALL_ERROR: {e}", "model": model_to_use}
 
-# ---------------- Fetch & Telegram (Unchanged) ----------------
-async def fetch_json(session,url):
+# ---------------- Fetch & Telegram ----------------
+async def fetch_json(session, url):
     try:
-        async with session.get(url,timeout=20) as r:
-            if r.status!=200: return None
-            return await r.json()
+        async with session.get(url, timeout=20) as r:
+            return await r.json() if r.status == 200 else None
     except Exception: return None
 
-async def send_text(session,text):
+async def send_text(session, text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: print(text); return
-    url=f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    try: await session.post(url,json={"chat_id":TELEGRAM_CHAT_ID,"text":text, "parse_mode": "Markdown"})
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    try: await session.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"})
     except Exception as e: print("send_text error:", e)
 
-async def send_photo(session,caption,path):
+async def send_photo(session, caption, path):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: print(caption); return
-    url=f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
     try:
-        with open(path,"rb") as f:
-            data=aiohttp.FormData(); data.add_field("chat_id",TELEGRAM_CHAT_ID); data.add_field("caption",caption); data.add_field("photo",f); data.add_field("parse_mode", "Markdown")
-            await session.post(url,data=data)
+        with open(path, "rb") as f:
+            data = aiohttp.FormData()
+            data.add_field("chat_id", TELEGRAM_CHAT_ID)
+            data.add_field("caption", caption)
+            data.add_field("photo", f)
+            data.add_field("parse_mode", "Markdown")
+            await session.post(url, data=data)
     except Exception as e: print("send_photo error:", e)
 
-
-# ---------------- Main loop (Updated for Gemini Logic) ----------------
+# ---------------- Main loop ----------------
 async def advanced_options_loop():
     if not client:
-        print("🔴 ERROR: Gemini API Key (GEMINI_API_KEY) not set. AI analysis will not work.")
+        print("🔴 ERROR: Gemini API Key not set. AI analysis will not work.")
         return
-
     init_redis_plain()
-
     async with aiohttp.ClientSession() as session:
-        startup=f"🤖 FULL Hybrid Bot Started (BTC/ETH: {GEMINI_VISION_MODEL}) • Scan Interval: 1 Hour ({POLL_INTERVAL//60}min)"
-        print(startup); await send_text(session,startup)
+        startup = f"🤖 FULL Hybrid Bot Started (BTC/ETH: {GEMINI_VISION_MODEL}) • Scan Interval: 30 minutes"
+        print(startup); await send_text(session, startup)
 
-        it=0
+        it = 0
         while True:
             it += 1; print(f"\nITER {it} @ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             start_time = time.time()
 
-            tasks = {}
+            all_data = {}
             for sym in SYMBOLS:
-                tasks[f"{sym}_24h"] = fetch_json(session, TICKER_24H_URL.format(symbol=sym))
-                tasks[f"{sym}_depth"] = fetch_json(session, DEPTH_URL.format(symbol=sym))
-                tasks[f"{sym}_aggTrades"] = fetch_json(session, AGGT_URL.format(symbol=sym))
-                tasks[f"{sym}_1h"] = fetch_json(session, CANDLE_URL.format(symbol=sym, tf="1h", limit=CANDLE_LIMITS["1h"]))
-                tasks[f"{sym}_4h"] = fetch_json(session, CANDLE_URL.format(symbol=sym, tf="4h", limit=CANDLE_LIMITS["4h"]))
-                tasks[f"{sym}_options"] = get_options_data_for_symbol(session, sym)
+                tasks = {
+                    "1h": fetch_json(session, CANDLE_URL.format(symbol=sym, tf="1h", limit=CANDLE_LIMITS["1h"])),
+                    "options": get_options_data_for_symbol(session, sym)
+                }
+                results = await asyncio.gather(*tasks.values())
+                all_data[sym] = dict(zip(tasks.keys(), results))
 
-            results = await asyncio.gather(*tasks.values())
-
-            fetched_data = {};
-            for key, res in zip(tasks.keys(), results):
-                sym, key_type = key.split('_', 1)
-                if sym not in fetched_data: fetched_data[sym] = {}
-                fetched_data[sym][key_type] = res
-
-            # --- Process each symbol ---
             for sym in SYMBOLS:
                 chart_path = None
                 try:
-                    data = fetched_data.get(sym, {})
-                    c1h = data.get("1h"); spot_depth = data.get("depth"); agg_data = data.get("aggTrades");
+                    data = all_data.get(sym, {})
+                    if not data.get("1h"):
+                        print(f"{sym}: Missing critical 1h candle data, skipping"); continue
 
-                    if not all([c1h, spot_depth, agg_data]):
-                        print(f"{sym}: Missing critical data, skipping"); continue
+                    # Generate chart for every analysis attempt
+                    chart_path = plot_signal_chart(sym, data["1h"], {"side":"Analyzing...", "confidence":0})
 
-                    if sym in VISION_SYMBOLS:
-                        chart_path = plot_signal_chart(sym, c1h, {"side":"N/A", "confidence":0, "model": GEMINI_VISION_MODEL})
-
-                    # Run Hybrid Gemini AI Analysis
                     final_signal = await analyze_with_gemini(sym, data, chart_path)
 
                     if final_signal["side"] in ["BUY", "SELL"] and final_signal["confidence"] >= SIGNAL_CONF_THRESHOLD:
                         store_signal(sym, final_signal)
-                        model_used = final_signal.get('model', GEMINI_VISION_MODEL)
-                        msg=f"**🔥 Advanced AI Signal ({final_signal['confidence']:.2f}%)**\n\n**Asset:** {sym} *(Model: {model_used})*\n**Action:** {final_signal['side']}\n**Entry:** `{fmt_price(final_signal['entry'])}`\n**SL:** `{fmt_price(final_signal['sl'])}`\n**TP1:** `{fmt_price(final_signal['tp'])}` | **TP2 (Macro):** `{fmt_price(final_signal['tp2'])}`\n\n**AI Logic:** {final_signal['reason']}"
-
-                        chart_path_final = plot_signal_chart(sym, c1h, final_signal)
-                        await send_photo(session,msg,chart_path_final)
-                        print(f"⚡ {sym}: {final_signal['side']} @ {final_signal['entry']:.2f} Conf {final_signal['confidence']:.2f}%")
-
-                        if chart_path != chart_path_final and chart_path and os.path.exists(chart_path):
-                             os.remove(chart_path)
-                        chart_path = chart_path_final
+                        model_used = final_signal.get('model', 'N/A')
+                        msg = (f"**🔥 AI Trade Alert ({final_signal['confidence']:.1f}%)**\n\n"
+                               f"**Asset:** {sym} *(Model: {model_used})*\n"
+                               f"**Action:** {final_signal['side']}\n"
+                               f"**Entry:** `{fmt_price(final_signal['entry'])}`\n"
+                               f"**SL:** `{fmt_price(final_signal['sl'])}` | **TP1:** `{fmt_price(final_signal['tp'])}` | **TP2:** `{fmt_price(final_signal['tp2'])}`\n\n"
+                               f"**AI Logic:** _{final_signal['reason']}_")
+                        
+                        # Re-plot the chart with the final signal details for the alert
+                        final_chart_path = plot_signal_chart(sym, data["1h"], final_signal)
+                        await send_photo(session, msg, final_chart_path)
+                        print(f"⚡ Alert Sent for {sym}: {final_signal['side']} @ {final_signal['entry']:.2f} Conf {final_signal['confidence']:.1f}%")
+                        if os.path.exists(final_chart_path): os.remove(final_chart_path)
                     else:
-                        print(f"{sym}: AI suggested HOLD/NONE or Confidence too low ({final_signal['confidence']:.2f}%). Model: {final_signal.get('model', 'N/A')}. Reason: {final_signal['reason'][:50]}...")
+                        print(f"{sym}: No high-confidence trade setup found. (AI says: {final_signal['side']}, Conf: {final_signal['confidence']:.1f}%)")
 
                 except Exception as e:
-                    print(f"Error processing {sym}: {e}")
-                    traceback.print_exc()
+                    print(f"Error processing {sym}: {e}"); traceback.print_exc()
                 finally:
-                    if chart_path and os.path.exists(chart_path):
-                        os.remove(chart_path)
-                    
-                    # === RATE LIMITING FOR GEMINI FREE TIER ===
-                    # Wait for 1 second before processing the next symbol to respect the 60 RPM limit.
-                    print(f"Waiting 1 second to respect API rate limit...")
-                    await asyncio.sleep(1)
-
+                    if chart_path and os.path.exists(chart_path): os.remove(chart_path)
+                    await asyncio.sleep(1) # Rate limit between symbols
 
             print(f"Processing time: {time.time() - start_time:.2f}s")
             time_to_wait = POLL_INTERVAL - (time.time() - start_time)
             if time_to_wait > 0:
-                print(f"Sleeping for {time_to_wait:.0f} seconds (Total interval: 1 hour).")
+                print(f"Sleeping for {time_to_wait:.0f} seconds...")
                 await asyncio.sleep(time_to_wait)
-            else:
-                print("Warning: Processing took longer than 1 hour. Starting next scan immediately.")
 
-if __name__=="__main__":
+if __name__ == "__main__":
     try:
-        print("Starting bot with Gemini AI...")
         asyncio.run(advanced_options_loop())
-    except KeyboardInterrupt: print("Stopped by user")
+    except KeyboardInterrupt: print("\nStopped by user.")

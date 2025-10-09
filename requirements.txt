@@ -1,10 +1,10 @@
 # Core Libraries for Data Processing and AI
 pandas==2.2.2
 numpy==1.26.4
-google-generativeai==0.5.4 # <-- IMPORTANT CHANGE HERE
+google-generativeai>=1.3.0 # <-- FAKT HA BADAL KARA
 python-dotenv==1.0.1
 redis==5.0.4
-Pillow==10.3.0 # <-- ADD THIS for image processing with Gemini
+Pillow==10.3.0
 
 # Libraries for Asynchronous Network Calls
 aiohttp==3.9.5

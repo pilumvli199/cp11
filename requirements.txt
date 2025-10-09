@@ -1,7 +1,7 @@
 # Core Libraries for Data Processing and AI
 pandas==2.2.2
 numpy==1.26.4
-google-generativeai>=1.3.0 # <-- FAKT HA BADAL KARA
+google-generativeai==0.8.5 # <-- FAKT HA BADAL KELA AHE
 python-dotenv==1.0.1
 redis==5.0.4
 Pillow==10.3.0

@@ -23,14 +23,10 @@ ALL_COINS = OPTIONS_COINS + ALTCOINS
 SCAN_INTERVAL = 300  # 5 minutes = 300 seconds
 GEMINI_MODEL = "gemini-1.5-flash-latest"
 
-# ==================== GEMINI INITIALIZATION ====================
-try:
-    genai.configure(api_key=GEMINI_API_KEY)
-    gemini_model = genai.GenerativeModel(GEMINI_MODEL)
-    print("✅ Gemini AI Client Initialized Successfully.")
-except Exception as e:
-    print(f"🔴 FATAL ERROR: Gemini initialization failed: {e}")
-    gemini_model = None
+# ==================== GEMINI DISABLED ====================
+# Gemini analysis disabled - only data alerts
+gemini_model = None
+print("ℹ️ Gemini analysis disabled - Data-only mode")
 
 # ==================== DERIBIT DATA FETCH ====================
 async def fetch_deribit_candles(session, symbol, timeframe="60", count=720):

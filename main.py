@@ -15,8 +15,11 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY")
 
-CRYPTO_PAIRS = ["BTC", "ETH", "SOL"]  # Deribit supports these
-TIMEFRAME = "60"  # 60 minutes = 1 hour
+# Top 10 Altcoins for futures data + BTC/ETH for options
+ALTCOINS = ["SOL", "DOGE", "MATIC", "AVAX", "LINK", "UNI", "SHIB", "XRP", "LTC", "BCH"]
+OPTIONS_COINS = ["BTC", "ETH"]  # Only these have options on Deribit
+ALL_COINS = OPTIONS_COINS + ALTCOINS
+
 SCAN_INTERVAL = 300  # 5 minutes = 300 seconds
 GEMINI_MODEL = "gemini-1.5-flash-latest"
 
@@ -31,10 +34,7 @@ except Exception as e:
 
 # ==================== DERIBIT DATA FETCH ====================
 async def fetch_deribit_candles(session, symbol, timeframe="60", count=720):
-    """
-    Fetch last 1 month (30 days) candle data from Deribit
-    timeframe: 60 = 1 hour, count: 720 = 30 days * 24 hours
-    """
+    """Fetch last 1 month candle data from Deribit"""
     url = "https://www.deribit.com/api/v2/public/get_tradingview_chart_data"
     
     end_timestamp = int(time.time() * 1000)
@@ -63,17 +63,98 @@ async def fetch_deribit_candles(session, symbol, timeframe="60", count=720):
                     'volume': result['volume']
                 })
                 df.set_index('timestamp', inplace=True)
-                print(f"✅ Fetched {len(df)} candles for {symbol} from Deribit")
+                print(f"✅ Fetched {len(df)} candles for {symbol}")
                 return df
             else:
-                print(f"❌ Deribit API returned error for {symbol}")
+                print(f"❌ Deribit API error for {symbol}")
                 return None
     except Exception as e:
         print(f"❌ Error fetching {symbol} candles: {e}")
         return None
 
+async def fetch_order_book(session, symbol):
+    """Fetch order book data"""
+    url = "https://www.deribit.com/api/v2/public/get_order_book"
+    params = {
+        "instrument_name": f"{symbol}-PERPETUAL",
+        "depth": 10
+    }
+    
+    try:
+        async with session.get(url, params=params) as response:
+            response.raise_for_status()
+            data = await response.json()
+            
+            if data.get("result"):
+                result = data["result"]
+                return {
+                    'bids': result.get('bids', [])[:5],  # Top 5 bids
+                    'asks': result.get('asks', [])[:5],  # Top 5 asks
+                    'best_bid': result.get('best_bid_price', 0),
+                    'best_ask': result.get('best_ask_price', 0),
+                    'spread': result.get('best_ask_price', 0) - result.get('best_bid_price', 0)
+                }
+            return None
+    except Exception as e:
+        print(f"❌ Error fetching order book for {symbol}: {e}")
+        return None
+
+async def fetch_funding_rate(session, symbol):
+    """Fetch funding rate"""
+    url = "https://www.deribit.com/api/v2/public/get_funding_rate_value"
+    params = {
+        "instrument_name": f"{symbol}-PERPETUAL",
+        "start_timestamp": int((datetime.now() - timedelta(hours=8)).timestamp() * 1000),
+        "end_timestamp": int(time.time() * 1000)
+    }
+    
+    try:
+        async with session.get(url, params=params) as response:
+            response.raise_for_status()
+            data = await response.json()
+            
+            if data.get("result"):
+                # Get latest funding rate
+                rates = data["result"]
+                if rates:
+                    latest = rates[-1]
+                    return latest
+            return None
+    except Exception as e:
+        print(f"❌ Error fetching funding rate: {e}")
+        return None
+
+async def fetch_ticker_data(session, symbol):
+    """Fetch ticker data (volume, OI, price)"""
+    url = "https://www.deribit.com/api/v2/public/ticker"
+    params = {"instrument_name": f"{symbol}-PERPETUAL"}
+    
+    try:
+        async with session.get(url, params=params) as response:
+            response.raise_for_status()
+            data = await response.json()
+            
+            if data.get("result"):
+                result = data["result"]
+                return {
+                    'last_price': result.get('last_price', 0),
+                    'volume_24h': result.get('stats', {}).get('volume', 0),
+                    'volume_usd': result.get('stats', {}).get('volume_usd', 0),
+                    'open_interest': result.get('open_interest', 0),
+                    'funding_8h': result.get('funding_8h', 0),
+                    'mark_price': result.get('mark_price', 0),
+                    'index_price': result.get('index_price', 0),
+                    '24h_high': result.get('stats', {}).get('high', 0),
+                    '24h_low': result.get('stats', {}).get('low', 0),
+                    'price_change_24h': result.get('stats', {}).get('price_change', 0)
+                }
+            return None
+    except Exception as e:
+        print(f"❌ Error fetching ticker: {e}")
+        return None
+
 async def fetch_deribit_options_chain(session, symbol):
-    """Fetch complete options chain data from Deribit"""
+    """Fetch options chain (only for BTC/ETH)"""
     url = "https://www.deribit.com/api/v2/public/get_book_summary_by_currency"
     params = {
         "currency": symbol,
@@ -87,8 +168,6 @@ async def fetch_deribit_options_chain(session, symbol):
             
             if data.get("result"):
                 options = data["result"]
-                
-                # Parse option chain data
                 chain_data = []
                 for opt in options:
                     chain_data.append({
@@ -100,67 +179,60 @@ async def fetch_deribit_options_chain(session, symbol):
                         'ask_price': opt.get('ask_price', 0),
                         'mark_price': opt.get('mark_price', 0),
                         'volume': opt.get('volume', 0),
-                        'open_interest': opt.get('open_interest', 0),
-                        'mid_price': opt.get('mid_price', 0)
+                        'open_interest': opt.get('open_interest', 0)
                     })
                 
                 df = pd.DataFrame(chain_data)
                 print(f"✅ Fetched {len(df)} options for {symbol}")
                 return df
-            else:
-                print(f"❌ No options data for {symbol}")
-                return None
+            return None
     except Exception as e:
-        print(f"❌ Error fetching {symbol} options chain: {e}")
+        print(f"❌ Error fetching options: {e}")
         return None
 
-async def fetch_current_price(session, symbol):
-    """Fetch current spot price from Deribit"""
-    url = "https://www.deribit.com/api/v2/public/ticker"
-    params = {"instrument_name": f"{symbol}-PERPETUAL"}
-    
-    try:
-        async with session.get(url, params=params) as response:
-            response.raise_for_status()
-            data = await response.json()
-            if data.get("result"):
-                return data["result"].get("last_price", 0)
-    except Exception as e:
-        print(f"❌ Error fetching current price: {e}")
-    return 0
-
 # ==================== CHART GENERATION ====================
-def create_chart(df, symbol):
-    """Create TradingView style chart"""
+def create_chart(df, symbol, chart_type="perpetual"):
+    """Create clean white background chart"""
     chart_file = f"chart_{symbol}_{int(time.time())}.png"
     
+    # White background professional style
     mc = mpf.make_marketcolors(
-        up='#26a69a', down='#ef5350', 
+        up='#26a69a', 
+        down='#ef5350', 
         edge='inherit', 
         wick={'up':'#26a69a', 'down':'#ef5350'}, 
-        volume='in'
+        volume='in',
+        alpha=0.9
     )
+    
     s = mpf.make_mpf_style(
         marketcolors=mc, 
-        gridstyle='--', 
-        gridcolor='#2a2e39', 
-        facecolor='#1e222d', 
-        edgecolor='#2a2e39', 
-        figcolor='#1e222d', 
+        gridstyle='-', 
+        gridcolor='#e0e0e0',
+        gridaxis='both',
+        facecolor='white',
+        figcolor='white',
+        edgecolor='#cccccc',
+        rc={'font.size': 10},
         y_on_right=True
     )
+    
+    title = f"{symbol}-PERPETUAL | Last 30 Days (1H)"
+    if chart_type == "options":
+        title = f"{symbol} Options Analysis | Last 30 Days (1H)"
     
     try:
         mpf.plot(
             df, 
             type='candle', 
             style=s, 
-            title=f"{symbol}-PERPETUAL - Last 30 Days (1H)", 
+            title=title,
             ylabel='Price (USD)', 
             volume=True, 
             savefig=chart_file, 
             figsize=(16, 10),
-            warn_too_much_data=len(df)+1
+            warn_too_much_data=len(df)+1,
+            tight_layout=True
         )
         print(f"✅ Chart created: {chart_file}")
         return chart_file
@@ -168,80 +240,119 @@ def create_chart(df, symbol):
         print(f"❌ Chart error: {e}")
         return None
 
-# ==================== OPTIONS CHAIN FORMATTING ====================
+# ==================== DATA FORMATTING ====================
+def format_altcoin_data(symbol, ticker, order_book, funding):
+    """Format altcoin perpetual futures data"""
+    msg = f"📊 **{symbol}-PERPETUAL Market Data**\n\n"
+    
+    # Price Info
+    if ticker:
+        msg += f"💰 **Price Information:**\n"
+        msg += f"   Last Price: ${ticker['last_price']:,.2f}\n"
+        msg += f"   Mark Price: ${ticker['mark_price']:,.2f}\n"
+        msg += f"   Index Price: ${ticker['index_price']:,.2f}\n"
+        msg += f"   24h High: ${ticker['24h_high']:,.2f}\n"
+        msg += f"   24h Low: ${ticker['24h_low']:,.2f}\n"
+        msg += f"   24h Change: {ticker['price_change_24h']:.2f}%\n\n"
+    
+    # Volume & OI
+    if ticker:
+        msg += f"📈 **Volume & Open Interest:**\n"
+        msg += f"   24h Volume: {ticker['volume_24h']:,.2f} {symbol}\n"
+        msg += f"   24h Volume USD: ${ticker['volume_usd']:,.0f}\n"
+        msg += f"   Open Interest: {ticker['open_interest']:,.2f} {symbol}\n\n"
+    
+    # Funding Rate
+    if ticker and ticker.get('funding_8h'):
+        funding_rate = ticker['funding_8h'] * 100
+        funding_annual = funding_rate * 365 * 3  # 8h intervals
+        msg += f"💸 **Funding Rate:**\n"
+        msg += f"   Current (8h): {funding_rate:.4f}%\n"
+        msg += f"   Annualized: {funding_annual:.2f}%\n\n"
+    
+    # Order Book
+    if order_book:
+        msg += f"📖 **Order Book (Top 5):**\n"
+        msg += f"   Best Bid: ${order_book['best_bid']:,.2f}\n"
+        msg += f"   Best Ask: ${order_book['best_ask']:,.2f}\n"
+        msg += f"   Spread: ${order_book['spread']:.2f}\n\n"
+        
+        msg += f"   **Bids:**\n"
+        for bid in order_book['bids'][:3]:
+            msg += f"   ${bid[0]:,.2f} × {bid[1]:.2f}\n"
+        
+        msg += f"\n   **Asks:**\n"
+        for ask in order_book['asks'][:3]:
+            msg += f"   ${ask[0]:,.2f} × {ask[1]:.2f}\n"
+    
+    return msg
+
 def format_options_data(options_df, current_price, symbol):
-    """Format options chain data for Telegram message"""
+    """Format options chain data for BTC/ETH"""
     if options_df is None or options_df.empty:
         return "❌ No options data available"
     
-    # Filter options near current price (±20%)
     options_df['strike_num'] = pd.to_numeric(options_df['strike'], errors='coerce')
     filtered = options_df[
         (options_df['strike_num'] >= current_price * 0.8) & 
         (options_df['strike_num'] <= current_price * 1.2)
     ].copy()
     
-    # Sort by volume and get top 10
     top_volume = filtered.nlargest(10, 'volume')
     
-    message = f"📊 **{symbol} Options Chain Summary**\n\n"
-    message += f"💰 Current Price: ${current_price:,.2f}\n"
-    message += f"📈 Total Options: {len(options_df)}\n\n"
-    message += f"**🔥 Top 10 by Volume (±20% from spot):**\n\n"
+    msg = f"📊 **{symbol} Options Chain Summary**\n\n"
+    msg += f"💰 Current Price: ${current_price:,.2f}\n"
+    msg += f"📈 Total Options: {len(options_df)}\n\n"
+    msg += f"**🔥 Top 10 by Volume (±20%):**\n\n"
     
     for idx, row in top_volume.iterrows():
         emoji = '📗' if row['type'] == 'CALL' else '📕'
-        message += f"{emoji} **{row['instrument']}**\n"
-        message += f"   Strike: ${row['strike']} | {row['type']}\n"
-        message += f"   Bid/Ask: ${row['bid_price']:.4f}/${row['ask_price']:.4f}\n"
-        message += f"   Vol: {row['volume']:.2f} | OI: {row['open_interest']:.2f}\n\n"
+        msg += f"{emoji} **{row['instrument']}**\n"
+        msg += f"   Strike: ${row['strike']} | {row['type']}\n"
+        msg += f"   Bid/Ask: ${row['bid_price']:.4f}/${row['ask_price']:.4f}\n"
+        msg += f"   Vol: {row['volume']:.2f} | OI: {row['open_interest']:.2f}\n\n"
     
-    # Summary statistics
-    total_call_volume = filtered[filtered['type'] == 'CALL']['volume'].sum()
-    total_put_volume = filtered[filtered['type'] == 'PUT']['volume'].sum()
+    # Statistics
+    total_call_vol = filtered[filtered['type'] == 'CALL']['volume'].sum()
+    total_put_vol = filtered[filtered['type'] == 'PUT']['volume'].sum()
     total_call_oi = filtered[filtered['type'] == 'CALL']['open_interest'].sum()
     total_put_oi = filtered[filtered['type'] == 'PUT']['open_interest'].sum()
     
-    pcr = (total_put_volume/total_call_volume if total_call_volume > 0 else 0)
+    pcr = (total_put_vol/total_call_vol if total_call_vol > 0 else 0)
     
-    message += f"\n📊 **Statistics (±20%):**\n"
-    message += f"📗 CALL Vol: {total_call_volume:,.2f} | OI: {total_call_oi:,.2f}\n"
-    message += f"📕 PUT Vol: {total_put_volume:,.2f} | OI: {total_put_oi:,.2f}\n"
-    message += f"📊 Put/Call Ratio: {pcr:.2f}"
+    msg += f"\n📊 **Statistics:**\n"
+    msg += f"📗 CALL Vol: {total_call_vol:,.2f} | OI: {total_call_oi:,.2f}\n"
+    msg += f"📕 PUT Vol: {total_put_vol:,.2f} | OI: {total_put_oi:,.2f}\n"
+    msg += f"📊 Put/Call Ratio: {pcr:.2f}"
     
-    return message
+    return msg
 
 # ==================== GEMINI ANALYSIS ====================
-def analyze_chart_with_gemini(chart_file, ohlc_data, symbol, options_summary):
-    """Analyze chart with Gemini AI including options data context"""
+def analyze_chart_with_gemini(chart_file, ohlc_data, symbol, market_data):
+    """Analyze chart with Gemini AI"""
     if not gemini_model:
-        return "Gemini model is not initialized."
+        return "Gemini model not initialized."
         
     prompt = f"""
-You are an expert crypto options trader analyzing {symbol} on Deribit.
+Analyze {symbol} chart and market data.
 
-**Last 10 candles OHLC (1H):**
+**Last 10 Candles (1H):**
 {ohlc_data.tail(10).to_string()}
 
-**Options Context:**
-{options_summary[:500]}
+**Market Data:**
+{market_data[:800]}
 
-**Analyze:**
+**Provide:**
 1. Key Support & Resistance
-2. Trend (bullish/bearish/sideways)
-3. Candlestick patterns
-4. Chart patterns
-5. Volume analysis
-6. Options sentiment (Put/Call ratio)
-7. Trade setup potential
+2. Trend Analysis
+3. Patterns detected
+4. Volume analysis
+5. Trade setup (if found)
 
-**Format:**
-- If HIGH-PROBABILITY setup exists: "TRADE SETUP FOUND"
-  Then: Entry, Stop Loss, Target, Risk/Reward, Reasoning
-- If no setup: "NO TRADE SETUP"
-  Then: Brief market analysis
+If HIGH-PROBABILITY setup: "TRADE SETUP FOUND" with Entry, SL, Target
+If no setup: "NO TRADE SETUP" with brief analysis
 
-Keep it concise and actionable.
+Keep concise.
 """
     
     try:
@@ -253,12 +364,12 @@ Keep it concise and actionable.
         return f"Analysis failed: {str(e)}"
 
 # ==================== TELEGRAM ALERT ====================
-async def send_telegram_alert(bot, symbol, chart_file, options_message, analysis):
-    """Send alert to Telegram with chart and options data"""
+async def send_telegram_alert(bot, symbol, chart_file, market_data, analysis):
+    """Send complete alert to Telegram"""
     try:
         # Send chart with analysis
         with open(chart_file, 'rb') as photo:
-            caption = f"📊 **{symbol}-PERPETUAL Analysis**\n\n{analysis[:900]}"
+            caption = f"📊 **{symbol} Analysis**\n\n{analysis[:900]}"
             if len(analysis) > 900:
                 caption += "..."
             
@@ -269,9 +380,9 @@ async def send_telegram_alert(bot, symbol, chart_file, options_message, analysis
                 parse_mode='Markdown'
             )
         
-        # Send options chain data (split if too long)
-        if len(options_message) > 4000:
-            chunks = [options_message[i:i+4000] for i in range(0, len(options_message), 4000)]
+        # Send market data
+        if len(market_data) > 4000:
+            chunks = [market_data[i:i+4000] for i in range(0, len(market_data), 4000)]
             for chunk in chunks:
                 await bot.send_message(
                     chat_id=TELEGRAM_CHAT_ID,
@@ -281,7 +392,7 @@ async def send_telegram_alert(bot, symbol, chart_file, options_message, analysis
         else:
             await bot.send_message(
                 chat_id=TELEGRAM_CHAT_ID,
-                text=options_message,
+                text=market_data,
                 parse_mode='Markdown'
             )
         
@@ -291,124 +402,145 @@ async def send_telegram_alert(bot, symbol, chart_file, options_message, analysis
 
 # ==================== MAIN SCANNER ====================
 async def scan_cryptos(bot: Bot):
-    """Main scanner loop - runs every 5 minutes"""
+    """Main scanner - scans all coins every 5 minutes"""
     try:
         await bot.send_message(
             chat_id=TELEGRAM_CHAT_ID, 
-            text=f"🚀 **Deribit Options Bot Started!**\n\n📊 Monitoring: {', '.join(CRYPTO_PAIRS)}\n⏰ Scan Interval: {SCAN_INTERVAL//60} minutes\n\n_Scanner is now running..._",
+            text=f"🚀 **Deribit Market Scanner Started!**\n\n📊 Altcoins (Perpetuals): {', '.join(ALTCOINS)}\n🎯 Options: {', '.join(OPTIONS_COINS)}\n⏰ Scan: Every {SCAN_INTERVAL//60} mins",
             parse_mode='Markdown'
         )
     except Exception as e:
         print(f"❌ Startup message error: {e}")
     
-    print(f"📊 Monitoring: {', '.join(CRYPTO_PAIRS)}")
+    print(f"📊 Monitoring {len(ALL_COINS)} coins")
     print(f"⏰ Scan Interval: Every {SCAN_INTERVAL//60} minutes\n")
     
     async with aiohttp.ClientSession() as session:
         while True:
-            for symbol in CRYPTO_PAIRS:
+            # Scan Altcoins (Perpetuals)
+            for symbol in ALTCOINS:
                 print(f"\n{'='*60}")
-                print(f"🔍 Scanning {symbol} at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                print(f"🔍 Scanning {symbol} at {datetime.now().strftime('%H:%M:%S')}")
                 
-                # Fetch candle data (last 30 days)
-                df = await fetch_deribit_candles(session, symbol, timeframe="60", count=720)
+                # Fetch all data
+                df = await fetch_deribit_candles(session, symbol)
+                ticker = await fetch_ticker_data(session, symbol)
+                order_book = await fetch_order_book(session, symbol)
+                funding = await fetch_funding_rate(session, symbol)
+                
                 if df is None or df.empty:
-                    print(f"⚠️ Skipping {symbol} - no candle data")
+                    print(f"⚠️ Skipping {symbol}")
                     continue
-                
-                # Fetch options chain
-                options_df = await fetch_deribit_options_chain(session, symbol)
-                
-                # Fetch current price
-                current_price = await fetch_current_price(session, symbol)
-                print(f"💰 Current Price: ${current_price:,.2f}")
                 
                 # Create chart
-                chart_file = create_chart(df, symbol)
-                if chart_file is None:
-                    print(f"⚠️ Skipping {symbol} - chart error")
+                chart_file = create_chart(df, symbol, "perpetual")
+                if not chart_file:
                     continue
                 
-                # Format options data
-                options_message = format_options_data(options_df, current_price, symbol)
+                # Format data
+                market_data = format_altcoin_data(symbol, ticker, order_book, funding)
                 
-                # Analyze with Gemini
-                print("🤖 Analyzing with Gemini AI...")
-                analysis = analyze_chart_with_gemini(chart_file, df, symbol, options_message[:500])
-                print(f"📋 Analysis Preview:\n{analysis[:300]}...")
+                # AI Analysis
+                print("🤖 Analyzing...")
+                analysis = analyze_chart_with_gemini(chart_file, df, symbol, market_data[:500])
                 
                 # Send alert
-                if "TRADE SETUP FOUND" in analysis.upper():
-                    print(f"🎯 Trade setup detected for {symbol}!")
-                else:
-                    print(f"📊 Market analysis for {symbol}")
-                
-                await send_telegram_alert(bot, symbol, chart_file, options_message, analysis)
+                await send_telegram_alert(bot, symbol, chart_file, market_data, analysis)
                 
                 # Cleanup
                 try:
                     os.remove(chart_file)
-                except OSError as e:
-                    print(f"⚠️ Error removing chart: {e}")
+                except:
+                    pass
                 
-                # Wait before next coin
-                await asyncio.sleep(10)
+                await asyncio.sleep(5)
             
-            print(f"\n⏳ Waiting {SCAN_INTERVAL//60} minutes before next scan cycle...\n")
+            # Scan BTC/ETH (Options + Perpetuals)
+            for symbol in OPTIONS_COINS:
+                print(f"\n{'='*60}")
+                print(f"🎯 Scanning {symbol} OPTIONS at {datetime.now().strftime('%H:%M:%S')}")
+                
+                # Fetch data
+                df = await fetch_deribit_candles(session, symbol)
+                ticker = await fetch_ticker_data(session, symbol)
+                order_book = await fetch_order_book(session, symbol)
+                options_df = await fetch_deribit_options_chain(session, symbol)
+                
+                if df is None or df.empty:
+                    continue
+                
+                # Create chart
+                chart_file = create_chart(df, symbol, "options")
+                if not chart_file:
+                    continue
+                
+                # Format data
+                current_price = ticker['last_price'] if ticker else 0
+                perpetual_data = format_altcoin_data(symbol, ticker, order_book, None)
+                options_data = format_options_data(options_df, current_price, symbol)
+                
+                combined_data = perpetual_data + "\n\n" + options_data
+                
+                # AI Analysis
+                print("🤖 Analyzing...")
+                analysis = analyze_chart_with_gemini(chart_file, df, symbol, combined_data[:800])
+                
+                # Send alert
+                await send_telegram_alert(bot, symbol, chart_file, combined_data, analysis)
+                
+                # Cleanup
+                try:
+                    os.remove(chart_file)
+                except:
+                    pass
+                
+                await asyncio.sleep(5)
+            
+            print(f"\n⏳ Waiting {SCAN_INTERVAL//60} minutes...\n")
             await asyncio.sleep(SCAN_INTERVAL)
 
 # ==================== TELEGRAM COMMANDS ====================
 async def start(update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🤖 **Deribit Options Chain Bot**\n\n"
-        f"📊 Coins: BTC, ETH, SOL\n"
-        f"⏰ Scans every 5 minutes\n"
-        f"📈 30-day charts + options data\n\n"
-        f"**Commands:**\n"
-        f"/start - Bot info\n"
-        f"/status - Check status",
+        "🤖 **Deribit Market Scanner**\n\n"
+        f"📊 Altcoins: {len(ALTCOINS)} (Perpetuals)\n"
+        f"🎯 Options: BTC, ETH\n"
+        f"⏰ Scans: Every 5 mins\n\n"
+        f"Commands:\n/start /status",
         parse_mode='Markdown'
     )
 
 async def status(update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        f"✅ **Bot Status: Running**\n\n"
-        f"📊 Monitoring: {', '.join(CRYPTO_PAIRS)}\n"
-        f"⏰ Scanner is active",
+        f"✅ Bot Running\n📊 Monitoring: {len(ALL_COINS)} coins",
         parse_mode='Markdown'
     )
 
 # ==================== POST INIT ====================
 async def post_init(application: Application):
-    """Called after bot initialization to start scanner"""
-    print("🚀 Starting scanner task...")
+    """Start scanner after bot init"""
+    print("🚀 Starting scanner...")
     asyncio.create_task(scan_cryptos(application.bot))
 
 # ==================== RUN BOT ====================
 def main():
-    """Start bot and scanner"""
+    """Start bot"""
     try:
-        # Check if event loop is already running
         loop = asyncio.get_event_loop()
     except RuntimeError:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
     
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    
-    # Add command handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("status", status))
-    
-    # Set post_init callback to start scanner
     application.post_init = post_init
     
-    # Start polling
-    print("🤖 Starting Telegram bot...")
+    print("🤖 Starting bot...")
     application.run_polling()
 
 if __name__ == "__main__":
     if gemini_model:
         main()
     else:
-        print("🔴 Bot cannot start - Gemini initialization failed.")
+        print("🔴 Gemini initialization failed.")

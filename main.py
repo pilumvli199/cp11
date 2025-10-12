@@ -14,8 +14,10 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
 
 # Only working coins on Deribit
-ALTCOINS = ["SOL"]  # Only SOL perpetual works
-OPTIONS_COINS = ["BTC", "ETH"]  # These have options
+# Perpetuals available: BTC, ETH, SOL, USDC (only these 4!)
+# Options available: BTC, ETH only
+ALTCOINS = ["SOL", "USDC"]  # Altcoins with perpetuals
+OPTIONS_COINS = ["BTC", "ETH"]  # These have options + perpetuals
 ALL_COINS = OPTIONS_COINS + ALTCOINS
 
 SCAN_INTERVAL = 300  # 5 minutes

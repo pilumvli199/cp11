@@ -1,657 +1,1045 @@
 import os
-import time
+import asyncio
+import logging
+from datetime import datetime, timedelta
+import redis
 import json
-from io import BytesIO
-from datetime import datetime
+from telegram import Update, InputFile
+from telegram.ext import Application, CommandHandler, ContextTypes
 import requests
+from openai import OpenAI
 import pandas as pd
+import numpy as np
+from typing import Dict, List, Tuple
 import mplfinance as mpf
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 from matplotlib.lines import Line2D
-from apscheduler.schedulers.background import BackgroundScheduler
-from openai import OpenAI
-from flask import Flask, render_template_string, jsonify
-import telebot
+import io
+from PIL import Image
 
-# Initialize
-app = Flask(__name__)
-client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+# Logging setup - ENHANCED
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-# Telegram Bot
+# Environment variables
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
-bot = telebot.TeleBot(TELEGRAM_TOKEN) if TELEGRAM_TOKEN else None
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379')
+CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 
-# Coins to track
-COINS = [
-    'BTC', 'ETH', 'USDT', 'BNB', 'XRP', 
-    'SOL', 'USDC', 'TRX', 'DOGE', 'ADA',
-    'LINK', 'BCH', 'XLM', 'SUI', 'AVAX'
-]
+# Initialize clients
+client = OpenAI(api_key=OPENAI_API_KEY)
+redis_client = redis.from_url(REDIS_URL, decode_responses=True)
 
-TIMEFRAMES = ['1h', '4h', '1d']
+# Constants
+DERIBIT_BASE = "https://www.deribit.com/api/v2/public"
+SYMBOLS = ['BTC-PERPETUAL', 'ETH-PERPETUAL']
+TIMEFRAMES = ['30', '60', '240']
+MAX_TRADES_PER_DAY = 8
+CANDLE_COUNT = 500
 
-# Store latest signals
-latest_signals = {}
-
-def send_startup_message():
-    """Send bot startup notification to Telegram"""
-    if not bot or not TELEGRAM_CHAT_ID:
-        print("⚠️  Telegram not configured - skipping startup message")
-        return
+class DeribitClient:
+    """Fetch data from Deribit public API"""
     
-    try:
-        startup_msg = f"""
-🤖 **BOT STARTED SUCCESSFULLY!**
-
-✅ Pure Price Action Trading Bot is now LIVE!
-
-🧠 **Powered by:** GPT-4o Mini (Vision + Analysis)
-
-📊 **Monitoring:**
-• 14 Cryptocurrencies
-• 3 Timeframes (1h, 4h, 1d)
-• Total: 42 scans per cycle
-
-⏰ **Scan Frequency:** Every 1 hour
-🎯 **Signal Types:** LONG / SHORT / NO TRADE
-
-🔔 You will receive alerts only for:
-🟢 LONG signals
-🔴 SHORT signals
-
-⚡ First scan starting now...
-
-Bot Time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-        """
-        
-        bot.send_message(
-            chat_id=TELEGRAM_CHAT_ID,
-            text=startup_msg,
-            parse_mode='Markdown'
-        )
-        print("✅ Startup message sent to Telegram!")
-        
-    except Exception as e:
-        print(f"❌ Failed to send startup message: {e}")
-
-def fetch_candlestick_data(symbol, timeframe='1h', limit=2800):
-    """Fetch candlestick data from Binance API"""
-    try:
-        tf_map = {'1h': '1h', '4h': '4h', '1d': '1d'}
-        interval = tf_map.get(timeframe, '1h')
-        
-        url = f'https://api.binance.com/api/v3/klines'
-        params = {
-            'symbol': f'{symbol}USDT',
-            'interval': interval,
-            'limit': limit
-        }
-        
-        response = requests.get(url, params=params, timeout=10)
-        data = response.json()
-        
-        df = pd.DataFrame(data, columns=[
-            'timestamp', 'open', 'high', 'low', 'close', 'volume',
-            'close_time', 'quote_volume', 'trades', 'taker_buy_base',
-            'taker_buy_quote', 'ignore'
-        ])
-        
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        for col in ['open', 'high', 'low', 'close', 'volume']:
-            df[col] = df[col].astype(float)
-        
-        df.set_index('timestamp', inplace=True)
-        df = df[['open', 'high', 'low', 'close', 'volume']]
-        
-        return df
-    
-    except Exception as e:
-        print(f"❌ Error fetching {symbol} data: {e}")
-        return None
-
-def calculate_swing_points(df, window=5):
-    """Identify swing highs and lows"""
-    swing_highs = []
-    swing_lows = []
-    
-    for i in range(window, len(df) - window):
-        if df['high'].iloc[i] == df['high'].iloc[i-window:i+window+1].max():
-            swing_highs.append({'index': i, 'price': df['high'].iloc[i], 'time': df.index[i]})
-        
-        if df['low'].iloc[i] == df['low'].iloc[i-window:i+window+1].min():
-            swing_lows.append({'index': i, 'price': df['low'].iloc[i], 'time': df.index[i]})
-    
-    return swing_highs, swing_lows
-
-def identify_support_resistance(df, num_levels=3):
-    """Find key support and resistance levels"""
-    swing_highs, swing_lows = calculate_swing_points(df)
-    
-    recent_highs = [s['price'] for s in swing_highs[-50:]]
-    recent_lows = [s['price'] for s in swing_lows[-50:]]
-    
-    resistance_levels = []
-    support_levels = []
-    
-    if recent_highs:
-        resistance_levels = sorted(set(recent_highs), reverse=True)[:num_levels]
-    
-    if recent_lows:
-        support_levels = sorted(set(recent_lows))[:num_levels]
-    
-    return support_levels, resistance_levels, swing_highs, swing_lows
-
-def analyze_with_gpt(candlestick_data, symbol, timeframe, support_levels, resistance_levels, swing_highs, swing_lows):
-    """Send RAW candlestick data to GPT-4o Mini for deep analysis"""
-    
-    print(f"🧠 Sending data to GPT-4o Mini for analysis...")
-    
-    # Prepare last 100 candles as JSON
-    recent_data = candlestick_data.tail(100).reset_index()
-    candles_json = recent_data.to_dict('records')
-    
-    # Prepare swing points
-    recent_swing_highs = [{'price': s['price'], 'time': str(s['time'])} for s in swing_highs[-20:]]
-    recent_swing_lows = [{'price': s['price'], 'time': str(s['time'])} for s in swing_lows[-20:]]
-    
-    # Build comprehensive prompt
-    prompt = f"""You are an expert pure price action trader. Analyze {symbol} on {timeframe} timeframe.
-
-**CURRENT MARKET DATA:**
-- Current Price: ${candlestick_data['close'].iloc[-1]:.2f}
-- Support Levels: {support_levels}
-- Resistance Levels: {resistance_levels}
-
-**RAW CANDLESTICK DATA (Last 100 Candles in JSON):**
-{json.dumps(candles_json[-50:], indent=2, default=str)}
-
-**SWING ANALYSIS:**
-- Recent Swing Highs: {recent_swing_highs[-5:]}
-- Recent Swing Lows: {recent_swing_lows[-5:]}
-
-**YOUR TASK - DEEP PRICE ACTION ANALYSIS:**
-
-1. **IDENTIFY CHART PATTERNS:**
-   - Head & Shoulders (regular/inverse)
-   - Double/Triple Top/Bottom
-   - Ascending/Descending Triangle
-   - Symmetrical Triangle
-   - Flag/Pennant
-   - Wedge (rising/falling)
-   - Channel (ascending/descending/horizontal)
-
-2. **IDENTIFY CANDLESTICK PATTERNS (Last 5-10 candles):**
-   - Bullish: Hammer, Bullish Engulfing, Morning Star, Piercing Pattern, Three White Soldiers
-   - Bearish: Shooting Star, Bearish Engulfing, Evening Star, Dark Cloud Cover, Three Black Crows
-   - Indecision: Doji, Spinning Top
-
-3. **DRAW TRENDLINES:**
-   - Connect swing highs for resistance trendline
-   - Connect swing lows for support trendline
-   - Identify trendline breaks or bounces
-
-4. **MARKET STRUCTURE:**
-   - Higher Highs + Higher Lows = Uptrend
-   - Lower Highs + Lower Lows = Downtrend
-   - Ranging = Choppy/Sideways
-
-5. **GENERATE TRADE SIGNAL:**
-   - LONG: Bullish pattern + support bounce + uptrend
-   - SHORT: Bearish pattern + resistance rejection + downtrend
-   - NO TRADE: No clear setup, choppy, conflicting signals
-
-**STRICT OUTPUT FORMAT (MUST FOLLOW EXACTLY):**
-
-SIGNAL: [LONG/SHORT/NO TRADE]
-CHART_PATTERN: [Pattern name or "None"]
-CANDLESTICK_PATTERN: [Pattern name or "None"]
-TRENDLINE: [Uptrend/Downtrend/Range/Break]
-MARKET_STRUCTURE: [Higher Highs Higher Lows / Lower Highs Lower Lows / Range]
-ENTRY: $[price]
-STOP_LOSS: $[price]
-TAKE_PROFIT: $[price]
-RISK_REWARD: [ratio]
-REASON: [2-3 sentence explanation focusing on price action]
-
-**IMPORTANT:**
-- Be conservative - only signal high-probability setups
-- Price action ONLY - no indicators
-- If unclear, say NO TRADE
-"""
-
-    try:
-        print("⏳ Waiting for GPT-4o Mini response...")
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are an expert pure price action trader. Analyze raw candlestick data and identify patterns, trendlines, and trade setups."
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-            max_tokens=1500,
-            temperature=0.3
-        )
-        
-        analysis = response.choices[0].message.content
-        print(f"✅ GPT-4o Mini analysis received!")
-        print(f"📊 Analysis Preview:\n{analysis[:200]}...\n")
-        
-        return analysis
-    
-    except Exception as e:
-        print(f"❌ GPT Analysis Error: {e}")
-        return f"GPT Analysis Error: {e}"
-
-def parse_gpt_analysis(analysis):
-    """Extract key info from GPT analysis"""
-    lines = analysis.split('\n')
-    parsed = {
-        'signal': 'NO TRADE',
-        'chart_pattern': 'None',
-        'candlestick_pattern': 'None',
-        'trendline': 'Unknown',
-        'market_structure': 'Unknown'
+    RESOLUTION_MAP = {
+        '30': '30',
+        '60': '60',
+        '240': '1D'
     }
     
-    for line in lines:
-        line_upper = line.upper()
-        if line_upper.startswith('SIGNAL:'):
-            if 'LONG' in line_upper:
-                parsed['signal'] = 'LONG'
-            elif 'SHORT' in line_upper:
-                parsed['signal'] = 'SHORT'
-        elif line_upper.startswith('CHART_PATTERN:'):
-            parsed['chart_pattern'] = line.split(':', 1)[1].strip()
-        elif line_upper.startswith('CANDLESTICK_PATTERN:'):
-            parsed['candlestick_pattern'] = line.split(':', 1)[1].strip()
-        elif line_upper.startswith('TRENDLINE:'):
-            parsed['trendline'] = line.split(':', 1)[1].strip()
-        elif line_upper.startswith('MARKET_STRUCTURE:'):
-            parsed['market_structure'] = line.split(':', 1)[1].strip()
-    
-    return parsed
-
-def draw_enhanced_chart(df, symbol, timeframe, support_levels, resistance_levels, gpt_data):
-    """Generate chart with GPT analysis annotations"""
-    
-    df_chart = df.tail(200).copy()
-    
-    fig, ax = plt.subplots(figsize=(18, 11))
-    
-    # Plot candlesticks
-    mpf.plot(df_chart, type='candle', style='charles', ax=ax, 
-             volume=False, ylabel='Price', warn_too_much_data=9999)
-    
-    # Support levels
-    for level in support_levels[:3]:
-        ax.axhline(y=level, color='green', linestyle='--', linewidth=2, alpha=0.7)
-        ax.text(len(df_chart)-5, level, f'Support: ${level:.2f}', 
-                fontsize=9, color='green', va='bottom', fontweight='bold')
-    
-    # Resistance levels
-    for level in resistance_levels[:3]:
-        ax.axhline(y=level, color='red', linestyle='--', linewidth=2, alpha=0.7)
-        ax.text(len(df_chart)-5, level, f'Resistance: ${level:.2f}', 
-                fontsize=9, color='red', va='top', fontweight='bold')
-    
-    # Add GPT analysis annotations
-    title_color = '#4CAF50' if gpt_data['signal'] == 'LONG' else '#f44336' if gpt_data['signal'] == 'SHORT' else '#888'
-    
-    title = f"{symbol} - {timeframe} | GPT-4o Mini Analysis\n"
-    title += f"Signal: {gpt_data['signal']} | Chart Pattern: {gpt_data['chart_pattern']}\n"
-    title += f"Candlestick: {gpt_data['candlestick_pattern']} | Trend: {gpt_data['trendline']}"
-    
-    ax.set_title(title, fontsize=14, fontweight='bold', color=title_color, pad=20)
-    ax.grid(True, alpha=0.3)
-    
-    # Add signal marker on last candle
-    if gpt_data['signal'] in ['LONG', 'SHORT']:
-        marker_color = 'green' if gpt_data['signal'] == 'LONG' else 'red'
-        marker_symbol = '^' if gpt_data['signal'] == 'LONG' else 'v'
-        ax.plot(len(df_chart)-1, df_chart['close'].iloc[-1], 
-                marker=marker_symbol, markersize=15, color=marker_color, zorder=5)
-    
-    buf = BytesIO()
-    plt.tight_layout()
-    plt.savefig(buf, format='png', dpi=120, bbox_inches='tight', facecolor='#1a1a1a')
-    buf.seek(0)
-    plt.close()
-    
-    return buf
-
-def send_telegram_alert(symbol, timeframe, analysis, current_price, gpt_data, chart_img=None):
-    """Send trading signal to Telegram with GPT insights"""
-    if not bot or not TELEGRAM_CHAT_ID:
-        return
-    
-    try:
-        signal_type = gpt_data['signal']
+    @staticmethod
+    def get_candles(symbol: str, timeframe: str, count: int = CANDLE_COUNT) -> pd.DataFrame:
+        """Fetch OHLCV data - 500 candles"""
         
-        if signal_type in ["LONG", "SHORT"]:
-            emoji = "🟢" if signal_type == "LONG" else "🔴"
+        logger.info(f"📊 Fetching {count} candles for {symbol} {timeframe}m...")
+        
+        resolution = DeribitClient.RESOLUTION_MAP.get(timeframe, timeframe)
+        url = f"{DERIBIT_BASE}/get_tradingview_chart_data"
+        
+        tf_minutes = int(timeframe)
+        if timeframe == '240':
+            days_needed = count + 10
+        else:
+            days_needed = (count * tf_minutes) // (24 * 60) + 10
+        
+        params = {
+            'instrument_name': symbol,
+            'resolution': resolution,
+            'start_timestamp': int((datetime.now() - timedelta(days=days_needed)).timestamp() * 1000),
+            'end_timestamp': int(datetime.now().timestamp() * 1000)
+        }
+        
+        try:
+            response = requests.get(url, params=params, timeout=15)
             
-            message = f"""
-{emoji} **{signal_type} SIGNAL DETECTED!**
-
-💰 **{symbol}** ({timeframe})
-💵 Current Price: ${current_price:.2f}
-
-🧠 **GPT-4o Mini Analysis:**
-
-📊 **Chart Pattern:** {gpt_data['chart_pattern']}
-🕯️ **Candlestick Pattern:** {gpt_data['candlestick_pattern']}
-📈 **Trendline:** {gpt_data['trendline']}
-🏗️ **Market Structure:** {gpt_data['market_structure']}
-
-**Full Analysis:**
-{analysis}
-
-⏰ {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-            """
+            if response.status_code != 200:
+                logger.error(f"❌ Deribit API HTTP {response.status_code} for {symbol} {timeframe}m")
+                return pd.DataFrame()
             
-            if chart_img:
-                chart_img.seek(0)
-                bot.send_photo(
-                    chat_id=TELEGRAM_CHAT_ID,
-                    photo=chart_img,
+            data = response.json()
+            
+            if 'error' in data:
+                logger.error(f"❌ Deribit API error for {symbol} {timeframe}m: {data['error']}")
+                return pd.DataFrame()
+            
+            if 'result' not in data:
+                logger.error(f"❌ No result in Deribit response for {symbol} {timeframe}m")
+                return pd.DataFrame()
+            
+            result = data['result']
+            
+            if result.get('status') != 'ok':
+                logger.error(f"❌ Deribit status not OK for {symbol} {timeframe}m")
+                return pd.DataFrame()
+            
+            required_fields = ['ticks', 'open', 'high', 'low', 'close', 'volume']
+            missing = [f for f in required_fields if f not in result]
+            if missing:
+                logger.error(f"❌ Missing fields for {symbol} {timeframe}m: {missing}")
+                return pd.DataFrame()
+            
+            df = pd.DataFrame({
+                'timestamp': pd.to_datetime(result['ticks'], unit='ms'),
+                'open': result['open'],
+                'high': result['high'],
+                'low': result['low'],
+                'close': result['close'],
+                'volume': result['volume']
+            })
+            
+            if len(df) == 0:
+                logger.warning(f"⚠️ Empty dataframe for {symbol} {timeframe}m")
+                return pd.DataFrame()
+            
+            df.set_index('timestamp', inplace=True)
+            
+            if timeframe == '240':
+                logger.info(f"ℹ️ Using daily data for 4hr timeframe {symbol}")
+            
+            logger.info(f"✅ Fetched {len(df)} candles for {symbol} {resolution}")
+            return df.tail(count)
+            
+        except requests.exceptions.Timeout:
+            logger.error(f"⏱️ Timeout fetching {symbol} {timeframe}m")
+        except Exception as e:
+            logger.error(f"💥 Error fetching {symbol} {timeframe}m: {e}")
+        
+        return pd.DataFrame()
+    
+    @staticmethod
+    def get_order_book(symbol: str, depth: int = 10) -> Dict:
+        """Fetch order book for OI analysis"""
+        logger.info(f"📖 Fetching order book for {symbol}...")
+        
+        url = f"{DERIBIT_BASE}/get_order_book"
+        params = {'instrument_name': symbol, 'depth': depth}
+        
+        try:
+            response = requests.get(url, params=params, timeout=10)
+            data = response.json()
+            
+            if 'result' in data:
+                oi = data['result'].get('open_interest', 0)
+                volume = data['result'].get('stats', {}).get('volume', 0)
+                mark = data['result'].get('mark_price', 0)
+                
+                logger.info(f"📊 {symbol} OI: {oi:,.0f}, Vol: {volume:,.2f}, Mark: ${mark:,.2f}")
+                
+                return {
+                    'open_interest': oi,
+                    'volume_24h': volume,
+                    'mark_price': mark
+                }
+        except Exception as e:
+            logger.error(f"❌ Error fetching order book for {symbol}: {e}")
+        
+        return {'open_interest': 0, 'volume_24h': 0, 'mark_price': 0}
+
+class TechnicalAnalyzer:
+    """Technical analysis functions"""
+    
+    @staticmethod
+    def find_swing_points(df: pd.DataFrame, period: int = 5) -> Tuple[List, List]:
+        """Identify swing highs and lows - IMPROVED VERSION"""
+        swing_highs = []
+        swing_lows = []
+        
+        for i in range(period, len(df) - period):
+            if df['high'].iloc[i] == df['high'].iloc[i-period:i+period+1].max():
+                swing_highs.append({
+                    'price': df['high'].iloc[i], 
+                    'index': i,
+                    'timestamp': df.index[i]
+                })
+            
+            if df['low'].iloc[i] == df['low'].iloc[i-period:i+period+1].min():
+                swing_lows.append({
+                    'price': df['low'].iloc[i], 
+                    'index': i,
+                    'timestamp': df.index[i]
+                })
+        
+        # IMPROVEMENT: Filter only RECENT swings (last 50 candles range)
+        current_price = df['close'].iloc[-1]
+        price_range = current_price * 0.05  # 5% range from current price
+        
+        # Filter relevant highs (within 5% above current price)
+        relevant_highs = [
+            s for s in swing_highs 
+            if s['index'] >= len(df) - 50 and  # Last 50 candles
+               s['price'] >= current_price and   # Above current price
+               s['price'] <= current_price * 1.05  # Within 5% above
+        ]
+        
+        # Filter relevant lows (within 5% below current price)
+        relevant_lows = [
+            s for s in swing_lows 
+            if s['index'] >= len(df) - 50 and  # Last 50 candles
+               s['price'] <= current_price and   # Below current price
+               s['price'] >= current_price * 0.95  # Within 5% below
+        ]
+        
+        # If no relevant swings, take closest ones
+        if len(relevant_highs) == 0:
+            relevant_highs = sorted(swing_highs, key=lambda x: abs(x['price'] - current_price))[:3]
+        
+        if len(relevant_lows) == 0:
+            relevant_lows = sorted(swing_lows, key=lambda x: abs(x['price'] - current_price))[:3]
+        
+        # Take max 3 most recent
+        relevant_highs = sorted(relevant_highs, key=lambda x: x['index'], reverse=True)[:3]
+        relevant_lows = sorted(relevant_lows, key=lambda x: x['index'], reverse=True)[:3]
+        
+        logger.info(f"🎯 Filtered to {len(relevant_highs)} resistance & {len(relevant_lows)} support levels (within 5% of price)")
+        
+        return relevant_highs, relevant_lows
+    
+    @staticmethod
+    def detect_patterns(df: pd.DataFrame) -> List[Dict]:
+        """Detect candlestick and chart patterns"""
+        patterns = []
+        
+        if len(df) < 3:
+            return patterns
+        
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
+        
+        body = abs(last['close'] - last['open'])
+        upper_wick = last['high'] - max(last['open'], last['close'])
+        lower_wick = min(last['open'], last['close']) - last['low']
+        candle_range = last['high'] - last['low']
+        
+        if candle_range > 0:
+            if body < candle_range * 0.1:
+                patterns.append({'type': 'candlestick', 'name': 'Doji', 'signal': 'neutral'})
+            
+            if lower_wick > body * 2 and upper_wick < body * 0.5 and last['close'] > last['open']:
+                patterns.append({'type': 'candlestick', 'name': 'Hammer', 'signal': 'bullish'})
+            
+            if upper_wick > body * 2 and lower_wick < body * 0.5 and last['close'] < last['open']:
+                patterns.append({'type': 'candlestick', 'name': 'Shooting Star', 'signal': 'bearish'})
+            
+            if (prev['close'] < prev['open'] and 
+                last['close'] > last['open'] and 
+                last['close'] > prev['open'] and 
+                last['open'] < prev['close']):
+                patterns.append({'type': 'candlestick', 'name': 'Bullish Engulfing', 'signal': 'bullish'})
+            
+            if (prev['close'] > prev['open'] and 
+                last['close'] < last['open'] and 
+                last['close'] < prev['open'] and 
+                last['open'] > prev['close']):
+                patterns.append({'type': 'candlestick', 'name': 'Bearish Engulfing', 'signal': 'bearish'})
+        
+        if len(df) >= 20:
+            recent = df.tail(20)
+            highs = recent['high'].values
+            lows = recent['low'].values
+            
+            if max(highs[-10:]) < max(highs[:10]) and min(lows[-10:]) > min(lows[:10]):
+                patterns.append({'type': 'chart', 'name': 'Symmetrical Triangle', 'signal': 'breakout_pending'})
+            elif abs(max(highs[-10:]) - max(highs[:10])) < (max(highs) * 0.01) and min(lows[-10:]) > min(lows[:10]):
+                patterns.append({'type': 'chart', 'name': 'Ascending Triangle', 'signal': 'bullish'})
+            elif abs(min(lows[-10:]) - min(lows[:10])) < (min(lows) * 0.01) and max(highs[-10:]) < max(highs[:10]):
+                patterns.append({'type': 'chart', 'name': 'Descending Triangle', 'signal': 'bearish'})
+        
+        logger.info(f"🔍 Detected {len(patterns)} patterns: {[p['name'] for p in patterns]}")
+        return patterns
+    
+    @staticmethod
+    def calculate_volume_profile(df: pd.DataFrame) -> Dict:
+        """Calculate high volume nodes"""
+        price_range = df['high'].max() - df['low'].min()
+        bins = 20
+        bin_size = price_range / bins
+        
+        volume_by_price = {}
+        for _, row in df.iterrows():
+            price_bin = int((row['close'] - df['low'].min()) / bin_size)
+            volume_by_price[price_bin] = volume_by_price.get(price_bin, 0) + row['volume']
+        
+        if volume_by_price:
+            poc_bin = max(volume_by_price, key=volume_by_price.get)
+            poc_price = df['low'].min() + (poc_bin * bin_size)
+            
+            return {
+                'poc': poc_price,
+                'high_volume_nodes': sorted(volume_by_price.items(), key=lambda x: x[1], reverse=True)[:3]
+            }
+        return {'poc': None, 'high_volume_nodes': []}
+
+class OITracker:
+    """Track OI changes using Redis"""
+    
+    @staticmethod
+    def store_oi(symbol: str, oi_data: Dict):
+        """Store current OI in Redis with timestamp"""
+        key = f"oi:{symbol}:{int(datetime.now().timestamp())}"
+        redis_client.setex(key, 7200, json.dumps(oi_data))
+        logger.info(f"💾 Stored OI data for {symbol}: OI={oi_data.get('open_interest', 0):,.0f}")
+    
+    @staticmethod
+    def get_oi_history(symbol: str, hours: int = 2) -> List[Dict]:
+        """Get OI history from Redis"""
+        cutoff = int((datetime.now() - timedelta(hours=hours)).timestamp())
+        pattern = f"oi:{symbol}:*"
+        
+        history = []
+        try:
+            keys = list(redis_client.scan_iter(match=pattern))
+            logger.info(f"📚 Found {len(keys)} OI records for {symbol}")
+            
+            for key in keys:
+                timestamp = int(key.split(':')[-1])
+                if timestamp >= cutoff:
+                    data = json.loads(redis_client.get(key))
+                    data['timestamp'] = timestamp
+                    history.append(data)
+        except Exception as e:
+            logger.error(f"❌ Redis error: {e}")
+        
+        return sorted(history, key=lambda x: x['timestamp'])
+    
+    @staticmethod
+    def analyze_oi_trend(symbol: str) -> Dict:
+        """Analyze OI trend over last 2 hours"""
+        history = OITracker.get_oi_history(symbol, hours=2)
+        
+        if len(history) < 2:
+            logger.warning(f"⚠️ Insufficient OI data for {symbol}")
+            return {'trend': 'insufficient_data', 'change': 0, 'supporting_sr': None}
+        
+        current_oi = history[-1]['open_interest']
+        old_oi = history[0]['open_interest']
+        change = ((current_oi - old_oi) / old_oi * 100) if old_oi > 0 else 0
+        
+        if change > 5:
+            trend = 'strongly_increasing'
+        elif change > 2:
+            trend = 'increasing'
+        elif change < -5:
+            trend = 'strongly_decreasing'
+        elif change < -2:
+            trend = 'decreasing'
+        else:
+            trend = 'stable'
+        
+        logger.info(f"📊 {symbol} OI Trend: {trend} ({change:+.2f}%)")
+        
+        return {
+            'trend': trend,
+            'change': round(change, 2),
+            'current_oi': current_oi,
+            'previous_oi': old_oi,
+            'supporting_sr': None
+        }
+
+class ChartGenerator:
+    """Generate annotated charts"""
+    
+    @staticmethod
+    def create_chart(df: pd.DataFrame, analysis: Dict, symbol: str) -> io.BytesIO:
+        """Create chart with S/R, trendlines, patterns marked"""
+        
+        logger.info(f"📈 Generating chart for {symbol}...")
+        
+        mc = mpf.make_marketcolors(
+            up='#26a69a',
+            down='#ef5350',
+            edge='inherit',
+            wick='inherit',
+            volume='in',
+            alpha=0.9
+        )
+        
+        s = mpf.make_mpf_style(
+            marketcolors=mc,
+            gridstyle='-',
+            gridcolor='#e0e0e0',
+            facecolor='white',
+            figcolor='white',
+            y_on_right=False
+        )
+        
+        fig, axes = mpf.plot(
+            df.tail(100),
+            type='candle',
+            style=s,
+            volume=True,
+            returnfig=True,
+            figsize=(14, 8),
+            title=f"\n{symbol} - {analysis.get('trade_type', 'Analysis')}",
+            ylabel='Price ($)',
+            ylabel_lower='Volume'
+        )
+        
+        ax = axes[0]
+        
+        if 'swing_lows_30m' in analysis:
+            for swing in analysis['swing_lows_30m'][-3:]:
+                price = swing['price']
+                ax.axhline(y=price, color='#4caf50', linestyle='--', linewidth=1.5, alpha=0.7, label='Support 30m')
+        
+        if 'swing_highs_30m' in analysis:
+            for swing in analysis['swing_highs_30m'][-3:]:
+                price = swing['price']
+                ax.axhline(y=price, color='#f44336', linestyle='--', linewidth=1.5, alpha=0.7, label='Resistance 30m')
+        
+        if analysis.get('support_4h'):
+            ax.axhline(y=analysis['support_4h'], color='#2e7d32', linestyle='-', linewidth=2, label='Support 4H')
+        
+        if analysis.get('resistance_4h'):
+            ax.axhline(y=analysis['resistance_4h'], color='#c62828', linestyle='-', linewidth=2, label='Resistance 4H')
+        
+        if analysis.get('oi_trend', {}).get('supporting_sr'):
+            sr_price = analysis['oi_trend']['supporting_sr']
+            ax.axhline(y=sr_price, color='#2196f3', linestyle='-.', linewidth=2.5, label='OI S/R')
+        
+        current_price = df['close'].iloc[-1]
+        ax.axhline(y=current_price, color='#ff9800', linestyle=':', linewidth=2, label=f'Current: ${current_price:.2f}')
+        
+        if analysis.get('patterns'):
+            pattern_text = "\n".join([p['name'] for p in analysis['patterns'][:3]])
+            ax.text(
+                0.02, 0.98, 
+                f"Patterns:\n{pattern_text}",
+                transform=ax.transAxes,
+                verticalalignment='top',
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8),
+                fontsize=10
+            )
+        
+        if analysis.get('trade_signal'):
+            signal = analysis['trade_signal']
+            signal_color = '#4caf50' if 'LONG' in signal else '#f44336' if 'SHORT' in signal else '#9e9e9e'
+            
+            signal_text = f"SIGNAL: {signal}\n"
+            if analysis.get('entry_price'):
+                signal_text += f"Entry: ${analysis['entry_price']:.2f}\n"
+            if analysis.get('sl_price'):
+                signal_text += f"SL: ${analysis['sl_price']:.2f}\n"
+            if analysis.get('target_price'):
+                signal_text += f"Target: ${analysis['target_price']:.2f}"
+            
+            ax.text(
+                0.98, 0.98,
+                signal_text,
+                transform=ax.transAxes,
+                verticalalignment='top',
+                horizontalalignment='right',
+                bbox=dict(boxstyle='round', facecolor=signal_color, alpha=0.3, edgecolor=signal_color, linewidth=2),
+                fontsize=11,
+                fontweight='bold'
+            )
+        
+        handles, labels = ax.get_legend_handles_labels()
+        by_label = dict(zip(labels, handles))
+        ax.legend(by_label.values(), by_label.keys(), loc='upper left', fontsize=8)
+        
+        buf = io.BytesIO()
+        plt.tight_layout()
+        fig.savefig(buf, format='png', dpi=150, facecolor='white')
+        buf.seek(0)
+        plt.close(fig)
+        
+        logger.info(f"✅ Chart generated for {symbol}")
+        return buf
+
+class TradeAnalyzer:
+    """Main trade analysis engine"""
+    
+    @staticmethod
+    def analyze_setup(symbol: str) -> Dict:
+        """Comprehensive trade analysis with 500 candles per TF"""
+        logger.info(f"\n{'='*60}")
+        logger.info(f"🔍 ANALYZING {symbol}")
+        logger.info(f"{'='*60}")
+        
+        df_30m = DeribitClient.get_candles(symbol, '30', CANDLE_COUNT)
+        df_1h = DeribitClient.get_candles(symbol, '60', CANDLE_COUNT)
+        df_4h = DeribitClient.get_candles(symbol, '240', CANDLE_COUNT)
+        
+        if df_30m.empty or df_1h.empty or df_4h.empty:
+            logger.error(f"❌ Insufficient data for {symbol}")
+            return {'valid': False, 'reason': 'Insufficient data', 'symbol': symbol}
+        
+        logger.info(f"✅ {symbol}: Loaded {len(df_30m)}x30m, {len(df_1h)}x1h, {len(df_4h)}x4h candles")
+        
+        oi_data = DeribitClient.get_order_book(symbol)
+        OITracker.store_oi(symbol, oi_data)
+        oi_trend = OITracker.analyze_oi_trend(symbol)
+        
+        swing_highs_30m, swing_lows_30m = TechnicalAnalyzer.find_swing_points(df_30m)
+        swing_highs_1h, swing_lows_1h = TechnicalAnalyzer.find_swing_points(df_1h)
+        swing_highs_4h, swing_lows_4h = TechnicalAnalyzer.find_swing_points(df_4h)
+        
+        logger.info(f"📍 30m: {len(swing_highs_30m)} resistance, {len(swing_lows_30m)} support")
+        logger.info(f"📍 1h: {len(swing_highs_1h)} resistance, {len(swing_lows_1h)} support")
+        logger.info(f"📍 4h: {len(swing_highs_4h)} resistance, {len(swing_lows_4h)} support")
+        
+        patterns = TechnicalAnalyzer.detect_patterns(df_30m)
+        volume_profile = TechnicalAnalyzer.calculate_volume_profile(df_30m)
+        
+        current_price = df_30m['close'].iloc[-1]
+        avg_volume = df_30m['volume'].tail(20).mean()
+        current_volume = df_30m['volume'].iloc[-1]
+        volume_ratio = current_volume / avg_volume if avg_volume > 0 else 0
+        
+        logger.info(f"💰 Price: ${current_price:.2f}")
+        logger.info(f"📊 Volume: {volume_ratio:.2f}x (current: {current_volume:.2f}, avg: {avg_volume:.2f})")
+        
+        # Get 4H S/R - closest to current price
+        resistance_4h = None
+        support_4h = None
+        
+        if swing_highs_4h:
+            # Closest resistance above current price
+            resistances = [s['price'] for s in swing_highs_4h if s['price'] >= current_price]
+            resistance_4h = min(resistances) if resistances else swing_highs_4h[0]['price']
+        
+        if swing_lows_4h:
+            # Closest support below current price  
+            supports = [s['price'] for s in swing_lows_4h if s['price'] <= current_price]
+            support_4h = max(supports) if supports else swing_lows_4h[0]['price']
+        
+        logger.info(f"🎯 4H Resistance: ${resistance_4h:.2f if resistance_4h else 0}")
+        logger.info(f"🎯 4H Support: ${support_4h:.2f if support_4h else 0}")
+        
+        oi_sr = None
+        if oi_trend['trend'] in ['increasing', 'strongly_increasing']:
+            recent_high = df_30m['high'].tail(10).max()
+            recent_low = df_30m['low'].tail(10).min()
+            
+            if abs(current_price - recent_high) < abs(current_price - recent_low):
+                oi_sr = recent_high
+                logger.info(f"🔵 OI increasing near resistance: ${oi_sr:.2f}")
+            else:
+                oi_sr = recent_low
+                logger.info(f"🔵 OI increasing near support: ${oi_sr:.2f}")
+        
+        oi_trend['supporting_sr'] = oi_sr
+        
+        analysis = {
+            'symbol': symbol,
+            'current_price': current_price,
+            'timestamp': datetime.now().isoformat(),
+            'patterns': patterns,
+            'volume_ratio': round(volume_ratio, 2),
+            'oi_trend': oi_trend,
+            'swing_highs_30m': swing_highs_30m,
+            'swing_lows_30m': swing_lows_30m,
+            'swing_highs_1h': swing_highs_1h,
+            'swing_lows_1h': swing_lows_1h,
+            'resistance_4h': resistance_4h,
+            'support_4h': support_4h,
+            'volume_profile': volume_profile,
+            'df_30m': df_30m,
+            'valid': True
+        }
+        
+        logger.info(f"✅ Analysis complete for {symbol}")
+        return analysis
+    
+    @staticmethod
+    def get_ai_analysis(analysis: Dict) -> Dict:
+        """Get GPT-4o mini analysis"""
+        
+        logger.info(f"\n🤖 Calling OpenAI for {analysis['symbol']}...")
+        
+        patterns_text = "\n".join([f"- {p['name']} ({p['signal']})" for p in analysis.get('patterns', [])]) if analysis.get('patterns') else "None detected"
+        
+        support_30m = analysis['swing_lows_30m'][-1]['price'] if analysis.get('swing_lows_30m') else None
+        resistance_30m = analysis['swing_highs_30m'][-1]['price'] if analysis.get('swing_highs_30m') else None
+        
+        support_30m_str = f"${support_30m:.2f}" if support_30m else "N/A"
+        resistance_30m_str = f"${resistance_30m:.2f}" if resistance_30m else "N/A"
+        support_4h_str = f"${analysis.get('support_4h'):.2f}" if analysis.get('support_4h') else "N/A"
+        resistance_4h_str = f"${analysis.get('resistance_4h'):.2f}" if analysis.get('resistance_4h') else "N/A"
+        
+        prompt = f"""Analyze this crypto setup for {analysis['symbol']}:
+
+CURRENT PRICE: ${analysis['current_price']:.2f}
+
+PATTERNS:
+{patterns_text}
+
+VOLUME: {analysis.get('volume_ratio', 0):.2f}x average
+
+OPEN INTEREST:
+- Trend: {analysis.get('oi_trend', {}).get('trend', 'unknown')}
+- Change: {analysis.get('oi_trend', {}).get('change', 0):.1f}%
+
+KEY LEVELS:
+- 30m Support: {support_30m_str}
+- 30m Resistance: {resistance_30m_str}
+- 4H Support: {support_4h_str}
+- 4H Resistance: {resistance_4h_str}
+
+TRADING RULES:
+1. Volume should be >1.2x (you have {analysis.get('volume_ratio', 0):.2f}x)
+2. Must have clear breakout/breakdown
+3. Reasonable R:R (min 1:1.5)
+4. Price near key S/R level
+
+TASK: Decide if this is tradeable. 
+
+If YES, provide:
+SIGNAL: LONG or SHORT
+ENTRY: [specific price near current]
+SL: [swing level]
+TARGET: [with good R:R]
+PATTERN: [trigger pattern]
+REASON: [why trade]
+
+If NO trade:
+SIGNAL: NO_TRADE
+REASON: [why not]"""
+
+        try:
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "You are a strict crypto trader. Only take high-probability setups. Be conservative."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=400,
+                temperature=0.3
+            )
+            
+            ai_text = response.choices[0].message.content
+            logger.info(f"📝 OpenAI response (first 150 chars): {ai_text[:150]}...")
+            
+            result = {
+                'signal': 'NO_TRADE',
+                'entry': None,
+                'sl': None,
+                'target': None,
+                'pattern': 'None',
+                'reason': 'No clear setup'
+            }
+            
+            lines = ai_text.split('\n')
+            for line in lines:
+                line = line.strip()
+                
+                if 'SIGNAL:' in line:
+                    signal_part = line.split('SIGNAL:')[-1].strip().upper()
+                    if 'LONG' in signal_part:
+                        result['signal'] = 'LONG'
+                    elif 'SHORT' in signal_part:
+                        result['signal'] = 'SHORT'
+                
+                elif 'ENTRY:' in line:
+                    try:
+                        entry_str = line.split('ENTRY:')[-1].strip()
+                        entry_str = entry_str.replace('$', '').replace(',', '')
+                        result['entry'] = float(entry_str.split()[0])
+                    except:
+                        result['entry'] = analysis['current_price']
+                
+                elif 'SL:' in line or 'STOP' in line:
+                    try:
+                        sl_str = line.split(':')[-1].strip()
+                        sl_str = sl_str.replace('$', '').replace(',', '')
+                        result['sl'] = float(sl_str.split()[0])
+                    except:
+                        pass
+                
+                elif 'TARGET:' in line:
+                    try:
+                        tgt_str = line.split('TARGET:')[-1].strip()
+                        tgt_str = tgt_str.replace('$', '').replace(',', '')
+                        result['target'] = float(tgt_str.split()[0])
+                    except:
+                        pass
+                
+                elif 'PATTERN:' in line:
+                    result['pattern'] = line.split('PATTERN:')[-1].strip()
+                
+                elif 'REASON:' in line:
+                    result['reason'] = line.split('REASON:')[-1].strip()
+            
+            if result['reason'] == 'No clear setup':
+                result['reason'] = ai_text
+            
+            logger.info(f"🎯 Parsed AI result: {result['signal']} - {result.get('pattern', 'No pattern')}")
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"❌ GPT API error for {analysis['symbol']}: {e}", exc_info=True)
+            return {
+                'signal': 'ERROR',
+                'reason': f'AI analysis failed: {str(e)}',
+                'entry': None,
+                'sl': None,
+                'target': None,
+                'pattern': 'Error'
+            }
+
+class TradingBot:
+    """Main bot logic"""
+    
+    def __init__(self):
+        self.trade_count_today = 0
+        self.last_reset = datetime.now().date()
+        self.bot_start_time = datetime.now()
+    
+    def reset_daily_counter(self):
+        """Reset trade counter at midnight"""
+        if datetime.now().date() > self.last_reset:
+            self.trade_count_today = 0
+            self.last_reset = datetime.now().date()
+            logger.info("🔄 Trade counter reset for new day")
+    
+    async def scan_markets(self, context: ContextTypes.DEFAULT_TYPE):
+        """Scan all symbols for setups"""
+        logger.info(f"\n{'='*80}")
+        logger.info(f"🚀 STARTING MARKET SCAN - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info(f"{'='*80}")
+        
+        self.reset_daily_counter()
+        
+        if self.trade_count_today >= MAX_TRADES_PER_DAY:
+            logger.info(f"⛔ Daily limit reached: {self.trade_count_today}/{MAX_TRADES_PER_DAY}")
+            return
+        
+        for symbol in SYMBOLS:
+            try:
+                logger.info(f"\n📊 Scanning {symbol}...")
+                analysis = TradeAnalyzer.analyze_setup(symbol)
+                
+                if not analysis or not analysis.get('valid'):
+                    logger.warning(f"⚠️ {symbol}: Invalid data, skipping")
+                    continue
+                
+                logger.info(f"💵 {symbol}: Price=${analysis['current_price']:.2f}, Volume={analysis['volume_ratio']}x, Patterns={len(analysis.get('patterns', []))}")
+                
+                patterns = analysis.get('patterns', [])
+                volume_ratio = analysis.get('volume_ratio', 0)
+                
+                if volume_ratio < 1.2:
+                    logger.info(f"❌ {symbol}: Volume too low ({volume_ratio}x < 1.2x)")
+                    continue
+                
+                if len(patterns) == 0 and volume_ratio < 2.0:
+                    logger.info(f"❌ {symbol}: No patterns and volume not exceptional")
+                    continue
+                
+                logger.info(f"✅ {symbol}: Passed filters, sending to AI analysis...")
+                
+                ai_result = TradeAnalyzer.get_ai_analysis(analysis)
+                
+                logger.info(f"🎯 {symbol}: AI Signal = {ai_result['signal']}")
+                
+                if ai_result['signal'] in ['LONG', 'SHORT']:
+                    self.trade_count_today += 1
+                    logger.info(f"🎉 {symbol}: VALID {ai_result['signal']} SIGNAL - Trade #{self.trade_count_today}")
+                    
+                    analysis['trade_signal'] = ai_result['signal']
+                    analysis['entry_price'] = ai_result.get('entry')
+                    analysis['sl_price'] = ai_result.get('sl')
+                    analysis['target_price'] = ai_result.get('target')
+                    analysis['trade_type'] = ai_result.get('pattern', 'Breakout')
+                    
+                    await self.send_alert(context, symbol, analysis, ai_result)
+                else:
+                    logger.info(f"⏭️ {symbol}: {ai_result['signal']} - {ai_result.get('reason', '')[:80]}")
+                
+            except Exception as e:
+                logger.error(f"💥 Error scanning {symbol}: {e}", exc_info=True)
+            
+            await asyncio.sleep(3)
+        
+        logger.info(f"\n{'='*80}")
+        logger.info(f"✅ SCAN COMPLETE - Trades today: {self.trade_count_today}/{MAX_TRADES_PER_DAY}")
+        logger.info(f"{'='*80}\n")
+    
+    async def send_alert(self, context: ContextTypes.DEFAULT_TYPE, symbol: str, analysis: Dict, ai_result: Dict):
+        """Send trade alert with chart to Telegram"""
+        
+        logger.info(f"📤 Sending alert for {symbol}...")
+        
+        try:
+            chart_buf = ChartGenerator.create_chart(analysis['df_30m'], analysis, symbol)
+        except Exception as e:
+            logger.error(f"❌ Chart generation error: {e}")
+            chart_buf = None
+        
+        patterns_text = ", ".join([p['name'] for p in analysis['patterns'][:3]])
+        
+        oi_emoji = "📈" if "increasing" in analysis['oi_trend']['trend'] else "📉" if "decreasing" in analysis['oi_trend']['trend'] else "➡️"
+        signal_emoji = "🟢" if ai_result['signal'] == 'LONG' else "🔴"
+        
+        try:
+            rr = abs((ai_result['target'] - ai_result['entry']) / (ai_result['entry'] - ai_result['sl']))
+        except:
+            rr = 0
+        
+        message = f"""{signal_emoji} **{analysis['symbol']} - {ai_result['signal']} SETUP**
+
+📊 **Pattern:** {ai_result['pattern']}
+💰 **Price:** ${analysis['current_price']:.2f}
+
+🎯 **TRADE DETAILS:**
+├ Entry: ${ai_result['entry']:.2f}
+├ Stop Loss: ${ai_result['sl']:.2f}
+├ Target: ${ai_result['target']:.2f}
+└ R:R = 1:{rr:.1f}
+
+✅ **CONFIRMATIONS:**
+├ Patterns: {patterns_text}
+├ Volume: {analysis['volume_ratio']}x avg
+└ OI: {oi_emoji} {analysis['oi_trend']['trend']} ({analysis['oi_trend']['change']:+.1f}%)
+
+📈 **SUPPORT & RESISTANCE:**
+├ 30m Support: ${analysis['swing_lows_30m'][-1]['price']:.2f if analysis['swing_lows_30m'] else 'N/A'}
+├ 30m Resistance: ${analysis['swing_highs_30m'][-1]['price']:.2f if analysis['swing_highs_30m'] else 'N/A'}
+├ 4H Support: ${analysis['support_4h']:.2f if analysis['support_4h'] else 'N/A'}
+└ 4H Resistance: ${analysis['resistance_4h']:.2f if analysis['resistance_4h'] else 'N/A'}
+
+💡 **Analysis:** {ai_result['reason']}
+
+⚠️ Trade #{self.trade_count_today}/{MAX_TRADES_PER_DAY} today
+"""
+        
+        try:
+            if chart_buf:
+                await context.bot.send_photo(
+                    chat_id=CHAT_ID,
+                    photo=chart_buf,
                     caption=message,
                     parse_mode='Markdown'
                 )
-                print(f"📲 Telegram alert sent: {symbol} {timeframe} - {signal_type}")
-        
-    except Exception as e:
-        print(f"❌ Telegram send error: {e}")
-
-def send_scan_summary(signal_count, signal_details):
-    """Send scan cycle summary to Telegram"""
-    if not bot or not TELEGRAM_CHAT_ID:
-        return
+            else:
+                await context.bot.send_message(
+                    chat_id=CHAT_ID,
+                    text=message,
+                    parse_mode='Markdown'
+                )
+            
+            logger.info(f"✅ Alert sent for {symbol}: {ai_result['signal']}")
+            
+        except Exception as e:
+            logger.error(f"❌ Error sending alert: {e}")
     
-    try:
-        long_list = "\n".join([f"  • {s}" for s in signal_details["LONG"]]) if signal_details["LONG"] else "  • None"
-        short_list = "\n".join([f"  • {s}" for s in signal_details["SHORT"]]) if signal_details["SHORT"] else "  • None"
+    async def send_startup_alert(self, context: ContextTypes.DEFAULT_TYPE):
+        """Send startup notification"""
+        startup_message = f"""🤖 **TRADING BOT STARTED**
+
+✅ Status: Online and Active
+🕐 Started: {self.bot_start_time.strftime('%Y-%m-%d %H:%M:%S')}
+
+📊 **Configuration:**
+├ Symbols: {', '.join(SYMBOLS)}
+├ Timeframes: 30m, 1h, 4h
+├ Candles per TF: {CANDLE_COUNT}
+├ Max Trades/Day: {MAX_TRADES_PER_DAY}
+└ Scan Interval: Every 30 minutes
+
+🔧 **Systems:**
+├ ✅ Deribit API Connected
+├ ✅ OpenAI GPT-4o mini Ready
+├ ✅ Redis OI Tracking Active
+└ ✅ Telegram Bot Online
+
+🚀 First scan will start in 10 seconds...
+"""
         
-        summary_msg = f"""
-📊 **SCAN CYCLE COMPLETED**
+        try:
+            await context.bot.send_message(
+                chat_id=CHAT_ID,
+                text=startup_message,
+                parse_mode='Markdown'
+            )
+            logger.info("✅ Startup alert sent to Telegram")
+        except Exception as e:
+            logger.error(f"❌ Failed to send startup alert: {e}")
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start command"""
+    await update.message.reply_text(
+        "🤖 **Trading Bot Active!**\n\n"
+        "📊 **Tracking:** BTC & ETH (Deribit)\n"
+        "⏱ **Timeframes:** 30m, 1hr, 4hr (500 candles each)\n"
+        "🎯 **Max Trades:** 8 per day\n"
+        "📈 **Scan Interval:** Every 30 minutes\n\n"
+        "**Commands:**\n"
+        "/status - Check bot status\n"
+        "/scan - Manual scan now\n"
+        "/analyze BTC - Analyze specific symbol\n\n"
+        "🚀 Bot will automatically scan and alert on valid setups!",
+        parse_mode='Markdown'
+    )
 
-🟢 **LONG Signals: {signal_count['LONG']}**
-{long_list}
-
-🔴 **SHORT Signals: {signal_count['SHORT']}**
-{short_list}
-
-⚪ **NO TRADE: {signal_count['NO TRADE']}**
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-✅ Total Scans: {sum(signal_count.values())}
-⏰ Completed: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-⏱️ Next Scan: 1 hour
-
-🧠 Powered by: GPT-4o Mini
-🤖 Bot Status: Active
-        """
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Status command"""
+    bot = context.bot_data.get('trading_bot')
+    if bot:
+        uptime = datetime.now() - bot.bot_start_time
+        hours = int(uptime.total_seconds() // 3600)
+        minutes = int((uptime.total_seconds() % 3600) // 60)
         
-        bot.send_message(
-            chat_id=TELEGRAM_CHAT_ID,
-            text=summary_msg,
+        await update.message.reply_text(
+            f"📊 **Bot Status:**\n\n"
+            f"✅ Active and Running\n"
+            f"⏰ Uptime: {hours}h {minutes}m\n"
+            f"📈 Trades Today: {bot.trade_count_today}/{MAX_TRADES_PER_DAY}\n"
+            f"⏱ Scan Interval: 30 minutes\n"
+            f"💾 Using Redis for OI tracking\n"
+            f"📊 Candles per TF: {CANDLE_COUNT}\n\n"
+            f"Next scan in ~30 mins",
             parse_mode='Markdown'
         )
-        print("📲 Scan summary sent to Telegram!")
+
+async def scan_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manual scan command"""
+    await update.message.reply_text("🔍 Starting manual scan...")
+    bot = context.bot_data.get('trading_bot')
+    if bot:
+        await bot.scan_markets(context)
+        await update.message.reply_text("✅ Scan complete!")
+
+async def analyze_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Analyze specific symbol"""
+    if not context.args:
+        await update.message.reply_text("Usage: /analyze BTC or /analyze ETH")
+        return
+    
+    symbol_input = context.args[0].upper()
+    symbol = f"{symbol_input}-PERPETUAL"
+    
+    if symbol not in SYMBOLS:
+        await update.message.reply_text(f"❌ Invalid symbol. Use: BTC or ETH")
+        return
+    
+    await update.message.reply_text(f"🔍 Analyzing {symbol}...")
+    
+    try:
+        analysis = TradeAnalyzer.analyze_setup(symbol)
+        
+        if not analysis.get('valid'):
+            await update.message.reply_text(f"❌ Cannot analyze {symbol}: {analysis.get('reason', 'Unknown error')}")
+            return
+        
+        ai_result = TradeAnalyzer.get_ai_analysis(analysis)
+        
+        analysis['trade_signal'] = ai_result['signal']
+        analysis['entry_price'] = ai_result.get('entry')
+        analysis['sl_price'] = ai_result.get('sl')
+        analysis['target_price'] = ai_result.get('target')
+        analysis['trade_type'] = ai_result.get('pattern', 'Analysis')
+        
+        chart_buf = ChartGenerator.create_chart(analysis['df_30m'], analysis, symbol)
+        
+        patterns_text = ", ".join([p['name'] for p in analysis['patterns']]) if analysis['patterns'] else "None"
+        
+        message = f"""📊 **{symbol} Analysis**
+
+💰 Price: ${analysis['current_price']:.2f}
+📈 Patterns: {patterns_text}
+📊 Volume: {analysis['volume_ratio']}x avg
+🔄 OI: {analysis['oi_trend']['trend']} ({analysis['oi_trend']['change']:+.1f}%)
+
+🤖 **AI Signal:** {ai_result['signal']}
+💡 {ai_result.get('reason', 'No reason provided')}
+"""
+        
+        await context.bot.send_photo(
+            chat_id=update.effective_chat.id,
+            photo=chart_buf,
+            caption=message,
+            parse_mode='Markdown'
+        )
         
     except Exception as e:
-        print(f"❌ Failed to send scan summary: {e}")
+        logger.error(f"❌ Error in analyze command: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ Error analyzing {symbol}: {str(e)}")
 
-def scan_coin(symbol, timeframe):
-    """Complete scan workflow for one coin"""
-    print(f"\n🔍 Scanning {symbol} on {timeframe}...")
+def main():
+    """Main function"""
+    logger.info("="*80)
+    logger.info("🚀 INITIALIZING CRYPTO TRADING BOT")
+    logger.info("="*80)
     
-    # 1. Fetch data
-    df = fetch_candlestick_data(symbol, timeframe)
-    if df is None or len(df) < 100:
-        print(f"❌ {symbol} {timeframe}: Data fetch failed")
-        return {"error": "Data fetch failed"}
+    if not TELEGRAM_TOKEN or not OPENAI_API_KEY or not CHAT_ID:
+        logger.error("❌ Missing required environment variables!")
+        logger.error("Required: TELEGRAM_BOT_TOKEN, OPENAI_API_KEY, TELEGRAM_CHAT_ID")
+        return
     
-    # 2. Calculate S/R levels and swing points
-    support_levels, resistance_levels, swing_highs, swing_lows = identify_support_resistance(df)
-    print(f"📊 {symbol} {timeframe}: Support={[f'${s:.2f}' for s in support_levels[:2]]}, Resistance={[f'${r:.2f}' for r in resistance_levels[:2]]}")
+    logger.info("✅ Environment variables validated")
     
-    # 3. GPT-4o Mini Deep Analysis
-    analysis = analyze_with_gpt(df, symbol, timeframe, support_levels, resistance_levels, swing_highs, swing_lows)
+    try:
+        redis_client.ping()
+        logger.info("✅ Redis connected successfully")
+    except Exception as e:
+        logger.error(f"❌ Redis connection failed: {e}")
+        logger.warning("⚠️ Bot will continue but OI tracking may not work properly")
     
-    # 4. Parse GPT response
-    gpt_data = parse_gpt_analysis(analysis)
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
+    trading_bot = TradingBot()
+    application.bot_data['trading_bot'] = trading_bot
     
-    # Log the result
-    if gpt_data['signal'] == "NO TRADE":
-        print(f"⚪ {symbol} {timeframe}: NO TRADE - No clear setup found")
+    logger.info("✅ Trading bot instance created")
+    
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("status", status))
+    application.add_handler(CommandHandler("scan", scan_now))
+    application.add_handler(CommandHandler("analyze", analyze_symbol))
+    
+    logger.info("✅ Command handlers registered")
+    
+    job_queue = application.job_queue
+    if job_queue:
+        job_queue.run_repeating(
+            trading_bot.scan_markets,
+            interval=1800,
+            first=10
+        )
+        logger.info("✅ Job queue configured - scanning every 30 mins")
+        
+        job_queue.run_once(
+            trading_bot.send_startup_alert,
+            when=2
+        )
+        logger.info("✅ Startup alert scheduled")
     else:
-        print(f"{'🟢' if gpt_data['signal'] == 'LONG' else '🔴'} {symbol} {timeframe}: **{gpt_data['signal']} SIGNAL CONFIRMED!**")
-        print(f"   📊 Chart Pattern: {gpt_data['chart_pattern']}")
-        print(f"   🕯️ Candlestick: {gpt_data['candlestick_pattern']}")
-        print(f"   📈 Trend: {gpt_data['trendline']}")
-        
-        # Extract trade details
-        for line in analysis.split('\n'):
-            if any(keyword in line.upper() for keyword in ['ENTRY', 'STOP', 'TAKE', 'RISK']):
-                print(f"   {line.strip()}")
+        logger.error("❌ Job queue not available!")
     
-    # 5. Generate enhanced chart
-    chart_img = draw_enhanced_chart(df, symbol, timeframe, support_levels, resistance_levels, gpt_data)
+    logger.info("="*80)
+    logger.info("🚀 BOT STARTING...")
+    logger.info(f"📊 Tracking: {', '.join(SYMBOLS)}")
+    logger.info(f"⏱ Scan interval: 30 minutes")
+    logger.info(f"📈 Candles per TF: {CANDLE_COUNT}")
+    logger.info(f"🎯 Max trades per day: {MAX_TRADES_PER_DAY}")
+    logger.info("="*80)
     
-    # 6. Send Telegram Alert
-    if gpt_data['signal'] in ["LONG", "SHORT"]:
-        chart_img_copy = BytesIO(chart_img.getvalue())
-        send_telegram_alert(symbol, timeframe, analysis, df['close'].iloc[-1], gpt_data, chart_img_copy)
-    
-    result = {
-        "symbol": symbol,
-        "timeframe": timeframe,
-        "current_price": float(df['close'].iloc[-1]),
-        "support": support_levels,
-        "resistance": resistance_levels,
-        "analysis": analysis,
-        "signal_type": gpt_data['signal'],
-        "chart_pattern": gpt_data['chart_pattern'],
-        "candlestick_pattern": gpt_data['candlestick_pattern'],
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    }
-    
-    print(f"✅ {symbol} {timeframe} scan complete!\n")
-    return result
-
-def scan_all_coins():
-    """Scan all coins on all timeframes"""
-    print("\n" + "="*80)
-    print(f"🚀 STARTING FULL SCAN CYCLE - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("="*80)
-    print(f"📊 Total Scans: {len(COINS)} coins × {len(TIMEFRAMES)} timeframes = {len(COINS) * len(TIMEFRAMES)} scans")
-    print(f"🧠 Using: GPT-4o Mini for deep price action analysis")
-    print("="*80 + "\n")
-    
-    results = {}
-    signal_count = {"LONG": 0, "SHORT": 0, "NO TRADE": 0}
-    signal_details = {"LONG": [], "SHORT": []}
-    
-    for coin in COINS:
-        for tf in TIMEFRAMES:
-            key = f"{coin}_{tf}"
-            try:
-                result = scan_coin(coin, tf)
-                results[key] = result
-                latest_signals[key] = result
-                
-                if "signal_type" in result:
-                    signal_count[result["signal_type"]] += 1
-                    
-                    if result["signal_type"] in ["LONG", "SHORT"]:
-                        signal_details[result["signal_type"]].append(f"{coin} ({tf})")
-                
-                time.sleep(2)
-            except Exception as e:
-                print(f"❌ Error scanning {key}: {e}")
-                results[key] = {"error": str(e)}
-    
-    print("\n" + "="*80)
-    print("📈 SCAN CYCLE COMPLETE - SUMMARY")
-    print("="*80)
-    print(f"🟢 LONG Signals:     {signal_count['LONG']}")
-    print(f"🔴 SHORT Signals:    {signal_count['SHORT']}")
-    print(f"⚪ NO TRADE:         {signal_count['NO TRADE']}")
-    print(f"✅ Total Processed:  {sum(signal_count.values())}")
-    print(f"⏰ Completed At:     {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"⏱️  Next Scan In:     1 hour")
-    print("="*80 + "\n")
-    
-    send_scan_summary(signal_count, signal_details)
-    
-    return results
-
-# Flask Routes
-@app.route('/')
-def home():
-    html = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Pure Price Action Bot - GPT-4o Mini</title>
-        <style>
-            body { font-family: Arial; margin: 20px; background: #1a1a1a; color: #fff; }
-            h1 { color: #4CAF50; }
-            .signal { background: #2d2d2d; padding: 15px; margin: 10px 0; border-radius: 8px; }
-            .long { border-left: 4px solid #4CAF50; }
-            .short { border-left: 4px solid #f44336; }
-            .no-trade { border-left: 4px solid #888; opacity: 0.6; }
-            pre { background: #000; padding: 10px; overflow-x: auto; font-size: 12px; }
-            button { background: #4CAF50; color: white; padding: 10px 20px; border: none; 
-                     border-radius: 5px; cursor: pointer; font-size: 16px; margin: 5px; }
-            button:hover { background: #45a049; }
-            .stats { display: flex; gap: 20px; margin: 20px 0; }
-            .stat-box { background: #2d2d2d; padding: 15px; border-radius: 8px; flex: 1; text-align: center; }
-            .stat-box h3 { margin: 0; font-size: 32px; }
-            .stat-box p { margin: 5px 0; color: #888; }
-            .pattern-tag { display: inline-block; background: #333; padding: 5px 10px; 
-                          border-radius: 5px; margin: 5px; font-size: 11px; }
-        </style>
-    </head>
-    <body>
-        <h1>🤖 Pure Price Action Trading Bot</h1>
-        <p>🧠 Powered by GPT-4o Mini AI Analysis</p>
-        <p>Scanning: """ + ", ".join(COINS) + """</p>
-        <p>Timeframes: """ + ", ".join(TIMEFRAMES) + """</p>
-        <button onclick="location.reload()">🔄 Refresh</button>
-        <button onclick="manualScan()">▶️ Manual Scan</button>
-        
-        <div class="stats" id="stats"></div>
-        <hr>
-        <div id="signals"></div>
-        
-        <script>
-            async function loadSignals() {
-                const res = await fetch('/signals');
-                const data = await res.json();
-                const div = document.getElementById('signals');
-                const statsDiv = document.getElementById('stats');
-                
-                let longCount = 0, shortCount = 0, noTradeCount = 0;
-                div.innerHTML = '';
-                
-                for (const [key, signal] of Object.entries(data)) {
-                    if (signal.error) continue;
-                    
-                    let signalClass = 'no-trade';
-                    if (signal.signal_type === 'LONG') { signalClass = 'long'; longCount++; }
-                    else if (signal.signal_type === 'SHORT') { signalClass = 'short'; shortCount++; }
-                    else { noTradeCount++; }
-                    
-                    let patterns = '';
-                    if (signal.chart_pattern && signal.chart_pattern !== 'None') {
-                        patterns += `<span class="pattern-tag">📊 ${signal.chart_pattern}</span>`;
-                    }
-                    if (signal.candlestick_pattern && signal.candlestick_pattern !== 'None') {
-                        patterns += `<span class="pattern-tag">🕯️ ${signal.candlestick_pattern}</span>`;
-                    }
-                    
-                    div.innerHTML += `
-                        <div class="signal ${signalClass}">
-                            <h3>${signal.symbol} (${signal.timeframe}) - $${signal.current_price.toFixed(2)} - ${signal.signal_type}</h3>
-                            <div>${patterns}</div>
-                            <p><small>${signal.timestamp}</small></p>
-                            <pre>${signal.analysis}</pre>
-                        </div>
-                    `;
-                }
-                
-                statsDiv.innerHTML = `
-                    <div class="stat-box" style="border-left: 4px solid #4CAF50;">
-                        <h3>🟢 ${longCount}</h3>
-                        <p>LONG Signals</p>
-                    </div>
-                    <div class="stat-box" style="border-left: 4px solid #f44336;">
-                        <h3>🔴 ${shortCount}</h3>
-                        <p>SHORT Signals</p>
-                    </div>
-                    <div class="stat-box" style="border-left: 4px solid #888;">
-                        <h3>⚪ ${noTradeCount}</h3>
-                        <p>NO TRADE</p>
-                    </div>
-                `;
-            }
-            
-            async function manualScan() {
-                if (!confirm('Start manual scan? This will take 2-3 minutes.')) return;
-                document.body.style.opacity = '0.5';
-                await fetch('/manual-scan');
-                document.body.style.opacity = '1';
-                alert('Scan complete!');
-                location.reload();
-            }
-            
-            loadSignals();
-            setInterval(loadSignals, 60000);
-        </script>
-    </body>
-    </html>
-    """
-    return render_template_string(html)
-
-@app.route('/signals')
-def get_signals():
-    return jsonify(latest_signals)
-
-@app.route('/manual-scan')
-def manual_scan():
-    scan_all_coins()
-    return jsonify({"status": "complete"})
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
-    print("\n" + "="*80)
-    print("🤖 PURE PRICE ACTION TRADING BOT")
-    print("🧠 POWERED BY GPT-4o MINI AI ANALYSIS")
-    print("="*80)
-    print(f"⏰ Start Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"📊 Monitoring: {len(COINS)} coins × {len(TIMEFRAMES)} timeframes = {len(COINS) * len(TIMEFRAMES)} scans")
-    print(f"🔄 Scan Frequency: Every 1 hour")
-    print(f"📱 Telegram: {'✅ Configured' if bot else '❌ Not configured'}")
-    print("="*80 + "\n")
-    
-    send_startup_message()
-    
-    scheduler = BackgroundScheduler()
-    scheduler.add_job(scan_all_coins, 'interval', hours=1)
-    scheduler.start()
-    
-    print("🚀 Running initial scan...\n")
-    scan_all_coins()
-    
-    port = int(os.getenv('PORT', 5000))
-    print(f"\n🌐 Starting Flask server on port {port}...\n")
-    app.run(host='0.0.0.0', port=port, debug=False)
+    main()

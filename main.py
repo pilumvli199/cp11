@@ -7,26 +7,20 @@ import pandas as pd
 import mplfinance as mpf
 from telegram import Bot
 from telegram.ext import Application, CommandHandler, ContextTypes
-import google.generativeai as genai
 from PIL import Image
 
 # ==================== CONFIG ====================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY")
 
-# Top 10 Altcoins for futures data + BTC/ETH for options
-ALTCOINS = ["SOL", "DOGE", "MATIC", "AVAX", "LINK", "UNI", "SHIB", "XRP", "LTC", "BCH"]
-OPTIONS_COINS = ["BTC", "ETH"]  # Only these have options on Deribit
+# Only working coins on Deribit
+ALTCOINS = ["SOL"]  # Only SOL perpetual works
+OPTIONS_COINS = ["BTC", "ETH"]  # These have options
 ALL_COINS = OPTIONS_COINS + ALTCOINS
 
-SCAN_INTERVAL = 300  # 5 minutes = 300 seconds
-GEMINI_MODEL = "gemini-1.5-flash-latest"
+SCAN_INTERVAL = 300  # 5 minutes
 
-# ==================== GEMINI DISABLED ====================
-# Gemini analysis disabled - only data alerts
-gemini_model = None
-print("ℹ️ Gemini analysis disabled - Data-only mode")
+print("ℹ️ Data-only mode - No AI analysis")
 
 # ==================== DERIBIT DATA FETCH ====================
 async def fetch_deribit_candles(session, symbol, timeframe="60", count=720):
@@ -84,8 +78,8 @@ async def fetch_order_book(session, symbol):
             if data.get("result"):
                 result = data["result"]
                 return {
-                    'bids': result.get('bids', [])[:5],  # Top 5 bids
-                    'asks': result.get('asks', [])[:5],  # Top 5 asks
+                    'bids': result.get('bids', [])[:5],
+                    'asks': result.get('asks', [])[:5],
                     'best_bid': result.get('best_bid_price', 0),
                     'best_ask': result.get('best_ask_price', 0),
                     'spread': result.get('best_ask_price', 0) - result.get('best_bid_price', 0)
@@ -110,11 +104,9 @@ async def fetch_funding_rate(session, symbol):
             data = await response.json()
             
             if data.get("result"):
-                # Get latest funding rate
                 rates = data["result"]
                 if rates:
-                    latest = rates[-1]
-                    return latest
+                    return rates[-1]
             return None
     except Exception as e:
         print(f"❌ Error fetching funding rate: {e}")
@@ -215,7 +207,7 @@ def create_chart(df, symbol, chart_type="perpetual"):
     
     title = f"{symbol}-PERPETUAL | Last 30 Days (1H)"
     if chart_type == "options":
-        title = f"{symbol} Options Analysis | Last 30 Days (1H)"
+        title = f"{symbol} Options + Perpetual | Last 30 Days (1H)"
     
     try:
         mpf.plot(
@@ -261,7 +253,7 @@ def format_altcoin_data(symbol, ticker, order_book, funding):
     # Funding Rate
     if ticker and ticker.get('funding_8h'):
         funding_rate = ticker['funding_8h'] * 100
-        funding_annual = funding_rate * 365 * 3  # 8h intervals
+        funding_annual = funding_rate * 365 * 3
         msg += f"💸 **Funding Rate:**\n"
         msg += f"   Current (8h): {funding_rate:.4f}%\n"
         msg += f"   Annualized: {funding_annual:.2f}%\n\n"
@@ -323,51 +315,13 @@ def format_options_data(options_df, current_price, symbol):
     
     return msg
 
-# ==================== GEMINI ANALYSIS ====================
-def analyze_chart_with_gemini(chart_file, ohlc_data, symbol, market_data):
-    """Analyze chart with Gemini AI"""
-    if not gemini_model:
-        return "Gemini model not initialized."
-        
-    prompt = f"""
-Analyze {symbol} chart and market data.
-
-**Last 10 Candles (1H):**
-{ohlc_data.tail(10).to_string()}
-
-**Market Data:**
-{market_data[:800]}
-
-**Provide:**
-1. Key Support & Resistance
-2. Trend Analysis
-3. Patterns detected
-4. Volume analysis
-5. Trade setup (if found)
-
-If HIGH-PROBABILITY setup: "TRADE SETUP FOUND" with Entry, SL, Target
-If no setup: "NO TRADE SETUP" with brief analysis
-
-Keep concise.
-"""
-    
-    try:
-        img = Image.open(chart_file)
-        response = gemini_model.generate_content([prompt, img])
-        return response.text
-    except Exception as e:
-        print(f"❌ Gemini error: {e}")
-        return f"Analysis failed: {str(e)}"
-
 # ==================== TELEGRAM ALERT ====================
-async def send_telegram_alert(bot, symbol, chart_file, market_data, analysis):
-    """Send complete alert to Telegram"""
+async def send_telegram_alert(bot, symbol, chart_file, market_data):
+    """Send complete alert to Telegram - Data only"""
     try:
-        # Send chart with analysis
+        # Send chart
         with open(chart_file, 'rb') as photo:
-            caption = f"📊 **{symbol} Analysis**\n\n{analysis[:900]}"
-            if len(analysis) > 900:
-                caption += "..."
+            caption = f"📊 **{symbol} Market Data**\n\n_Chart: Last 30 Days (1H)_"
             
             await bot.send_photo(
                 chat_id=TELEGRAM_CHAT_ID,
@@ -402,7 +356,7 @@ async def scan_cryptos(bot: Bot):
     try:
         await bot.send_message(
             chat_id=TELEGRAM_CHAT_ID, 
-            text=f"🚀 **Deribit Market Scanner Started!**\n\n📊 Altcoins (Perpetuals): {', '.join(ALTCOINS)}\n🎯 Options: {', '.join(OPTIONS_COINS)}\n⏰ Scan: Every {SCAN_INTERVAL//60} mins",
+            text=f"🚀 **Deribit Market Scanner Started!**\n\n📊 Coins: {', '.join(ALL_COINS)}\n⏰ Scan: Every {SCAN_INTERVAL//60} mins\n\n_Data-only mode (No AI analysis)_",
             parse_mode='Markdown'
         )
     except Exception as e:
@@ -413,7 +367,7 @@ async def scan_cryptos(bot: Bot):
     
     async with aiohttp.ClientSession() as session:
         while True:
-            # Scan Altcoins (Perpetuals)
+            # Scan Altcoins (SOL)
             for symbol in ALTCOINS:
                 print(f"\n{'='*60}")
                 print(f"🔍 Scanning {symbol} at {datetime.now().strftime('%H:%M:%S')}")
@@ -436,12 +390,8 @@ async def scan_cryptos(bot: Bot):
                 # Format data
                 market_data = format_altcoin_data(symbol, ticker, order_book, funding)
                 
-                # AI Analysis
-                print("🤖 Analyzing...")
-                analysis = analyze_chart_with_gemini(chart_file, df, symbol, market_data[:500])
-                
                 # Send alert
-                await send_telegram_alert(bot, symbol, chart_file, market_data, analysis)
+                await send_telegram_alert(bot, symbol, chart_file, market_data)
                 
                 # Cleanup
                 try:
@@ -477,12 +427,8 @@ async def scan_cryptos(bot: Bot):
                 
                 combined_data = perpetual_data + "\n\n" + options_data
                 
-                # AI Analysis
-                print("🤖 Analyzing...")
-                analysis = analyze_chart_with_gemini(chart_file, df, symbol, combined_data[:800])
-                
                 # Send alert
-                await send_telegram_alert(bot, symbol, chart_file, combined_data, analysis)
+                await send_telegram_alert(bot, symbol, chart_file, combined_data)
                 
                 # Cleanup
                 try:
@@ -499,8 +445,7 @@ async def scan_cryptos(bot: Bot):
 async def start(update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 **Deribit Market Scanner**\n\n"
-        f"📊 Altcoins: {len(ALTCOINS)} (Perpetuals)\n"
-        f"🎯 Options: BTC, ETH\n"
+        f"📊 Coins: {', '.join(ALL_COINS)}\n"
         f"⏰ Scans: Every 5 mins\n\n"
         f"Commands:\n/start /status",
         parse_mode='Markdown'
@@ -508,7 +453,7 @@ async def start(update, context: ContextTypes.DEFAULT_TYPE):
 
 async def status(update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        f"✅ Bot Running\n📊 Monitoring: {len(ALL_COINS)} coins",
+        f"✅ Bot Running\n📊 Monitoring: {', '.join(ALL_COINS)}",
         parse_mode='Markdown'
     )
 
@@ -536,7 +481,4 @@ def main():
     application.run_polling()
 
 if __name__ == "__main__":
-    if gemini_model:
-        main()
-    else:
-        print("🔴 Gemini initialization failed.")
+    main()

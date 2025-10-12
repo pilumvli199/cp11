@@ -1,385 +1,206 @@
 import os
 import time
-import asyncio
-from datetime import datetime, timedelta
-import aiohttp
-import pandas as pd
-import mplfinance as mpf
-from telegram import Bot
-from telegram.ext import Application, CommandHandler, ContextTypes
-from PIL import Image
-import json
 import base64
 from io import BytesIO
+from datetime import datetime
+import requests
+import pandas as pd
+import mplfinance as mpf
+import matplotlib.pyplot as plt
+from apscheduler.schedulers.background import BackgroundScheduler
+from openai import OpenAI
+from flask import Flask, render_template_string, jsonify
+import telebot
 
-# ==================== CONFIG ====================
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "YOUR_OPENAI_API_KEY")
+# Initialize
+app = Flask(__name__)
+client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
 
-# Binance altcoins (Perpetual futures)
-BINANCE_COINS = ["LINK", "DOGE", "XRP", "BNB", "LTC", "TRX", "ADA", "AVAX", "SOL"]
+# Coins to track
+COINS = [
+    'BTC', 'ETH', 'USDT', 'BNB', 'XRP', 
+    'SOL', 'USDC', 'TRX', 'DOGE', 'ADA',
+    'LINK', 'BCH', 'XLM', 'SUI', 'AVAX'
+]
 
-# Deribit options (BTC, ETH only)
-DERIBIT_OPTIONS = ["BTC", "ETH"]
+TIMEFRAMES = ['1h', '4h', '1d']
 
-ALL_COINS = BINANCE_COINS + DERIBIT_OPTIONS
-SCAN_INTERVAL = 3600  # 1 hour (3600 seconds)
-ANALYSIS_ACCURACY_THRESHOLD = 70  # Minimum 70% confidence
+# Store latest signals
+latest_signals = {}
 
-print("ℹ️ AI-Powered Trading Scanner: GPT-4o Mini + Vision Analysis")
-
-# ==================== BINANCE DATA FETCH ====================
-async def fetch_binance_candles(session, symbol, interval="1h", limit=1000):
-    """Fetch 4 months data from Binance using multiple requests"""
-    all_data = []
-    end_time = int(time.time() * 1000)
-    
-    for i in range(3):
-        url = "https://fapi.binance.com/fapi/v1/klines"
+def fetch_candlestick_data(symbol, timeframe='1h', limit=2800):
+    """Fetch candlestick data from Binance API (free, no auth needed)"""
+    try:
+        # Convert timeframe for Binance
+        tf_map = {'1h': '1h', '4h': '4h', '1d': '1d'}
+        interval = tf_map.get(timeframe, '1h')
+        
+        url = f'https://api.binance.com/api/v3/klines'
         params = {
-            "symbol": f"{symbol}USDT",
-            "interval": interval,
-            "limit": 1000,
-            "endTime": end_time
+            'symbol': f'{symbol}USDT',
+            'interval': interval,
+            'limit': limit
         }
         
-        try:
-            async with session.get(url, params=params) as response:
-                response.raise_for_status()
-                data = await response.json()
-                
-                if not data:
-                    break
-                
-                all_data = data + all_data
-                end_time = int(data[0][0]) - 1
-                
-                await asyncio.sleep(0.2)
-        except Exception as e:
-            print(f"❌ Binance error for {symbol}: {e}")
-            break
-    
-    if all_data:
-        df = pd.DataFrame(all_data, columns=[
+        response = requests.get(url, params=params, timeout=10)
+        data = response.json()
+        
+        # Convert to DataFrame
+        df = pd.DataFrame(data, columns=[
             'timestamp', 'open', 'high', 'low', 'close', 'volume',
             'close_time', 'quote_volume', 'trades', 'taker_buy_base',
             'taker_buy_quote', 'ignore'
         ])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        df.set_index('timestamp', inplace=True)
         
+        # Clean and convert
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         for col in ['open', 'high', 'low', 'close', 'volume']:
             df[col] = df[col].astype(float)
         
-        four_months_ago = datetime.now() - timedelta(days=120)
-        df = df[df.index >= four_months_ago]
+        df.set_index('timestamp', inplace=True)
+        df = df[['open', 'high', 'low', 'close', 'volume']]
         
-        print(f"✅ Binance: Fetched {len(df)} candles for {symbol}")
-        return df[['open', 'high', 'low', 'close', 'volume']]
+        return df
     
-    return None
-
-async def fetch_binance_ticker(session, symbol):
-    """Fetch 24h ticker data from Binance"""
-    url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
-    params = {"symbol": f"{symbol}USDT"}
-    
-    try:
-        async with session.get(url, params=params) as response:
-            response.raise_for_status()
-            data = await response.json()
-            return {
-                'last_price': float(data['lastPrice']),
-                'price_change_24h': float(data['priceChangePercent']),
-                '24h_high': float(data['highPrice']),
-                '24h_low': float(data['lowPrice']),
-                'volume_24h': float(data['volume']),
-                'volume_usd': float(data['quoteVolume'])
-            }
     except Exception as e:
-        print(f"❌ Binance ticker error: {e}")
+        print(f"Error fetching {symbol} data: {e}")
         return None
 
-async def fetch_binance_funding_rate(session, symbol):
-    """Fetch funding rate from Binance"""
-    url = "https://fapi.binance.com/fapi/v1/fundingRate"
-    params = {"symbol": f"{symbol}USDT", "limit": 1}
+def calculate_swing_points(df, window=5):
+    """Identify swing highs and lows"""
+    swing_highs = []
+    swing_lows = []
     
-    try:
-        async with session.get(url, params=params) as response:
-            response.raise_for_status()
-            data = await response.json()
-            if data:
-                return float(data[0]['fundingRate']) * 100
-    except Exception as e:
-        print(f"❌ Funding rate error: {e}")
-    return 0
-
-async def fetch_binance_open_interest(session, symbol):
-    """Fetch open interest from Binance"""
-    url = "https://fapi.binance.com/fapi/v1/openInterest"
-    params = {"symbol": f"{symbol}USDT"}
-    
-    try:
-        async with session.get(url, params=params) as response:
-            response.raise_for_status()
-            data = await response.json()
-            return float(data['openInterest'])
-    except Exception as e:
-        print(f"❌ OI error: {e}")
-    return 0
-
-# ==================== DERIBIT DATA FETCH ====================
-async def fetch_deribit_candles(session, symbol):
-    """Fetch 4 months data from Deribit"""
-    url = "https://www.deribit.com/api/v2/public/get_tradingview_chart_data"
-    
-    end_timestamp = int(time.time() * 1000)
-    start_timestamp = int((datetime.now() - timedelta(days=120)).timestamp() * 1000)
-    
-    params = {
-        "instrument_name": f"{symbol}-PERPETUAL",
-        "start_timestamp": start_timestamp,
-        "end_timestamp": end_timestamp,
-        "resolution": "60"
-    }
-    
-    try:
-        async with session.get(url, params=params) as response:
-            response.raise_for_status()
-            data = await response.json()
-            
-            if data.get("result") and data["result"].get("status") == "ok":
-                result = data["result"]
-                df = pd.DataFrame({
-                    'timestamp': pd.to_datetime(result['ticks'], unit='ms'),
-                    'open': result['open'],
-                    'high': result['high'],
-                    'low': result['low'],
-                    'close': result['close'],
-                    'volume': result['volume']
-                })
-                df.set_index('timestamp', inplace=True)
-                print(f"✅ Deribit: Fetched {len(df)} candles for {symbol}")
-                return df
-    except Exception as e:
-        print(f"❌ Deribit candles error: {e}")
-    return None
-
-async def fetch_deribit_ticker(session, symbol):
-    """Fetch ticker from Deribit"""
-    url = "https://www.deribit.com/api/v2/public/ticker"
-    params = {"instrument_name": f"{symbol}-PERPETUAL"}
-    
-    try:
-        async with session.get(url, params=params) as response:
-            response.raise_for_status()
-            data = await response.json()
-            
-            if data.get("result"):
-                result = data["result"]
-                return {
-                    'last_price': result.get('last_price', 0),
-                    'mark_price': result.get('mark_price', 0),
-                    'index_price': result.get('index_price', 0),
-                    'volume_24h': result.get('stats', {}).get('volume', 0),
-                    'volume_usd': result.get('stats', {}).get('volume_usd', 0),
-                    'open_interest': result.get('open_interest', 0),
-                    'funding_8h': result.get('funding_8h', 0),
-                    '24h_high': result.get('stats', {}).get('high', 0),
-                    '24h_low': result.get('stats', {}).get('low', 0),
-                    'price_change_24h': result.get('stats', {}).get('price_change', 0)
-                }
-    except Exception as e:
-        print(f"❌ Deribit ticker error: {e}")
-    return None
-
-# ==================== CHART GENERATION ====================
-def create_chart(df, symbol, source="Binance"):
-    """Create ultra-wide HD candlestick chart"""
-    chart_file = f"chart_{symbol}_{int(time.time())}.png"
-    
-    mc = mpf.make_marketcolors(
-        up='#26a69a', down='#ef5350', 
-        edge='inherit', 
-        wick={'up':'#26a69a', 'down':'#ef5350'}, 
-        volume='in', alpha=0.9
-    )
-    
-    s = mpf.make_mpf_style(
-        marketcolors=mc, gridstyle='-', 
-        gridcolor='#e0e0e0', gridaxis='both',
-        facecolor='white', figcolor='white',
-        edgecolor='#cccccc', 
-        rc={'font.size': 12, 'axes.linewidth': 1.5},
-        y_on_right=True
-    )
-    
-    title = f"{symbol}USDT ({source}) | Last 4 Months (1H) | {len(df)} Candles"
-    
-    try:
-        mpf.plot(
-            df, type='candle', style=s, title=title,
-            ylabel='Price (USDT)', volume=True, 
-            savefig=dict(fname=chart_file, dpi=150, bbox_inches='tight'),
-            figsize=(32, 14),
-            warn_too_much_data=len(df)+1
-        )
-        print(f"✅ Chart created: {chart_file}")
-        return chart_file
-    except Exception as e:
-        print(f"❌ Chart error: {e}")
-    return None
-
-# ==================== TECHNICAL INDICATORS ====================
-def calculate_technical_indicators(df):
-    """Calculate technical indicators for analysis"""
-    try:
-        # Moving Averages
-        df['SMA_20'] = df['close'].rolling(window=20).mean()
-        df['SMA_50'] = df['close'].rolling(window=50).mean()
-        df['SMA_200'] = df['close'].rolling(window=200).mean()
+    for i in range(window, len(df) - window):
+        # Swing High
+        if df['high'].iloc[i] == df['high'].iloc[i-window:i+window+1].max():
+            swing_highs.append((df.index[i], df['high'].iloc[i]))
         
-        # RSI
-        delta = df['close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / loss
-        df['RSI'] = 100 - (100 / (1 + rs))
-        
-        # MACD
-        exp1 = df['close'].ewm(span=12, adjust=False).mean()
-        exp2 = df['close'].ewm(span=26, adjust=False).mean()
-        df['MACD'] = exp1 - exp2
-        df['MACD_signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
-        
-        # Bollinger Bands
-        df['BB_middle'] = df['close'].rolling(window=20).mean()
-        bb_std = df['close'].rolling(window=20).std()
-        df['BB_upper'] = df['BB_middle'] + (bb_std * 2)
-        df['BB_lower'] = df['BB_middle'] - (bb_std * 2)
-        
-        # Support & Resistance
-        recent_data = df.tail(100)
-        df['support'] = recent_data['low'].min()
-        df['resistance'] = recent_data['high'].max()
-        
-        return df
-    except Exception as e:
-        print(f"❌ Indicator calculation error: {e}")
-        return df
-
-def prepare_analysis_data(df, ticker, funding_rate, oi, symbol):
-    """Prepare comprehensive data for AI analysis"""
-    df = calculate_technical_indicators(df)
+        # Swing Low
+        if df['low'].iloc[i] == df['low'].iloc[i-window:i+window+1].min():
+            swing_lows.append((df.index[i], df['low'].iloc[i]))
     
-    latest = df.iloc[-1]
-    prev = df.iloc[-2]
+    return swing_highs, swing_lows
+
+def identify_support_resistance(df, num_levels=3):
+    """Find key support and resistance levels"""
+    swing_highs, swing_lows = calculate_swing_points(df)
     
-    analysis_data = {
-        "symbol": symbol,
-        "timestamp": datetime.now().isoformat(),
-        "current_price": float(latest['close']),
-        "price_change_24h": ticker['price_change_24h'] if ticker else 0,
-        "volume_24h": ticker['volume_usd'] if ticker else 0,
-        "funding_rate": funding_rate,
-        "open_interest": oi,
-        
-        "technical_indicators": {
-            "sma_20": float(latest['SMA_20']) if pd.notna(latest['SMA_20']) else None,
-            "sma_50": float(latest['SMA_50']) if pd.notna(latest['SMA_50']) else None,
-            "sma_200": float(latest['SMA_200']) if pd.notna(latest['SMA_200']) else None,
-            "rsi": float(latest['RSI']) if pd.notna(latest['RSI']) else None,
-            "macd": float(latest['MACD']) if pd.notna(latest['MACD']) else None,
-            "macd_signal": float(latest['MACD_signal']) if pd.notna(latest['MACD_signal']) else None,
-            "bb_upper": float(latest['BB_upper']) if pd.notna(latest['BB_upper']) else None,
-            "bb_lower": float(latest['BB_lower']) if pd.notna(latest['BB_lower']) else None,
-            "support": float(latest['support']) if pd.notna(latest['support']) else None,
-            "resistance": float(latest['resistance']) if pd.notna(latest['resistance']) else None
-        },
-        
-        "candlestick_data": {
-            "last_10_candles": df[['open', 'high', 'low', 'close', 'volume']].tail(10).to_dict('records')
-        }
-    }
+    # Get recent swing points (last 50)
+    recent_highs = [price for _, price in swing_highs[-50:]]
+    recent_lows = [price for _, price in swing_lows[-50:]]
     
-    return analysis_data
+    # Cluster nearby levels
+    resistance_levels = []
+    support_levels = []
+    
+    if recent_highs:
+        resistance_levels = sorted(set(recent_highs), reverse=True)[:num_levels]
+    
+    if recent_lows:
+        support_levels = sorted(set(recent_lows))[:num_levels]
+    
+    return support_levels, resistance_levels
 
-# ==================== GPT-4O MINI VISION ANALYSIS ====================
-async def analyze_with_gpt4o_mini(chart_file, analysis_data, session):
-    """Analyze chart using GPT-4o Mini Vision"""
-    try:
-        # Convert image to base64
-        with open(chart_file, 'rb') as image_file:
-            image_data = base64.b64encode(image_file.read()).decode('utf-8')
-        
-        # Prepare prompt
-        prompt = f"""You are an expert crypto trader analyzing {analysis_data['symbol']}USDT.
+def draw_chart(df, symbol, timeframe, support_levels, resistance_levels):
+    """Generate candlestick chart with S/R levels"""
+    
+    # Take last 200 candles for chart
+    df_chart = df.tail(200).copy()
+    
+    # Create plot
+    fig, ax = plt.subplots(figsize=(16, 10))
+    
+    # Plot candlesticks
+    mpf.plot(df_chart, type='candle', style='charles', ax=ax, 
+             volume=False, ylabel='Price', warn_too_much_data=9999)
+    
+    # Add support levels (green)
+    for level in support_levels:
+        ax.axhline(y=level, color='green', linestyle='--', linewidth=1.5, alpha=0.7, label=f'Support: {level:.2f}')
+    
+    # Add resistance levels (red)
+    for level in resistance_levels:
+        ax.axhline(y=level, color='red', linestyle='--', linewidth=1.5, alpha=0.7, label=f'Resistance: {level:.2f}')
+    
+    ax.set_title(f'{symbol} - {timeframe} Timeframe | Pure Price Action Analysis', fontsize=16, fontweight='bold')
+    ax.legend(loc='upper left', fontsize=9)
+    ax.grid(True, alpha=0.3)
+    
+    # Save to bytes
+    buf = BytesIO()
+    plt.tight_layout()
+    plt.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+    buf.seek(0)
+    plt.close()
+    
+    return buf
 
-**CURRENT DATA:**
-- Price: ${analysis_data['current_price']:,.2f}
-- 24h Change: {analysis_data['price_change_24h']:.2f}%
-- Volume (24h): ${analysis_data['volume_24h']:,.0f}
-- Funding Rate: {analysis_data['funding_rate']:.4f}%
-- Open Interest: {analysis_data['open_interest']:,.2f}
+def analyze_with_gpt(chart_image, candlestick_data, symbol, timeframe, support_levels, resistance_levels):
+    """Send chart and data to GPT-4o Mini for analysis"""
+    
+    # Encode image
+    img_base64 = base64.b64encode(chart_image.read()).decode('utf-8')
+    
+    # Prepare recent candles text
+    recent_candles = candlestick_data.tail(20).to_dict('records')
+    candles_text = "\n".join([
+        f"Time: {i}, O:{c['open']:.2f}, H:{c['high']:.2f}, L:{c['low']:.2f}, C:{c['close']:.2f}"
+        for i, c in enumerate(recent_candles)
+    ])
+    
+    prompt = f"""You are a professional pure price action trader analyzing {symbol} on {timeframe} timeframe.
 
-**TECHNICAL INDICATORS:**
-{json.dumps(analysis_data['technical_indicators'], indent=2)}
+**CHART DATA:**
+- Current Price: {candlestick_data['close'].iloc[-1]:.2f}
+- Support Levels: {support_levels}
+- Resistance Levels: {resistance_levels}
+
+**RECENT CANDLESTICKS (Last 20):**
+{candles_text}
+
+**TRADING RULES - STRICT PRICE ACTION ONLY:**
+
+1. **CANDLESTICK PATTERNS (Reversal Signals):**
+   - Bullish: Hammer, Bullish Engulfing, Morning Star, Piercing Pattern
+   - Bearish: Shooting Star, Bearish Engulfing, Evening Star, Dark Cloud Cover
+
+2. **CHART PATTERNS:**
+   - Reversal: Head & Shoulders, Double Top/Bottom, V-Reversal
+   - Continuation: Flags, Triangles, Channels
+
+3. **MARKET STRUCTURE:**
+   - Uptrend: Higher Highs + Higher Lows
+   - Downtrend: Lower Highs + Lower Lows
+   - Range: Bouncing between S/R
+
+4. **ENTRY RULES:**
+   - LONG: Bullish reversal pattern AT support + rejection wick
+   - SHORT: Bearish reversal pattern AT resistance + rejection wick
+   - Avoid choppy/ranging markets without clear setup
+
+5. **EXIT RULES:**
+   - Take profit at next S/R level
+   - Exit if opposite pattern forms
+   - Trail stop below recent swing low (long) or above swing high (short)
 
 **YOUR TASK:**
-Analyze the attached 4-month chart and provide:
+Analyze the chart image and recent price action. Give:
+1. Market Structure (trend/range)
+2. Key Pattern Identified (if any)
+3. Trade Signal: LONG / SHORT / NO TRADE
+4. Entry Price & Reason
+5. Stop Loss Level
+6. Take Profit Target
+7. Risk/Reward Ratio
 
-1. **Candlestick Patterns:** Identify key patterns (Doji, Hammer, Engulfing, etc.)
-2. **Chart Patterns:** Head & Shoulders, Double Top/Bottom, Triangles, Flags, Wedges
-3. **Price Action:** Trend direction, momentum, breakouts
-4. **Support & Resistance:** Key levels with exact prices
-5. **Trend Lines:** Draw trend lines and identify channels
+Be conservative. Only signal high-probability setups. If no clear setup, say NO TRADE.
+"""
 
-**TRADING SIGNALS:**
-- **SHORT TERM (1-7 days):** Entry, Stop Loss, Take Profit, Position Size
-- **MEDIUM TERM (1-4 weeks):** Entry, Stop Loss, Take Profit, Position Size
-
-**CONFIDENCE SCORE:** Rate your analysis accuracy from 0-100%
-
-**OUTPUT FORMAT (JSON):**
-{{
-  "confidence_score": 85,
-  "trend": "BULLISH/BEARISH/NEUTRAL",
-  "candlestick_patterns": ["pattern1", "pattern2"],
-  "chart_patterns": ["pattern1", "pattern2"],
-  "support_levels": [12.50, 11.80],
-  "resistance_levels": [14.20, 15.00],
-  "short_term_trade": {{
-    "signal": "LONG/SHORT/NONE",
-    "entry": 13.50,
-    "stop_loss": 12.80,
-    "take_profit": 15.20,
-    "risk_reward": 2.5,
-    "position_size": "2-3%"
-  }},
-  "medium_term_trade": {{
-    "signal": "LONG/SHORT/NONE",
-    "entry": 13.00,
-    "stop_loss": 11.50,
-    "take_profit": 17.00,
-    "risk_reward": 3.0,
-    "position_size": "5-7%"
-  }},
-  "reasoning": "Detailed explanation of your analysis"
-}}
-
-IMPORTANT: Only provide trades if confidence >= 70%. Be conservative."""
-
-        # Call OpenAI API
-        headers = {
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "Content-Type": "application/json"
-        }
-        
-        payload = {
-            "model": "gpt-4o-mini",
-            "messages": [
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
                 {
                     "role": "user",
                     "content": [
@@ -387,256 +208,163 @@ IMPORTANT: Only provide trades if confidence >= 70%. Be conservative."""
                         {
                             "type": "image_url",
                             "image_url": {
-                                "url": f"data:image/png;base64,{image_data}"
+                                "url": f"data:image/png;base64,{img_base64}"
                             }
                         }
                     ]
                 }
             ],
-            "max_tokens": 2000,
-            "temperature": 0.3
-        }
-        
-        async with session.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers=headers,
-            json=payload
-        ) as response:
-            response.raise_for_status()
-            result = await response.json()
-            
-            ai_response = result['choices'][0]['message']['content']
-            
-            # Extract JSON from response
-            if "```json" in ai_response:
-                json_str = ai_response.split("```json")[1].split("```")[0].strip()
-            else:
-                json_str = ai_response
-            
-            analysis_result = json.loads(json_str)
-            print(f"✅ AI Analysis completed for {analysis_data['symbol']}")
-            return analysis_result
-            
-    except Exception as e:
-        print(f"❌ GPT-4o Mini analysis error: {e}")
-        return None
-
-# ==================== TELEGRAM ALERT ====================
-async def send_trade_alert(bot, symbol, analysis_result, chart_file):
-    """Send trading alert if confidence >= 70%"""
-    try:
-        confidence = analysis_result.get('confidence_score', 0)
-        
-        if confidence < ANALYSIS_ACCURACY_THRESHOLD:
-            print(f"⚠️ {symbol}: Confidence {confidence}% < 70%, skipping alert")
-            return
-        
-        # Send chart
-        with open(chart_file, 'rb') as photo:
-            await bot.send_photo(
-                chat_id=TELEGRAM_CHAT_ID,
-                photo=photo,
-                caption=f"🤖 **AI Trading Signal: {symbol}**\n📊 Confidence: {confidence}%"
-            )
-        
-        # Format alert message
-        msg = f"🎯 **{symbol} TRADING SIGNAL**\n\n"
-        msg += f"🔮 **Confidence:** {confidence}%\n"
-        msg += f"📈 **Trend:** {analysis_result.get('trend', 'N/A')}\n\n"
-        
-        # Patterns
-        if analysis_result.get('candlestick_patterns'):
-            msg += f"🕯️ **Candlestick Patterns:**\n"
-            for pattern in analysis_result['candlestick_patterns']:
-                msg += f"   • {pattern}\n"
-            msg += "\n"
-        
-        if analysis_result.get('chart_patterns'):
-            msg += f"📊 **Chart Patterns:**\n"
-            for pattern in analysis_result['chart_patterns']:
-                msg += f"   • {pattern}\n"
-            msg += "\n"
-        
-        # Support & Resistance
-        if analysis_result.get('support_levels'):
-            msg += f"🛡️ **Support Levels:**\n"
-            for level in analysis_result['support_levels']:
-                msg += f"   • ${level:,.2f}\n"
-            msg += "\n"
-        
-        if analysis_result.get('resistance_levels'):
-            msg += f"⚔️ **Resistance Levels:**\n"
-            for level in analysis_result['resistance_levels']:
-                msg += f"   • ${level:,.2f}\n"
-            msg += "\n"
-        
-        # Short Term Trade
-        st = analysis_result.get('short_term_trade', {})
-        if st.get('signal') and st['signal'] != 'NONE':
-            msg += f"⚡ **SHORT TERM (1-7 Days):**\n"
-            msg += f"   Signal: **{st['signal']}**\n"
-            msg += f"   Entry: ${st.get('entry', 0):,.2f}\n"
-            msg += f"   Stop Loss: ${st.get('stop_loss', 0):,.2f}\n"
-            msg += f"   Take Profit: ${st.get('take_profit', 0):,.2f}\n"
-            msg += f"   Risk/Reward: {st.get('risk_reward', 0):.1f}\n"
-            msg += f"   Position: {st.get('position_size', 'N/A')}\n\n"
-        
-        # Medium Term Trade
-        mt = analysis_result.get('medium_term_trade', {})
-        if mt.get('signal') and mt['signal'] != 'NONE':
-            msg += f"📅 **MEDIUM TERM (1-4 Weeks):**\n"
-            msg += f"   Signal: **{mt['signal']}**\n"
-            msg += f"   Entry: ${mt.get('entry', 0):,.2f}\n"
-            msg += f"   Stop Loss: ${mt.get('stop_loss', 0):,.2f}\n"
-            msg += f"   Take Profit: ${mt.get('take_profit', 0):,.2f}\n"
-            msg += f"   Risk/Reward: {mt.get('risk_reward', 0):.1f}\n"
-            msg += f"   Position: {mt.get('position_size', 'N/A')}\n\n"
-        
-        # Reasoning
-        msg += f"💡 **Analysis:**\n{analysis_result.get('reasoning', 'N/A')}\n\n"
-        msg += f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        
-        # Send message
-        if len(msg) > 4000:
-            chunks = [msg[i:i+4000] for i in range(0, len(msg), 4000)]
-            for chunk in chunks:
-                await bot.send_message(
-                    chat_id=TELEGRAM_CHAT_ID,
-                    text=chunk,
-                    parse_mode='Markdown'
-                )
-        else:
-            await bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID,
-                text=msg,
-                parse_mode='Markdown'
-            )
-        
-        print(f"✅ Trade alert sent for {symbol}")
-        
-    except Exception as e:
-        print(f"❌ Alert error: {e}")
-
-# ==================== MAIN SCANNER ====================
-async def scan_cryptos(bot: Bot):
-    """Main AI scanner - runs every 1 hour"""
-    try:
-        await bot.send_message(
-            chat_id=TELEGRAM_CHAT_ID,
-            text=f"🚀 **AI Trading Scanner Started!**\n\n🤖 Model: GPT-4o Mini\n📊 Coins: {len(ALL_COINS)}\n⏰ Analysis: Every 1 hour\n🎯 Min Confidence: {ANALYSIS_ACCURACY_THRESHOLD}%",
-            parse_mode='Markdown'
+            max_tokens=1000
         )
+        
+        analysis = response.choices[0].message.content
+        return analysis
+    
     except Exception as e:
-        print(f"❌ Startup error: {e}")
+        return f"GPT Analysis Error: {e}"
+
+def scan_coin(symbol, timeframe):
+    """Complete scan workflow for one coin"""
+    print(f"\n🔍 Scanning {symbol} on {timeframe}...")
     
-    print(f"🤖 AI Scanner: {len(ALL_COINS)} coins | Every 1 hour | Min confidence: {ANALYSIS_ACCURACY_THRESHOLD}%\n")
+    # 1. Fetch data
+    df = fetch_candlestick_data(symbol, timeframe)
+    if df is None or len(df) < 100:
+        return {"error": "Data fetch failed"}
     
-    async with aiohttp.ClientSession() as session:
-        while True:
-            # Scan Binance coins
-            for symbol in BINANCE_COINS:
-                print(f"\n{'='*60}")
-                print(f"🔍 Analyzing {symbol} at {datetime.now().strftime('%H:%M:%S')}")
+    # 2. Calculate S/R levels
+    support_levels, resistance_levels = identify_support_resistance(df)
+    
+    # 3. Generate chart
+    chart_img = draw_chart(df, symbol, timeframe, support_levels, resistance_levels)
+    
+    # 4. GPT Analysis
+    chart_img_copy = BytesIO(chart_img.getvalue())
+    analysis = analyze_with_gpt(chart_img_copy, df, symbol, timeframe, support_levels, resistance_levels)
+    
+    result = {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "current_price": float(df['close'].iloc[-1]),
+        "support": support_levels,
+        "resistance": resistance_levels,
+        "analysis": analysis,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    }
+    
+    print(f"✅ {symbol} scan complete!")
+    return result
+
+def scan_all_coins():
+    """Scan all coins on all timeframes"""
+    print("\n" + "="*50)
+    print(f"🚀 Starting Full Scan - {datetime.now()}")
+    print("="*50)
+    
+    results = {}
+    
+    for coin in COINS:
+        for tf in TIMEFRAMES:
+            key = f"{coin}_{tf}"
+            try:
+                result = scan_coin(coin, tf)
+                results[key] = result
+                latest_signals[key] = result
+                time.sleep(2)  # Rate limit protection
+            except Exception as e:
+                print(f"❌ Error scanning {key}: {e}")
+                results[key] = {"error": str(e)}
+    
+    print("\n✅ Full scan completed!")
+    return results
+
+# Flask Routes
+@app.route('/')
+def home():
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Pure Price Action Bot</title>
+        <style>
+            body { font-family: Arial; margin: 20px; background: #1a1a1a; color: #fff; }
+            h1 { color: #4CAF50; }
+            .signal { background: #2d2d2d; padding: 15px; margin: 10px 0; border-radius: 8px; }
+            .long { border-left: 4px solid #4CAF50; }
+            .short { border-left: 4px solid #f44336; }
+            .no-trade { border-left: 4px solid #888; }
+            pre { background: #000; padding: 10px; overflow-x: auto; }
+            button { background: #4CAF50; color: white; padding: 10px 20px; border: none; 
+                     border-radius: 5px; cursor: pointer; font-size: 16px; }
+            button:hover { background: #45a049; }
+        </style>
+    </head>
+    <body>
+        <h1>🤖 Pure Price Action Trading Bot</h1>
+        <p>Scanning: """ + ", ".join(COINS) + """</p>
+        <p>Timeframes: """ + ", ".join(TIMEFRAMES) + """</p>
+        <button onclick="location.reload()">🔄 Refresh Signals</button>
+        <button onclick="manualScan()">▶️ Manual Scan</button>
+        <hr>
+        <div id="signals"></div>
+        
+        <script>
+            async function loadSignals() {
+                const res = await fetch('/signals');
+                const data = await res.json();
+                const div = document.getElementById('signals');
+                div.innerHTML = '';
                 
-                df = await fetch_binance_candles(session, symbol)
-                ticker = await fetch_binance_ticker(session, symbol)
-                funding = await fetch_binance_funding_rate(session, symbol)
-                oi = await fetch_binance_open_interest(session, symbol)
-                
-                if df is None or df.empty:
-                    print(f"⚠️ Skipping {symbol}")
-                    continue
-                
-                # Create chart
-                chart_file = create_chart(df, symbol, "Binance")
-                if not chart_file:
-                    continue
-                
-                # Prepare analysis data
-                analysis_data = prepare_analysis_data(df, ticker, funding, oi, symbol)
-                
-                # AI Analysis
-                analysis_result = await analyze_with_gpt4o_mini(chart_file, analysis_data, session)
-                
-                if analysis_result:
-                    await send_trade_alert(bot, symbol, analysis_result, chart_file)
-                
-                try:
-                    os.remove(chart_file)
-                except:
-                    pass
-                
-                await asyncio.sleep(10)
+                for (const [key, signal] of Object.entries(data)) {
+                    if (signal.error) continue;
+                    
+                    let signalClass = 'no-trade';
+                    if (signal.analysis.includes('LONG')) signalClass = 'long';
+                    else if (signal.analysis.includes('SHORT')) signalClass = 'short';
+                    
+                    div.innerHTML += `
+                        <div class="signal ${signalClass}">
+                            <h3>${signal.symbol} (${signal.timeframe}) - $${signal.current_price}</h3>
+                            <p><small>${signal.timestamp}</small></p>
+                            <pre>${signal.analysis}</pre>
+                        </div>
+                    `;
+                }
+            }
             
-            # Scan Deribit BTC/ETH
-            for symbol in DERIBIT_OPTIONS:
-                print(f"\n{'='*60}")
-                print(f"🎯 Analyzing {symbol} (Deribit) at {datetime.now().strftime('%H:%M:%S')}")
-                
-                df = await fetch_deribit_candles(session, symbol)
-                ticker = await fetch_deribit_ticker(session, symbol)
-                
-                if df is None or df.empty:
-                    continue
-                
-                chart_file = create_chart(df, symbol, "Deribit")
-                if not chart_file:
-                    continue
-                
-                analysis_data = prepare_analysis_data(df, ticker, 0, 0, symbol)
-                analysis_result = await analyze_with_gpt4o_mini(chart_file, analysis_data, session)
-                
-                if analysis_result:
-                    await send_trade_alert(bot, symbol, analysis_result, chart_file)
-                
-                try:
-                    os.remove(chart_file)
-                except:
-                    pass
-                
-                await asyncio.sleep(10)
+            async function manualScan() {
+                alert('Starting manual scan... This will take a few minutes.');
+                await fetch('/manual-scan');
+                alert('Scan complete! Refreshing...');
+                location.reload();
+            }
             
-            print(f"\n⏳ Next scan in 1 hour...\n")
-            await asyncio.sleep(SCAN_INTERVAL)
+            loadSignals();
+            setInterval(loadSignals, 60000); // Refresh every minute
+        </script>
+    </body>
+    </html>
+    """
+    return render_template_string(html)
 
-# ==================== TELEGRAM COMMANDS ====================
-async def start(update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🤖 **AI Crypto Trading Scanner**\n\n"
-        f"🧠 Model: GPT-4o Mini Vision\n"
-        f"📊 Coins: {len(ALL_COINS)}\n"
-        f"⏰ Analysis: Every 1 hour\n"
-        f"🎯 Min Confidence: {ANALYSIS_ACCURACY_THRESHOLD}%\n\n"
-        f"Commands: /start /status",
-        parse_mode='Markdown'
-    )
+@app.route('/signals')
+def get_signals():
+    return jsonify(latest_signals)
 
-async def status(update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        f"✅ Running | 🤖 AI Active | 📊 {len(ALL_COINS)} coins | ⏰ Every 1hr",
-        parse_mode='Markdown'
-    )
+@app.route('/manual-scan')
+def manual_scan():
+    scan_all_coins()
+    return jsonify({"status": "complete"})
 
-# ==================== POST INIT ====================
-async def post_init(application: Application):
-    print("🚀 Starting AI Trading Scanner...")
-    asyncio.create_task(scan_cryptos(application.bot))
-
-# ==================== RUN BOT ====================
-def main():
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+if __name__ == '__main__':
+    # Schedule hourly scans
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(scan_all_coins, 'interval', hours=1)
+    scheduler.start()
     
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("status", status))
-    application.post_init = post_init
+    print("🚀 Bot started! Running initial scan...")
+    scan_all_coins()
     
-    print("🤖 Starting AI Trading Bot...")
-    application.run_polling()
-
-if __name__ == "__main__":
-    main()
+    # Start Flask server
+    port = int(os.getenv('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)

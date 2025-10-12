@@ -25,36 +25,60 @@ SCAN_INTERVAL = 300  # 5 minutes
 print("ℹ️ Hybrid Mode: Binance altcoins + Deribit BTC/ETH options")
 
 # ==================== BINANCE DATA FETCH ====================
-async def fetch_binance_candles(session, symbol, interval="1h", limit=720):
-    """Fetch 1 month data from Binance (30 days * 24 hours = 720 candles)"""
-    url = "https://fapi.binance.com/fapi/v1/klines"
-    params = {
-        "symbol": f"{symbol}USDT",
-        "interval": interval,
-        "limit": limit
-    }
+async def fetch_binance_candles(session, symbol, interval="1h", limit=1000):
+    """Fetch 4 months data from Binance using multiple requests"""
+    all_data = []
+    end_time = int(time.time() * 1000)
     
-    try:
-        async with session.get(url, params=params) as response:
-            response.raise_for_status()
-            data = await response.json()
-            
-            df = pd.DataFrame(data, columns=[
-                'timestamp', 'open', 'high', 'low', 'close', 'volume',
-                'close_time', 'quote_volume', 'trades', 'taker_buy_base',
-                'taker_buy_quote', 'ignore'
-            ])
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-            df.set_index('timestamp', inplace=True)
-            
-            for col in ['open', 'high', 'low', 'close', 'volume']:
-                df[col] = df[col].astype(float)
-            
-            print(f"✅ Binance: Fetched {len(df)} candles for {symbol}")
-            return df[['open', 'high', 'low', 'close', 'volume']]
-    except Exception as e:
-        print(f"❌ Binance error for {symbol}: {e}")
-        return None
+    # 4 months = ~120 days = ~2880 hourly candles
+    # Binance allows max 1500 candles per request
+    # We'll make 2 requests to get ~2880 candles
+    
+    for i in range(3):  # 3 requests to ensure 4 months coverage
+        url = "https://fapi.binance.com/fapi/v1/klines"
+        params = {
+            "symbol": f"{symbol}USDT",
+            "interval": interval,
+            "limit": 1000,
+            "endTime": end_time
+        }
+        
+        try:
+            async with session.get(url, params=params) as response:
+                response.raise_for_status()
+                data = await response.json()
+                
+                if not data:
+                    break
+                
+                all_data = data + all_data
+                end_time = int(data[0][0]) - 1
+                
+                await asyncio.sleep(0.2)
+        except Exception as e:
+            print(f"❌ Binance error for {symbol}: {e}")
+            break
+    
+    if all_data:
+        df = pd.DataFrame(all_data, columns=[
+            'timestamp', 'open', 'high', 'low', 'close', 'volume',
+            'close_time', 'quote_volume', 'trades', 'taker_buy_base',
+            'taker_buy_quote', 'ignore'
+        ])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df.set_index('timestamp', inplace=True)
+        
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            df[col] = df[col].astype(float)
+        
+        # Keep only last 4 months
+        four_months_ago = datetime.now() - timedelta(days=120)
+        df = df[df.index >= four_months_ago]
+        
+        print(f"✅ Binance: Fetched {len(df)} candles for {symbol} (Last 4 months)")
+        return df[['open', 'high', 'low', 'close', 'volume']]
+    
+    return None
 
 async def fetch_binance_ticker(session, symbol):
     """Fetch 24h ticker data from Binance"""
@@ -87,7 +111,7 @@ async def fetch_binance_funding_rate(session, symbol):
             response.raise_for_status()
             data = await response.json()
             if data:
-                return float(data[0]['fundingRate']) * 100  # Convert to %
+                return float(data[0]['fundingRate']) * 100
     except Exception as e:
         print(f"❌ Funding rate error: {e}")
     return 0
@@ -132,11 +156,11 @@ async def fetch_binance_orderbook(session, symbol):
 
 # ==================== DERIBIT DATA FETCH ====================
 async def fetch_deribit_candles(session, symbol):
-    """Fetch 1 month data from Deribit"""
+    """Fetch 4 months data from Deribit"""
     url = "https://www.deribit.com/api/v2/public/get_tradingview_chart_data"
     
     end_timestamp = int(time.time() * 1000)
-    start_timestamp = int((datetime.now() - timedelta(days=30)).timestamp() * 1000)
+    start_timestamp = int((datetime.now() - timedelta(days=120)).timestamp() * 1000)
     
     params = {
         "instrument_name": f"{symbol}-PERPETUAL",
@@ -161,7 +185,7 @@ async def fetch_deribit_candles(session, symbol):
                     'volume': result['volume']
                 })
                 df.set_index('timestamp', inplace=True)
-                print(f"✅ Deribit: Fetched {len(df)} candles for {symbol}")
+                print(f"✅ Deribit: Fetched {len(df)} candles for {symbol} (Last 4 months)")
                 return df
     except Exception as e:
         print(f"❌ Deribit candles error: {e}")
@@ -229,7 +253,7 @@ async def fetch_deribit_options_chain(session, symbol):
 
 # ==================== CHART GENERATION ====================
 def create_chart(df, symbol, source="Binance"):
-    """Create white background chart"""
+    """Create white background chart for 4 months data"""
     chart_file = f"chart_{symbol}_{int(time.time())}.png"
     
     mc = mpf.make_marketcolors(
@@ -247,16 +271,16 @@ def create_chart(df, symbol, source="Binance"):
         y_on_right=True
     )
     
-    title = f"{symbol}USDT ({source}) | Last 30 Days (1H)"
+    title = f"{symbol}USDT ({source}) | Last 4 Months (1H)"
     
     try:
         mpf.plot(
             df, type='candle', style=s, title=title,
             ylabel='Price (USDT)', volume=True, 
-            savefig=chart_file, figsize=(16, 10),
+            savefig=chart_file, figsize=(20, 12),
             warn_too_much_data=len(df)+1, tight_layout=True
         )
-        print(f"✅ Chart created: {chart_file}")
+        print(f"✅ Chart created: {chart_file} ({len(df)} candles)")
         return chart_file
     except Exception as e:
         print(f"❌ Chart error: {e}")
@@ -372,7 +396,7 @@ async def send_telegram_alert(bot, symbol, chart_file, market_data):
     """Send alert to Telegram"""
     try:
         with open(chart_file, 'rb') as photo:
-            caption = f"📊 **{symbol} Market Data**\n_30 Days Chart (1H)_"
+            caption = f"📊 **{symbol} Market Data**\n_Last 4 Months Chart (1H)_"
             await bot.send_photo(
                 chat_id=TELEGRAM_CHAT_ID,
                 photo=photo,
@@ -380,7 +404,6 @@ async def send_telegram_alert(bot, symbol, chart_file, market_data):
                 parse_mode='Markdown'
             )
         
-        # Send data in chunks if needed
         if len(market_data) > 4000:
             chunks = [market_data[i:i+4000] for i in range(0, len(market_data), 4000)]
             for chunk in chunks:
@@ -406,13 +429,13 @@ async def scan_cryptos(bot: Bot):
     try:
         await bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
-            text=f"🚀 **Crypto Scanner Started!**\n\n📊 Binance: {', '.join(BINANCE_COINS)}\n🎯 Deribit Options: {', '.join(DERIBIT_OPTIONS)}\n⏰ Scan: Every {SCAN_INTERVAL//60} mins",
+            text=f"🚀 **Crypto Scanner Started!**\n\n📊 Binance: {', '.join(BINANCE_COINS)}\n🎯 Deribit Options: {', '.join(DERIBIT_OPTIONS)}\n⏰ Scan: Every {SCAN_INTERVAL//60} mins\n📈 Chart: Last 4 Months",
             parse_mode='Markdown'
         )
     except Exception as e:
         print(f"❌ Startup error: {e}")
     
-    print(f"📊 Monitoring {len(ALL_COINS)} coins\n")
+    print(f"📊 Monitoring {len(ALL_COINS)} coins (4 months data)\n")
     
     async with aiohttp.ClientSession() as session:
         while True:
@@ -484,13 +507,14 @@ async def start(update, context: ContextTypes.DEFAULT_TYPE):
         "🤖 **Crypto Market Scanner**\n\n"
         f"📊 Binance: {len(BINANCE_COINS)} coins\n"
         f"🎯 Deribit: BTC/ETH options\n"
-        f"⏰ Every 5 mins\n\n/start /status",
+        f"⏰ Every 5 mins\n"
+        f"📈 Chart: Last 4 Months\n\n/start /status",
         parse_mode='Markdown'
     )
 
 async def status(update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        f"✅ Running | 📊 {len(ALL_COINS)} coins",
+        f"✅ Running | 📊 {len(ALL_COINS)} coins | 📈 4 Months Data",
         parse_mode='Markdown'
     )
 

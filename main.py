@@ -14,11 +14,17 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
 
 # Only working coins on Deribit
-# Perpetuals available: BTC, ETH, SOL, USDC (only these 4!)
-# Options available: BTC, ETH only
-ALTCOINS = ["SOL", "USDC"]  # Altcoins with perpetuals
+# BTC, ETH use "-PERPETUAL", SOL uses "_USDC-PERPETUAL"
+ALTCOINS = ["SOL"]  # SOL perpetual available
 OPTIONS_COINS = ["BTC", "ETH"]  # These have options + perpetuals
 ALL_COINS = OPTIONS_COINS + ALTCOINS
+
+def get_instrument_name(symbol):
+    """Get correct instrument name for each coin"""
+    if symbol == "SOL":
+        return "SOL_USDC-PERPETUAL"  # SOL special format
+    else:
+        return f"{symbol}-PERPETUAL"  # BTC, ETH standard format
 
 SCAN_INTERVAL = 300  # 5 minutes
 
@@ -32,8 +38,10 @@ async def fetch_deribit_candles(session, symbol, timeframe="60", count=720):
     end_timestamp = int(time.time() * 1000)
     start_timestamp = int((datetime.now() - timedelta(days=30)).timestamp() * 1000)
     
+    instrument = get_instrument_name(symbol)
+    
     params = {
-        "instrument_name": f"{symbol}-PERPETUAL",
+        "instrument_name": instrument,
         "start_timestamp": start_timestamp,
         "end_timestamp": end_timestamp,
         "resolution": timeframe
@@ -67,8 +75,10 @@ async def fetch_deribit_candles(session, symbol, timeframe="60", count=720):
 async def fetch_order_book(session, symbol):
     """Fetch order book data"""
     url = "https://www.deribit.com/api/v2/public/get_order_book"
+    instrument = get_instrument_name(symbol)
+    
     params = {
-        "instrument_name": f"{symbol}-PERPETUAL",
+        "instrument_name": instrument,
         "depth": 10
     }
     
@@ -94,8 +104,10 @@ async def fetch_order_book(session, symbol):
 async def fetch_funding_rate(session, symbol):
     """Fetch funding rate"""
     url = "https://www.deribit.com/api/v2/public/get_funding_rate_value"
+    instrument = get_instrument_name(symbol)
+    
     params = {
-        "instrument_name": f"{symbol}-PERPETUAL",
+        "instrument_name": instrument,
         "start_timestamp": int((datetime.now() - timedelta(hours=8)).timestamp() * 1000),
         "end_timestamp": int(time.time() * 1000)
     }
@@ -117,7 +129,9 @@ async def fetch_funding_rate(session, symbol):
 async def fetch_ticker_data(session, symbol):
     """Fetch ticker data (volume, OI, price)"""
     url = "https://www.deribit.com/api/v2/public/ticker"
-    params = {"instrument_name": f"{symbol}-PERPETUAL"}
+    instrument = get_instrument_name(symbol)
+    
+    params = {"instrument_name": instrument}
     
     try:
         async with session.get(url, params=params) as response:
@@ -207,7 +221,7 @@ def create_chart(df, symbol, chart_type="perpetual"):
         y_on_right=True
     )
     
-    title = f"{symbol}-PERPETUAL | Last 30 Days (1H)"
+    title = f"{get_instrument_name(symbol)} | Last 30 Days (1H)"
     if chart_type == "options":
         title = f"{symbol} Options + Perpetual | Last 30 Days (1H)"
     
@@ -233,7 +247,8 @@ def create_chart(df, symbol, chart_type="perpetual"):
 # ==================== DATA FORMATTING ====================
 def format_altcoin_data(symbol, ticker, order_book, funding):
     """Format altcoin perpetual futures data"""
-    msg = f"📊 **{symbol}-PERPETUAL Market Data**\n\n"
+    instrument = get_instrument_name(symbol)
+    msg = f"📊 **{instrument} Market Data**\n\n"
     
     # Price Info
     if ticker:

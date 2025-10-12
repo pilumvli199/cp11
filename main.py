@@ -2,7 +2,6 @@ import os
 import asyncio
 import logging
 from datetime import datetime, timedelta
-import redis
 import json
 from telegram import Update, InputFile
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -18,7 +17,7 @@ from matplotlib.lines import Line2D
 import io
 from PIL import Image
 
-# Logging setup - ENHANCED
+# Logging setup
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
@@ -28,12 +27,13 @@ logger = logging.getLogger(__name__)
 # Environment variables
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
-REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379')
 CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 
-# Initialize clients
+# Initialize OpenAI client
 client = OpenAI(api_key=OPENAI_API_KEY)
-redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+
+# In-memory storage for OI data (replaces Redis)
+oi_storage = {}
 
 # Constants
 DERIBIT_BASE = "https://www.deribit.com/api/v2/public"
@@ -183,24 +183,24 @@ class TechnicalAnalyzer:
                     'timestamp': df.index[i]
                 })
         
-        # IMPROVEMENT: Filter only RECENT swings (last 50 candles range)
+        # Filter only RECENT swings (last 50 candles range)
         current_price = df['close'].iloc[-1]
         price_range = current_price * 0.05  # 5% range from current price
         
         # Filter relevant highs (within 5% above current price)
         relevant_highs = [
             s for s in swing_highs 
-            if s['index'] >= len(df) - 50 and  # Last 50 candles
-               s['price'] >= current_price and   # Above current price
-               s['price'] <= current_price * 1.05  # Within 5% above
+            if s['index'] >= len(df) - 50 and
+               s['price'] >= current_price and
+               s['price'] <= current_price * 1.05
         ]
         
         # Filter relevant lows (within 5% below current price)
         relevant_lows = [
             s for s in swing_lows 
-            if s['index'] >= len(df) - 50 and  # Last 50 candles
-               s['price'] <= current_price and   # Below current price
-               s['price'] >= current_price * 0.95  # Within 5% below
+            if s['index'] >= len(df) - 50 and
+               s['price'] <= current_price and
+               s['price'] >= current_price * 0.95
         ]
         
         # If no relevant swings, take closest ones
@@ -294,35 +294,46 @@ class TechnicalAnalyzer:
         return {'poc': None, 'high_volume_nodes': []}
 
 class OITracker:
-    """Track OI changes using Redis"""
+    """Track OI changes using in-memory storage (replaces Redis)"""
     
     @staticmethod
     def store_oi(symbol: str, oi_data: Dict):
-        """Store current OI in Redis with timestamp"""
-        key = f"oi:{symbol}:{int(datetime.now().timestamp())}"
-        redis_client.setex(key, 7200, json.dumps(oi_data))
+        """Store current OI in memory with timestamp"""
+        timestamp = int(datetime.now().timestamp())
+        key = f"{symbol}:{timestamp}"
+        
+        if symbol not in oi_storage:
+            oi_storage[symbol] = []
+        
+        oi_storage[symbol].append({
+            'timestamp': timestamp,
+            'data': oi_data
+        })
+        
+        # Clean old data (keep only last 3 hours)
+        cutoff = timestamp - (3 * 3600)
+        oi_storage[symbol] = [
+            entry for entry in oi_storage[symbol] 
+            if entry['timestamp'] >= cutoff
+        ]
+        
         logger.info(f"💾 Stored OI data for {symbol}: OI={oi_data.get('open_interest', 0):,.0f}")
     
     @staticmethod
     def get_oi_history(symbol: str, hours: int = 2) -> List[Dict]:
-        """Get OI history from Redis"""
+        """Get OI history from memory"""
         cutoff = int((datetime.now() - timedelta(hours=hours)).timestamp())
-        pattern = f"oi:{symbol}:*"
         
-        history = []
-        try:
-            keys = list(redis_client.scan_iter(match=pattern))
-            logger.info(f"📚 Found {len(keys)} OI records for {symbol}")
-            
-            for key in keys:
-                timestamp = int(key.split(':')[-1])
-                if timestamp >= cutoff:
-                    data = json.loads(redis_client.get(key))
-                    data['timestamp'] = timestamp
-                    history.append(data)
-        except Exception as e:
-            logger.error(f"❌ Redis error: {e}")
+        if symbol not in oi_storage:
+            return []
         
+        history = [
+            {**entry['data'], 'timestamp': entry['timestamp']}
+            for entry in oi_storage[symbol]
+            if entry['timestamp'] >= cutoff
+        ]
+        
+        logger.info(f"📚 Found {len(history)} OI records for {symbol}")
         return sorted(history, key=lambda x: x['timestamp'])
     
     @staticmethod
@@ -518,12 +529,10 @@ class TradeAnalyzer:
         support_4h = None
         
         if swing_highs_4h:
-            # Closest resistance above current price
             resistances = [s['price'] for s in swing_highs_4h if s['price'] >= current_price]
             resistance_4h = min(resistances) if resistances else swing_highs_4h[0]['price']
         
         if swing_lows_4h:
-            # Closest support below current price  
             supports = [s['price'] for s in swing_lows_4h if s['price'] <= current_price]
             support_4h = max(supports) if supports else swing_lows_4h[0]['price']
         
@@ -657,7 +666,7 @@ REASON: [why not]"""
                 elif 'ENTRY:' in line:
                     try:
                         entry_str = line.split('ENTRY:')[-1].strip()
-                        entry_str = entry_str.replace('$', '').replace(',', '')
+                        entry_str = entry_str.replace(', '').replace(',', '')
                         result['entry'] = float(entry_str.split()[0])
                     except:
                         result['entry'] = analysis['current_price']
@@ -665,7 +674,7 @@ REASON: [why not]"""
                 elif 'SL:' in line or 'STOP' in line:
                     try:
                         sl_str = line.split(':')[-1].strip()
-                        sl_str = sl_str.replace('$', '').replace(',', '')
+                        sl_str = sl_str.replace(', '').replace(',', '')
                         result['sl'] = float(sl_str.split()[0])
                     except:
                         pass
@@ -673,7 +682,7 @@ REASON: [why not]"""
                 elif 'TARGET:' in line:
                     try:
                         tgt_str = line.split('TARGET:')[-1].strip()
-                        tgt_str = tgt_str.replace('$', '').replace(',', '')
+                        tgt_str = tgt_str.replace(', '').replace(',', '')
                         result['target'] = float(tgt_str.split()[0])
                     except:
                         pass
@@ -865,7 +874,7 @@ class TradingBot:
 🔧 **Systems:**
 ├ ✅ Deribit API Connected
 ├ ✅ OpenAI GPT-4o mini Ready
-├ ✅ Redis OI Tracking Active
+├ ✅ In-Memory OI Tracking Active
 └ ✅ Telegram Bot Online
 
 🚀 First scan will start in 10 seconds...
@@ -911,7 +920,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"⏰ Uptime: {hours}h {minutes}m\n"
             f"📈 Trades Today: {bot.trade_count_today}/{MAX_TRADES_PER_DAY}\n"
             f"⏱ Scan Interval: 30 minutes\n"
-            f"💾 Using Redis for OI tracking\n"
+            f"💾 Using In-Memory OI tracking\n"
             f"📊 Candles per TF: {CANDLE_COUNT}\n\n"
             f"Next scan in ~30 mins",
             parse_mode='Markdown'
@@ -993,13 +1002,7 @@ def main():
         return
     
     logger.info("✅ Environment variables validated")
-    
-    try:
-        redis_client.ping()
-        logger.info("✅ Redis connected successfully")
-    except Exception as e:
-        logger.error(f"❌ Redis connection failed: {e}")
-        logger.warning("⚠️ Bot will continue but OI tracking may not work properly")
+    logger.info("✅ Using in-memory storage (Redis not required)")
     
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     trading_bot = TradingBot()
@@ -1029,12 +1032,13 @@ def main():
         )
         logger.info("✅ Startup alert scheduled")
     else:
-        logger.error("❌ Job queue not available!")
+        logger.warning("⚠️ Job queue not available - install with: pip install 'python-telegram-bot[job-queue]'")
+        logger.info("ℹ️ You can still use manual commands: /scan and /analyze")
     
     logger.info("="*80)
     logger.info("🚀 BOT STARTING...")
     logger.info(f"📊 Tracking: {', '.join(SYMBOLS)}")
-    logger.info(f"⏱ Scan interval: 30 minutes")
+    logger.info(f"⏱ Scan interval: 30 minutes (if job-queue installed)")
     logger.info(f"📈 Candles per TF: {CANDLE_COUNT}")
     logger.info(f"🎯 Max trades per day: {MAX_TRADES_PER_DAY}")
     logger.info("="*80)

@@ -1,5 +1,5 @@
 # Core dependencies
-python-telegram-bot==20.7
+python-telegram-bot[job-queue]==20.7
 aiohttp==3.9.1
 pandas==2.1.4
 mplfinance==0.12.10b0

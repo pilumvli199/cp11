@@ -32,7 +32,7 @@ async def fetch_binance_candles(session, symbol, interval="1h", limit=1000):
     
     # 4 months = ~120 days = ~2880 hourly candles
     # Binance allows max 1500 candles per request
-    # We'll make 2 requests to get ~2880 candles
+    # We'll make 3 requests to get ~3000 candles
     
     for i in range(3):  # 3 requests to ensure 4 months coverage
         url = "https://fapi.binance.com/fapi/v1/klines"
@@ -253,7 +253,7 @@ async def fetch_deribit_options_chain(session, symbol):
 
 # ==================== CHART GENERATION ====================
 def create_chart(df, symbol, source="Binance"):
-    """Create white background chart for 4 months data"""
+    """Create ultra-wide HD candlestick chart with better visibility"""
     chart_file = f"chart_{symbol}_{int(time.time())}.png"
     
     mc = mpf.make_marketcolors(
@@ -267,20 +267,23 @@ def create_chart(df, symbol, source="Binance"):
         marketcolors=mc, gridstyle='-', 
         gridcolor='#e0e0e0', gridaxis='both',
         facecolor='white', figcolor='white',
-        edgecolor='#cccccc', rc={'font.size': 10},
+        edgecolor='#cccccc', 
+        rc={'font.size': 12, 'axes.linewidth': 1.5},
         y_on_right=True
     )
     
-    title = f"{symbol}USDT ({source}) | Last 4 Months (1H)"
+    title = f"{symbol}USDT ({source}) | Last 4 Months (1H) | {len(df)} Candles"
     
     try:
+        # Ultra-wide chart for better candlestick visibility
         mpf.plot(
             df, type='candle', style=s, title=title,
             ylabel='Price (USDT)', volume=True, 
-            savefig=chart_file, figsize=(20, 12),
-            warn_too_much_data=len(df)+1, tight_layout=True
+            savefig=dict(fname=chart_file, dpi=150, bbox_inches='tight'),
+            figsize=(32, 14),  # 🔥 32 inches wide HD chart
+            warn_too_much_data=len(df)+1
         )
-        print(f"✅ Chart created: {chart_file} ({len(df)} candles)")
+        print(f"✅ HD Chart created: {chart_file} ({len(df)} candles, 32\" wide)")
         return chart_file
     except Exception as e:
         print(f"❌ Chart error: {e}")
@@ -396,7 +399,7 @@ async def send_telegram_alert(bot, symbol, chart_file, market_data):
     """Send alert to Telegram"""
     try:
         with open(chart_file, 'rb') as photo:
-            caption = f"📊 **{symbol} Market Data**\n_Last 4 Months Chart (1H)_"
+            caption = f"📊 **{symbol} Market Data**\n_Last 4 Months Chart (1H) - HD Wide_"
             await bot.send_photo(
                 chat_id=TELEGRAM_CHAT_ID,
                 photo=photo,
@@ -429,13 +432,13 @@ async def scan_cryptos(bot: Bot):
     try:
         await bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
-            text=f"🚀 **Crypto Scanner Started!**\n\n📊 Binance: {', '.join(BINANCE_COINS)}\n🎯 Deribit Options: {', '.join(DERIBIT_OPTIONS)}\n⏰ Scan: Every {SCAN_INTERVAL//60} mins\n📈 Chart: Last 4 Months",
+            text=f"🚀 **Crypto Scanner Started!**\n\n📊 Binance: {', '.join(BINANCE_COINS)}\n🎯 Deribit Options: {', '.join(DERIBIT_OPTIONS)}\n⏰ Scan: Every {SCAN_INTERVAL//60} mins\n📈 Chart: 4 Months (32\" HD Wide)",
             parse_mode='Markdown'
         )
     except Exception as e:
         print(f"❌ Startup error: {e}")
     
-    print(f"📊 Monitoring {len(ALL_COINS)} coins (4 months data)\n")
+    print(f"📊 Monitoring {len(ALL_COINS)} coins (4 months data, 32\" wide charts)\n")
     
     async with aiohttp.ClientSession() as session:
         while True:
@@ -508,19 +511,19 @@ async def start(update, context: ContextTypes.DEFAULT_TYPE):
         f"📊 Binance: {len(BINANCE_COINS)} coins\n"
         f"🎯 Deribit: BTC/ETH options\n"
         f"⏰ Every 5 mins\n"
-        f"📈 Chart: Last 4 Months\n\n/start /status",
+        f"📈 Chart: 4 Months (32\" HD Wide)\n\n/start /status",
         parse_mode='Markdown'
     )
 
 async def status(update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        f"✅ Running | 📊 {len(ALL_COINS)} coins | 📈 4 Months Data",
+        f"✅ Running | 📊 {len(ALL_COINS)} coins | 📈 4 Months (32\" HD)",
         parse_mode='Markdown'
     )
 
 # ==================== POST INIT ====================
 async def post_init(application: Application):
-    print("🚀 Starting scanner...")
+    print("🚀 Starting scanner with 32\" HD wide charts...")
     asyncio.create_task(scan_cryptos(application.bot))
 
 # ==================== RUN BOT ====================
@@ -536,7 +539,7 @@ def main():
     application.add_handler(CommandHandler("status", status))
     application.post_init = post_init
     
-    print("🤖 Starting bot...")
+    print("🤖 Starting bot with 32\" wide HD charts...")
     application.run_polling()
 
 if __name__ == "__main__":

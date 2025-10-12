@@ -164,7 +164,7 @@ class TechnicalAnalyzer:
     
     @staticmethod
     def find_swing_points(df: pd.DataFrame, period: int = 5) -> Tuple[List, List]:
-        """Identify swing highs and lows - IMPROVED VERSION"""
+        """Identify swing highs and lows"""
         swing_highs = []
         swing_lows = []
         
@@ -183,9 +183,7 @@ class TechnicalAnalyzer:
                     'timestamp': df.index[i]
                 })
         
-        # Filter only RECENT swings (last 50 candles range)
         current_price = df['close'].iloc[-1]
-        price_range = current_price * 0.05  # 5% range from current price
         
         # Filter relevant highs (within 5% above current price)
         relevant_highs = [
@@ -203,18 +201,16 @@ class TechnicalAnalyzer:
                s['price'] >= current_price * 0.95
         ]
         
-        # If no relevant swings, take closest ones
         if len(relevant_highs) == 0:
             relevant_highs = sorted(swing_highs, key=lambda x: abs(x['price'] - current_price))[:3]
         
         if len(relevant_lows) == 0:
             relevant_lows = sorted(swing_lows, key=lambda x: abs(x['price'] - current_price))[:3]
         
-        # Take max 3 most recent
         relevant_highs = sorted(relevant_highs, key=lambda x: x['index'], reverse=True)[:3]
         relevant_lows = sorted(relevant_lows, key=lambda x: x['index'], reverse=True)[:3]
         
-        logger.info(f"🎯 Filtered to {len(relevant_highs)} resistance & {len(relevant_lows)} support levels (within 5% of price)")
+        logger.info(f"🎯 Found {len(relevant_highs)} resistance & {len(relevant_lows)} support levels")
         
         return relevant_highs, relevant_lows
     
@@ -294,13 +290,12 @@ class TechnicalAnalyzer:
         return {'poc': None, 'high_volume_nodes': []}
 
 class OITracker:
-    """Track OI changes using in-memory storage (replaces Redis)"""
+    """Track OI changes using in-memory storage"""
     
     @staticmethod
     def store_oi(symbol: str, oi_data: Dict):
         """Store current OI in memory with timestamp"""
         timestamp = int(datetime.now().timestamp())
-        key = f"{symbol}:{timestamp}"
         
         if symbol not in oi_storage:
             oi_storage[symbol] = []
@@ -371,13 +366,13 @@ class OITracker:
         }
 
 class ChartGenerator:
-    """Generate annotated charts"""
+    """Generate annotated charts based on GPT analysis"""
     
     @staticmethod
-    def create_chart(df: pd.DataFrame, analysis: Dict, symbol: str) -> io.BytesIO:
-        """Create chart with S/R, trendlines, patterns marked"""
+    def create_chart(df: pd.DataFrame, analysis: Dict, ai_result: Dict, symbol: str) -> io.BytesIO:
+        """Create chart with GPT analysis overlayed"""
         
-        logger.info(f"📈 Generating chart for {symbol}...")
+        logger.info(f"📈 Generating chart for {symbol} based on GPT analysis...")
         
         mc = mpf.make_marketcolors(
             up='#26a69a',
@@ -404,19 +399,20 @@ class ChartGenerator:
             volume=True,
             returnfig=True,
             figsize=(14, 8),
-            title=f"\n{symbol} - {analysis.get('trade_type', 'Analysis')}",
+            title=f"\n{symbol} - {ai_result.get('pattern', 'Analysis')}",
             ylabel='Price ($)',
             ylabel_lower='Volume'
         )
         
         ax = axes[0]
         
-        if 'swing_lows_30m' in analysis:
+        # Draw support/resistance levels
+        if 'swing_lows_30m' in analysis and analysis['swing_lows_30m']:
             for swing in analysis['swing_lows_30m'][-3:]:
                 price = swing['price']
                 ax.axhline(y=price, color='#4caf50', linestyle='--', linewidth=1.5, alpha=0.7, label='Support 30m')
         
-        if 'swing_highs_30m' in analysis:
+        if 'swing_highs_30m' in analysis and analysis['swing_highs_30m']:
             for swing in analysis['swing_highs_30m'][-3:]:
                 price = swing['price']
                 ax.axhline(y=price, color='#f44336', linestyle='--', linewidth=1.5, alpha=0.7, label='Resistance 30m')
@@ -427,13 +423,24 @@ class ChartGenerator:
         if analysis.get('resistance_4h'):
             ax.axhline(y=analysis['resistance_4h'], color='#c62828', linestyle='-', linewidth=2, label='Resistance 4H')
         
-        if analysis.get('oi_trend', {}).get('supporting_sr'):
-            sr_price = analysis['oi_trend']['supporting_sr']
-            ax.axhline(y=sr_price, color='#2196f3', linestyle='-.', linewidth=2.5, label='OI S/R')
-        
+        # Current price
         current_price = df['close'].iloc[-1]
         ax.axhline(y=current_price, color='#ff9800', linestyle=':', linewidth=2, label=f'Current: ${current_price:.2f}')
         
+        # Draw GPT suggested entry, SL, target
+        if ai_result.get('entry') and ai_result['signal'] in ['LONG', 'SHORT']:
+            entry_price = ai_result['entry']
+            ax.axhline(y=entry_price, color='#2196f3', linestyle='-.', linewidth=2.5, label=f'Entry: ${entry_price:.2f}')
+            
+            if ai_result.get('sl'):
+                sl_price = ai_result['sl']
+                ax.axhline(y=sl_price, color='#d32f2f', linestyle='-.', linewidth=2, label=f'Stop Loss: ${sl_price:.2f}')
+            
+            if ai_result.get('target'):
+                target_price = ai_result['target']
+                ax.axhline(y=target_price, color='#388e3c', linestyle='-.', linewidth=2, label=f'Target: ${target_price:.2f}')
+        
+        # Add patterns box
         if analysis.get('patterns'):
             pattern_text = "\n".join([p['name'] for p in analysis['patterns'][:3]])
             ax.text(
@@ -445,17 +452,21 @@ class ChartGenerator:
                 fontsize=10
             )
         
-        if analysis.get('trade_signal'):
-            signal = analysis['trade_signal']
+        # Add GPT signal box
+        if ai_result.get('signal'):
+            signal = ai_result['signal']
             signal_color = '#4caf50' if 'LONG' in signal else '#f44336' if 'SHORT' in signal else '#9e9e9e'
             
-            signal_text = f"SIGNAL: {signal}\n"
-            if analysis.get('entry_price'):
-                signal_text += f"Entry: ${analysis['entry_price']:.2f}\n"
-            if analysis.get('sl_price'):
-                signal_text += f"SL: ${analysis['sl_price']:.2f}\n"
-            if analysis.get('target_price'):
-                signal_text += f"Target: ${analysis['target_price']:.2f}"
+            signal_text = f"GPT SIGNAL: {signal}\n"
+            if ai_result.get('entry'):
+                signal_text += f"Entry: ${ai_result['entry']:.2f}\n"
+            if ai_result.get('sl'):
+                signal_text += f"SL: ${ai_result['sl']:.2f}\n"
+            if ai_result.get('target'):
+                signal_text += f"Target: ${ai_result['target']:.2f}\n"
+            if ai_result.get('reason'):
+                reason_short = ai_result['reason'][:60] + "..." if len(ai_result['reason']) > 60 else ai_result['reason']
+                signal_text += f"\n{reason_short}"
             
             ax.text(
                 0.98, 0.98,
@@ -464,10 +475,11 @@ class ChartGenerator:
                 verticalalignment='top',
                 horizontalalignment='right',
                 bbox=dict(boxstyle='round', facecolor=signal_color, alpha=0.3, edgecolor=signal_color, linewidth=2),
-                fontsize=11,
+                fontsize=10,
                 fontweight='bold'
             )
         
+        # Legend
         handles, labels = ax.get_legend_handles_labels()
         by_label = dict(zip(labels, handles))
         ax.legend(by_label.values(), by_label.keys(), loc='upper left', fontsize=8)
@@ -478,7 +490,7 @@ class ChartGenerator:
         buf.seek(0)
         plt.close(fig)
         
-        logger.info(f"✅ Chart generated for {symbol}")
+        logger.info(f"✅ Chart generated for {symbol} with GPT overlay")
         return buf
 
 class TradeAnalyzer:
@@ -539,20 +551,6 @@ class TradeAnalyzer:
         logger.info(f"🎯 4H Resistance: ${resistance_4h:.2f if resistance_4h else 0}")
         logger.info(f"🎯 4H Support: ${support_4h:.2f if support_4h else 0}")
         
-        oi_sr = None
-        if oi_trend['trend'] in ['increasing', 'strongly_increasing']:
-            recent_high = df_30m['high'].tail(10).max()
-            recent_low = df_30m['low'].tail(10).min()
-            
-            if abs(current_price - recent_high) < abs(current_price - recent_low):
-                oi_sr = recent_high
-                logger.info(f"🔵 OI increasing near resistance: ${oi_sr:.2f}")
-            else:
-                oi_sr = recent_low
-                logger.info(f"🔵 OI increasing near support: ${oi_sr:.2f}")
-        
-        oi_trend['supporting_sr'] = oi_sr
-        
         analysis = {
             'symbol': symbol,
             'current_price': current_price,
@@ -578,7 +576,7 @@ class TradeAnalyzer:
     def get_ai_analysis(analysis: Dict) -> Dict:
         """Get GPT-4o mini analysis"""
         
-        logger.info(f"\n🤖 Calling OpenAI for {analysis['symbol']}...")
+        logger.info(f"\n🤖 Calling OpenAI GPT-4o-mini for {analysis['symbol']}...")
         
         patterns_text = "\n".join([f"- {p['name']} ({p['signal']})" for p in analysis.get('patterns', [])]) if analysis.get('patterns') else "None detected"
         
@@ -641,7 +639,7 @@ REASON: [why not]"""
             )
             
             ai_text = response.choices[0].message.content
-            logger.info(f"📝 OpenAI response (first 150 chars): {ai_text[:150]}...")
+            logger.info(f"📝 GPT-4o-mini response:\n{ai_text}")
             
             result = {
                 'signal': 'NO_TRADE',
@@ -649,7 +647,8 @@ REASON: [why not]"""
                 'sl': None,
                 'target': None,
                 'pattern': 'None',
-                'reason': 'No clear setup'
+                'reason': 'No clear setup',
+                'full_response': ai_text
             }
             
             lines = ai_text.split('\n')
@@ -696,7 +695,7 @@ REASON: [why not]"""
             if result['reason'] == 'No clear setup':
                 result['reason'] = ai_text
             
-            logger.info(f"🎯 Parsed AI result: {result['signal']} - {result.get('pattern', 'No pattern')}")
+            logger.info(f"🎯 Parsed GPT result: {result['signal']} - {result.get('pattern', 'No pattern')}")
             
             return result
             
@@ -708,7 +707,8 @@ REASON: [why not]"""
                 'entry': None,
                 'sl': None,
                 'target': None,
-                'pattern': 'Error'
+                'pattern': 'Error',
+                'full_response': ''
             }
 
 class TradingBot:
@@ -749,32 +749,16 @@ class TradingBot:
                 
                 logger.info(f"💵 {symbol}: Price=${analysis['current_price']:.2f}, Volume={analysis['volume_ratio']}x, Patterns={len(analysis.get('patterns', []))}")
                 
-                patterns = analysis.get('patterns', [])
-                volume_ratio = analysis.get('volume_ratio', 0)
-                
-                if volume_ratio < 1.2:
-                    logger.info(f"❌ {symbol}: Volume too low ({volume_ratio}x < 1.2x)")
-                    continue
-                
-                if len(patterns) == 0 and volume_ratio < 2.0:
-                    logger.info(f"❌ {symbol}: No patterns and volume not exceptional")
-                    continue
-                
-                logger.info(f"✅ {symbol}: Passed filters, sending to AI analysis...")
+                # Always send to GPT for analysis
+                logger.info(f"✅ {symbol}: Sending to GPT-4o-mini analysis...")
                 
                 ai_result = TradeAnalyzer.get_ai_analysis(analysis)
                 
-                logger.info(f"🎯 {symbol}: AI Signal = {ai_result['signal']}")
+                logger.info(f"🎯 {symbol}: GPT Signal = {ai_result['signal']}")
                 
                 if ai_result['signal'] in ['LONG', 'SHORT']:
                     self.trade_count_today += 1
                     logger.info(f"🎉 {symbol}: VALID {ai_result['signal']} SIGNAL - Trade #{self.trade_count_today}")
-                    
-                    analysis['trade_signal'] = ai_result['signal']
-                    analysis['entry_price'] = ai_result.get('entry')
-                    analysis['sl_price'] = ai_result.get('sl')
-                    analysis['target_price'] = ai_result.get('target')
-                    analysis['trade_type'] = ai_result.get('pattern', 'Breakout')
                     
                     await self.send_alert(context, symbol, analysis, ai_result)
                 else:
@@ -790,35 +774,39 @@ class TradingBot:
         logger.info(f"{'='*80}\n")
     
     async def send_alert(self, context: ContextTypes.DEFAULT_TYPE, symbol: str, analysis: Dict, ai_result: Dict):
-        """Send trade alert with chart to Telegram"""
+        """Send trade alert with GPT-generated chart to Telegram"""
         
-        logger.info(f"📤 Sending alert for {symbol}...")
+        logger.info(f"📤 Sending alert for {symbol} with GPT analysis...")
         
         try:
-            chart_buf = ChartGenerator.create_chart(analysis['df_30m'], analysis, symbol)
+            chart_buf = ChartGenerator.create_chart(analysis['df_30m'], analysis, ai_result, symbol)
         except Exception as e:
             logger.error(f"❌ Chart generation error: {e}")
             chart_buf = None
         
-        patterns_text = ", ".join([p['name'] for p in analysis['patterns'][:3]])
+        patterns_text = ", ".join([p['name'] for p in analysis['patterns'][:3]]) if analysis.get('patterns') else "None"
         
         oi_emoji = "📈" if "increasing" in analysis['oi_trend']['trend'] else "📉" if "decreasing" in analysis['oi_trend']['trend'] else "➡️"
         signal_emoji = "🟢" if ai_result['signal'] == 'LONG' else "🔴"
         
         try:
-            rr = abs((ai_result['target'] - ai_result['entry']) / (ai_result['entry'] - ai_result['sl']))
+            if ai_result.get('entry') and ai_result.get('sl'):
+                rr = abs((ai_result['target'] - ai_result['entry']) / (ai_result['entry'] - ai_result['sl']))
+            else:
+                rr = 0
         except:
             rr = 0
         
         message = f"""{signal_emoji} **{analysis['symbol']} - {ai_result['signal']} SETUP**
 
-📊 **Pattern:** {ai_result['pattern']}
-💰 **Price:** ${analysis['current_price']:.2f}
+🤖 **GPT-4o-mini Analysis:**
+📊 Pattern: {ai_result['pattern']}
+💰 Current Price: ${analysis['current_price']:.2f}
 
 🎯 **TRADE DETAILS:**
-├ Entry: ${ai_result['entry']:.2f}
-├ Stop Loss: ${ai_result['sl']:.2f}
-├ Target: ${ai_result['target']:.2f}
+├ Entry: ${ai_result['entry']:.2f if ai_result.get('entry') else 'N/A'}
+├ Stop Loss: ${ai_result['sl']:.2f if ai_result.get('sl') else 'N/A'}
+├ Target: ${ai_result['target']:.2f if ai_result.get('target') else 'N/A'}
 └ R:R = 1:{rr:.1f}
 
 ✅ **CONFIRMATIONS:**
@@ -832,7 +820,8 @@ class TradingBot:
 ├ 4H Support: ${analysis['support_4h']:.2f if analysis['support_4h'] else 'N/A'}
 └ 4H Resistance: ${analysis['resistance_4h']:.2f if analysis['resistance_4h'] else 'N/A'}
 
-💡 **Analysis:** {ai_result['reason']}
+💡 **GPT Reasoning:** 
+{ai_result['reason'][:200]}
 
 ⚠️ Trade #{self.trade_count_today}/{MAX_TRADES_PER_DAY} today
 """
@@ -873,7 +862,7 @@ class TradingBot:
 
 🔧 **Systems:**
 ├ ✅ Deribit API Connected
-├ ✅ OpenAI GPT-4o mini Ready
+├ ✅ OpenAI GPT-4o-mini Ready
 ├ ✅ In-Memory OI Tracking Active
 └ ✅ Telegram Bot Online
 
@@ -897,7 +886,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📊 **Tracking:** BTC & ETH (Deribit)\n"
         "⏱ **Timeframes:** 30m, 1hr, 4hr (500 candles each)\n"
         "🎯 **Max Trades:** 8 per day\n"
-        "📈 **Scan Interval:** Every 30 minutes\n\n"
+        "📈 **Scan Interval:** Every 30 minutes\n"
+        "🤖 **AI:** GPT-4o-mini analysis\n\n"
         "**Commands:**\n"
         "/status - Check bot status\n"
         "/scan - Manual scan now\n"
@@ -921,6 +911,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📈 Trades Today: {bot.trade_count_today}/{MAX_TRADES_PER_DAY}\n"
             f"⏱ Scan Interval: 30 minutes\n"
             f"💾 Using In-Memory OI tracking\n"
+            f"🤖 AI: GPT-4o-mini\n"
             f"📊 Candles per TF: {CANDLE_COUNT}\n\n"
             f"Next scan in ~30 mins",
             parse_mode='Markdown'
@@ -928,14 +919,14 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def scan_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Manual scan command"""
-    await update.message.reply_text("🔍 Starting manual scan...")
+    await update.message.reply_text("🔍 Starting manual scan with GPT-4o-mini analysis...")
     bot = context.bot_data.get('trading_bot')
     if bot:
         await bot.scan_markets(context)
         await update.message.reply_text("✅ Scan complete!")
 
 async def analyze_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Analyze specific symbol"""
+    """Analyze specific symbol with GPT"""
     if not context.args:
         await update.message.reply_text("Usage: /analyze BTC or /analyze ETH")
         return
@@ -947,7 +938,7 @@ async def analyze_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Invalid symbol. Use: BTC or ETH")
         return
     
-    await update.message.reply_text(f"🔍 Analyzing {symbol}...")
+    await update.message.reply_text(f"🔍 Analyzing {symbol} with GPT-4o-mini...")
     
     try:
         analysis = TradeAnalyzer.analyze_setup(symbol)
@@ -958,25 +949,23 @@ async def analyze_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         ai_result = TradeAnalyzer.get_ai_analysis(analysis)
         
-        analysis['trade_signal'] = ai_result['signal']
-        analysis['entry_price'] = ai_result.get('entry')
-        analysis['sl_price'] = ai_result.get('sl')
-        analysis['target_price'] = ai_result.get('target')
-        analysis['trade_type'] = ai_result.get('pattern', 'Analysis')
-        
-        chart_buf = ChartGenerator.create_chart(analysis['df_30m'], analysis, symbol)
+        chart_buf = ChartGenerator.create_chart(analysis['df_30m'], analysis, ai_result, symbol)
         
         patterns_text = ", ".join([p['name'] for p in analysis['patterns']]) if analysis['patterns'] else "None"
         
-        message = f"""📊 **{symbol} Analysis**
+        message = f"""📊 **{symbol} GPT-4o-mini Analysis**
 
 💰 Price: ${analysis['current_price']:.2f}
 📈 Patterns: {patterns_text}
 📊 Volume: {analysis['volume_ratio']}x avg
 🔄 OI: {analysis['oi_trend']['trend']} ({analysis['oi_trend']['change']:+.1f}%)
 
-🤖 **AI Signal:** {ai_result['signal']}
-💡 {ai_result.get('reason', 'No reason provided')}
+🤖 **GPT Signal:** {ai_result['signal']}
+💡 **Reasoning:** 
+{ai_result.get('reason', 'No reason provided')[:300]}
+
+**Full GPT Response:**
+{ai_result.get('full_response', '')[:500]}
 """
         
         await context.bot.send_photo(
@@ -993,7 +982,7 @@ async def analyze_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     """Main function"""
     logger.info("="*80)
-    logger.info("🚀 INITIALIZING CRYPTO TRADING BOT")
+    logger.info("🚀 INITIALIZING CRYPTO TRADING BOT WITH GPT-4O-MINI")
     logger.info("="*80)
     
     if not TELEGRAM_TOKEN or not OPENAI_API_KEY or not CHAT_ID:
@@ -1003,6 +992,7 @@ def main():
     
     logger.info("✅ Environment variables validated")
     logger.info("✅ Using in-memory storage (Redis not required)")
+    logger.info("✅ GPT-4o-mini configured for trade analysis")
     
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     trading_bot = TradingBot()
@@ -1041,6 +1031,7 @@ def main():
     logger.info(f"⏱ Scan interval: 30 minutes (if job-queue installed)")
     logger.info(f"📈 Candles per TF: {CANDLE_COUNT}")
     logger.info(f"🎯 Max trades per day: {MAX_TRADES_PER_DAY}")
+    logger.info(f"🤖 AI Engine: GPT-4o-mini")
     logger.info("="*80)
     
     application.run_polling(allowed_updates=Update.ALL_TYPES)

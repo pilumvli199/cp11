@@ -8,10 +8,14 @@ import mplfinance as mpf
 from telegram import Bot
 from telegram.ext import Application, CommandHandler, ContextTypes
 from PIL import Image
+import json
+import base64
+from io import BytesIO
 
 # ==================== CONFIG ====================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "YOUR_OPENAI_API_KEY")
 
 # Binance altcoins (Perpetual futures)
 BINANCE_COINS = ["LINK", "DOGE", "XRP", "BNB", "LTC", "TRX", "ADA", "AVAX", "SOL"]
@@ -20,9 +24,10 @@ BINANCE_COINS = ["LINK", "DOGE", "XRP", "BNB", "LTC", "TRX", "ADA", "AVAX", "SOL
 DERIBIT_OPTIONS = ["BTC", "ETH"]
 
 ALL_COINS = BINANCE_COINS + DERIBIT_OPTIONS
-SCAN_INTERVAL = 300  # 5 minutes
+SCAN_INTERVAL = 3600  # 1 hour (3600 seconds)
+ANALYSIS_ACCURACY_THRESHOLD = 70  # Minimum 70% confidence
 
-print("ℹ️ Hybrid Mode: Binance altcoins + Deribit BTC/ETH options")
+print("ℹ️ AI-Powered Trading Scanner: GPT-4o Mini + Vision Analysis")
 
 # ==================== BINANCE DATA FETCH ====================
 async def fetch_binance_candles(session, symbol, interval="1h", limit=1000):
@@ -30,11 +35,7 @@ async def fetch_binance_candles(session, symbol, interval="1h", limit=1000):
     all_data = []
     end_time = int(time.time() * 1000)
     
-    # 4 months = ~120 days = ~2880 hourly candles
-    # Binance allows max 1500 candles per request
-    # We'll make 3 requests to get ~3000 candles
-    
-    for i in range(3):  # 3 requests to ensure 4 months coverage
+    for i in range(3):
         url = "https://fapi.binance.com/fapi/v1/klines"
         params = {
             "symbol": f"{symbol}USDT",
@@ -71,11 +72,10 @@ async def fetch_binance_candles(session, symbol, interval="1h", limit=1000):
         for col in ['open', 'high', 'low', 'close', 'volume']:
             df[col] = df[col].astype(float)
         
-        # Keep only last 4 months
         four_months_ago = datetime.now() - timedelta(days=120)
         df = df[df.index >= four_months_ago]
         
-        print(f"✅ Binance: Fetched {len(df)} candles for {symbol} (Last 4 months)")
+        print(f"✅ Binance: Fetched {len(df)} candles for {symbol}")
         return df[['open', 'high', 'low', 'close', 'volume']]
     
     return None
@@ -130,30 +130,6 @@ async def fetch_binance_open_interest(session, symbol):
         print(f"❌ OI error: {e}")
     return 0
 
-async def fetch_binance_orderbook(session, symbol):
-    """Fetch order book from Binance"""
-    url = "https://fapi.binance.com/fapi/v1/depth"
-    params = {"symbol": f"{symbol}USDT", "limit": 10}
-    
-    try:
-        async with session.get(url, params=params) as response:
-            response.raise_for_status()
-            data = await response.json()
-            
-            bids = [[float(x[0]), float(x[1])] for x in data['bids'][:5]]
-            asks = [[float(x[0]), float(x[1])] for x in data['asks'][:5]]
-            
-            return {
-                'bids': bids,
-                'asks': asks,
-                'best_bid': float(data['bids'][0][0]) if data['bids'] else 0,
-                'best_ask': float(data['asks'][0][0]) if data['asks'] else 0,
-                'spread': float(data['asks'][0][0]) - float(data['bids'][0][0]) if data['bids'] and data['asks'] else 0
-            }
-    except Exception as e:
-        print(f"❌ Order book error: {e}")
-    return None
-
 # ==================== DERIBIT DATA FETCH ====================
 async def fetch_deribit_candles(session, symbol):
     """Fetch 4 months data from Deribit"""
@@ -185,7 +161,7 @@ async def fetch_deribit_candles(session, symbol):
                     'volume': result['volume']
                 })
                 df.set_index('timestamp', inplace=True)
-                print(f"✅ Deribit: Fetched {len(df)} candles for {symbol} (Last 4 months)")
+                print(f"✅ Deribit: Fetched {len(df)} candles for {symbol}")
                 return df
     except Exception as e:
         print(f"❌ Deribit candles error: {e}")
@@ -219,41 +195,9 @@ async def fetch_deribit_ticker(session, symbol):
         print(f"❌ Deribit ticker error: {e}")
     return None
 
-async def fetch_deribit_options_chain(session, symbol):
-    """Fetch options chain from Deribit (BTC/ETH only)"""
-    url = "https://www.deribit.com/api/v2/public/get_book_summary_by_currency"
-    params = {"currency": symbol, "kind": "option"}
-    
-    try:
-        async with session.get(url, params=params) as response:
-            response.raise_for_status()
-            data = await response.json()
-            
-            if data.get("result"):
-                options = data["result"]
-                chain_data = []
-                for opt in options:
-                    chain_data.append({
-                        'instrument': opt['instrument_name'],
-                        'type': 'CALL' if '-C' in opt['instrument_name'] else 'PUT',
-                        'strike': opt['instrument_name'].split('-')[2] if len(opt['instrument_name'].split('-')) > 2 else 'N/A',
-                        'expiry': opt['instrument_name'].split('-')[1] if len(opt['instrument_name'].split('-')) > 1 else 'N/A',
-                        'bid_price': opt.get('bid_price', 0),
-                        'ask_price': opt.get('ask_price', 0),
-                        'volume': opt.get('volume', 0),
-                        'open_interest': opt.get('open_interest', 0)
-                    })
-                
-                df = pd.DataFrame(chain_data)
-                print(f"✅ Fetched {len(df)} options for {symbol}")
-                return df
-    except Exception as e:
-        print(f"❌ Options error: {e}")
-    return None
-
 # ==================== CHART GENERATION ====================
 def create_chart(df, symbol, source="Binance"):
-    """Create ultra-wide HD candlestick chart with better visibility"""
+    """Create ultra-wide HD candlestick chart"""
     chart_file = f"chart_{symbol}_{int(time.time())}.png"
     
     mc = mpf.make_marketcolors(
@@ -275,140 +219,286 @@ def create_chart(df, symbol, source="Binance"):
     title = f"{symbol}USDT ({source}) | Last 4 Months (1H) | {len(df)} Candles"
     
     try:
-        # Ultra-wide chart for better candlestick visibility
         mpf.plot(
             df, type='candle', style=s, title=title,
             ylabel='Price (USDT)', volume=True, 
             savefig=dict(fname=chart_file, dpi=150, bbox_inches='tight'),
-            figsize=(32, 14),  # 🔥 32 inches wide HD chart
+            figsize=(32, 14),
             warn_too_much_data=len(df)+1
         )
-        print(f"✅ HD Chart created: {chart_file} ({len(df)} candles, 32\" wide)")
+        print(f"✅ Chart created: {chart_file}")
         return chart_file
     except Exception as e:
         print(f"❌ Chart error: {e}")
     return None
 
-# ==================== DATA FORMATTING ====================
-def format_binance_data(symbol, ticker, funding_rate, oi, order_book):
-    """Format Binance perpetual data"""
-    msg = f"📊 **{symbol}USDT Binance Perpetual**\n\n"
-    
-    if ticker:
-        msg += f"💰 **Price:**\n"
-        msg += f"   Last: ${ticker['last_price']:,.4f}\n"
-        msg += f"   24h High: ${ticker['24h_high']:,.4f}\n"
-        msg += f"   24h Low: ${ticker['24h_low']:,.4f}\n"
-        msg += f"   24h Change: {ticker['price_change_24h']:.2f}%\n\n"
+# ==================== TECHNICAL INDICATORS ====================
+def calculate_technical_indicators(df):
+    """Calculate technical indicators for analysis"""
+    try:
+        # Moving Averages
+        df['SMA_20'] = df['close'].rolling(window=20).mean()
+        df['SMA_50'] = df['close'].rolling(window=50).mean()
+        df['SMA_200'] = df['close'].rolling(window=200).mean()
         
-        msg += f"📈 **Volume & OI:**\n"
-        msg += f"   24h Volume: {ticker['volume_24h']:,.2f} {symbol}\n"
-        msg += f"   24h Volume USD: ${ticker['volume_usd']:,.0f}\n"
-        msg += f"   Open Interest: {oi:,.2f} {symbol}\n\n"
-    
-    if funding_rate:
-        funding_annual = funding_rate * 365 * 3
-        msg += f"💸 **Funding Rate:**\n"
-        msg += f"   Current (8h): {funding_rate:.4f}%\n"
-        msg += f"   Annualized: {funding_annual:.2f}%\n\n"
-    
-    if order_book:
-        msg += f"📖 **Order Book:**\n"
-        msg += f"   Best Bid: ${order_book['best_bid']:,.4f}\n"
-        msg += f"   Best Ask: ${order_book['best_ask']:,.4f}\n"
-        msg += f"   Spread: ${order_book['spread']:.4f}\n\n"
+        # RSI
+        delta = df['close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        df['RSI'] = 100 - (100 / (1 + rs))
         
-        msg += f"   **Top 3 Bids:**\n"
-        for bid in order_book['bids'][:3]:
-            msg += f"   ${bid[0]:,.4f} × {bid[1]:,.2f}\n"
+        # MACD
+        exp1 = df['close'].ewm(span=12, adjust=False).mean()
+        exp2 = df['close'].ewm(span=26, adjust=False).mean()
+        df['MACD'] = exp1 - exp2
+        df['MACD_signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
         
-        msg += f"\n   **Top 3 Asks:**\n"
-        for ask in order_book['asks'][:3]:
-            msg += f"   ${ask[0]:,.4f} × {ask[1]:,.2f}\n"
-    
-    return msg
+        # Bollinger Bands
+        df['BB_middle'] = df['close'].rolling(window=20).mean()
+        bb_std = df['close'].rolling(window=20).std()
+        df['BB_upper'] = df['BB_middle'] + (bb_std * 2)
+        df['BB_lower'] = df['BB_middle'] - (bb_std * 2)
+        
+        # Support & Resistance
+        recent_data = df.tail(100)
+        df['support'] = recent_data['low'].min()
+        df['resistance'] = recent_data['high'].max()
+        
+        return df
+    except Exception as e:
+        print(f"❌ Indicator calculation error: {e}")
+        return df
 
-def format_deribit_data(symbol, ticker):
-    """Format Deribit perpetual data"""
-    msg = f"📊 **{symbol} Deribit Perpetual**\n\n"
+def prepare_analysis_data(df, ticker, funding_rate, oi, symbol):
+    """Prepare comprehensive data for AI analysis"""
+    df = calculate_technical_indicators(df)
     
-    if ticker:
-        msg += f"💰 **Price:**\n"
-        msg += f"   Last: ${ticker['last_price']:,.2f}\n"
-        msg += f"   Mark: ${ticker['mark_price']:,.2f}\n"
-        msg += f"   Index: ${ticker['index_price']:,.2f}\n"
-        msg += f"   24h High: ${ticker['24h_high']:,.2f}\n"
-        msg += f"   24h Low: ${ticker['24h_low']:,.2f}\n"
-        msg += f"   24h Change: {ticker['price_change_24h']:.2f}%\n\n"
-        
-        msg += f"📈 **Volume & OI:**\n"
-        msg += f"   24h Volume: {ticker['volume_24h']:,.2f} {symbol}\n"
-        msg += f"   24h Volume USD: ${ticker['volume_usd']:,.0f}\n"
-        msg += f"   Open Interest: {ticker['open_interest']:,.2f}\n\n"
-        
-        if ticker.get('funding_8h'):
-            funding = ticker['funding_8h'] * 100
-            funding_annual = funding * 365 * 3
-            msg += f"💸 **Funding Rate:**\n"
-            msg += f"   Current (8h): {funding:.4f}%\n"
-            msg += f"   Annualized: {funding_annual:.2f}%\n\n"
+    latest = df.iloc[-1]
+    prev = df.iloc[-2]
     
-    return msg
+    analysis_data = {
+        "symbol": symbol,
+        "timestamp": datetime.now().isoformat(),
+        "current_price": float(latest['close']),
+        "price_change_24h": ticker['price_change_24h'] if ticker else 0,
+        "volume_24h": ticker['volume_usd'] if ticker else 0,
+        "funding_rate": funding_rate,
+        "open_interest": oi,
+        
+        "technical_indicators": {
+            "sma_20": float(latest['SMA_20']) if pd.notna(latest['SMA_20']) else None,
+            "sma_50": float(latest['SMA_50']) if pd.notna(latest['SMA_50']) else None,
+            "sma_200": float(latest['SMA_200']) if pd.notna(latest['SMA_200']) else None,
+            "rsi": float(latest['RSI']) if pd.notna(latest['RSI']) else None,
+            "macd": float(latest['MACD']) if pd.notna(latest['MACD']) else None,
+            "macd_signal": float(latest['MACD_signal']) if pd.notna(latest['MACD_signal']) else None,
+            "bb_upper": float(latest['BB_upper']) if pd.notna(latest['BB_upper']) else None,
+            "bb_lower": float(latest['BB_lower']) if pd.notna(latest['BB_lower']) else None,
+            "support": float(latest['support']) if pd.notna(latest['support']) else None,
+            "resistance": float(latest['resistance']) if pd.notna(latest['resistance']) else None
+        },
+        
+        "candlestick_data": {
+            "last_10_candles": df[['open', 'high', 'low', 'close', 'volume']].tail(10).to_dict('records')
+        }
+    }
+    
+    return analysis_data
 
-def format_options_data(options_df, current_price, symbol):
-    """Format options chain"""
-    if options_df is None or options_df.empty:
-        return "❌ No options data"
-    
-    options_df['strike_num'] = pd.to_numeric(options_df['strike'], errors='coerce')
-    filtered = options_df[
-        (options_df['strike_num'] >= current_price * 0.8) & 
-        (options_df['strike_num'] <= current_price * 1.2)
-    ].copy()
-    
-    top_volume = filtered.nlargest(10, 'volume')
-    
-    msg = f"🎯 **{symbol} Options Chain**\n\n"
-    msg += f"💰 Spot: ${current_price:,.2f}\n"
-    msg += f"📈 Total Options: {len(options_df)}\n\n"
-    msg += f"**🔥 Top 10 by Volume (±20%):**\n\n"
-    
-    for idx, row in top_volume.iterrows():
-        emoji = '📗' if row['type'] == 'CALL' else '📕'
-        msg += f"{emoji} **{row['instrument']}**\n"
-        msg += f"   Strike: ${row['strike']} | {row['type']}\n"
-        msg += f"   Bid/Ask: ${row['bid_price']:.4f}/${row['ask_price']:.4f}\n"
-        msg += f"   Vol: {row['volume']:.2f} | OI: {row['open_interest']:.2f}\n\n"
-    
-    # Stats
-    call_vol = filtered[filtered['type'] == 'CALL']['volume'].sum()
-    put_vol = filtered[filtered['type'] == 'PUT']['volume'].sum()
-    call_oi = filtered[filtered['type'] == 'CALL']['open_interest'].sum()
-    put_oi = filtered[filtered['type'] == 'PUT']['open_interest'].sum()
-    pcr = (put_vol/call_vol if call_vol > 0 else 0)
-    
-    msg += f"\n📊 **Statistics:**\n"
-    msg += f"📗 CALL Vol: {call_vol:,.2f} | OI: {call_oi:,.2f}\n"
-    msg += f"📕 PUT Vol: {put_vol:,.2f} | OI: {put_oi:,.2f}\n"
-    msg += f"📊 Put/Call Ratio: {pcr:.2f}"
-    
-    return msg
+# ==================== GPT-4O MINI VISION ANALYSIS ====================
+async def analyze_with_gpt4o_mini(chart_file, analysis_data, session):
+    """Analyze chart using GPT-4o Mini Vision"""
+    try:
+        # Convert image to base64
+        with open(chart_file, 'rb') as image_file:
+            image_data = base64.b64encode(image_file.read()).decode('utf-8')
+        
+        # Prepare prompt
+        prompt = f"""You are an expert crypto trader analyzing {analysis_data['symbol']}USDT.
+
+**CURRENT DATA:**
+- Price: ${analysis_data['current_price']:,.2f}
+- 24h Change: {analysis_data['price_change_24h']:.2f}%
+- Volume (24h): ${analysis_data['volume_24h']:,.0f}
+- Funding Rate: {analysis_data['funding_rate']:.4f}%
+- Open Interest: {analysis_data['open_interest']:,.2f}
+
+**TECHNICAL INDICATORS:**
+{json.dumps(analysis_data['technical_indicators'], indent=2)}
+
+**YOUR TASK:**
+Analyze the attached 4-month chart and provide:
+
+1. **Candlestick Patterns:** Identify key patterns (Doji, Hammer, Engulfing, etc.)
+2. **Chart Patterns:** Head & Shoulders, Double Top/Bottom, Triangles, Flags, Wedges
+3. **Price Action:** Trend direction, momentum, breakouts
+4. **Support & Resistance:** Key levels with exact prices
+5. **Trend Lines:** Draw trend lines and identify channels
+
+**TRADING SIGNALS:**
+- **SHORT TERM (1-7 days):** Entry, Stop Loss, Take Profit, Position Size
+- **MEDIUM TERM (1-4 weeks):** Entry, Stop Loss, Take Profit, Position Size
+
+**CONFIDENCE SCORE:** Rate your analysis accuracy from 0-100%
+
+**OUTPUT FORMAT (JSON):**
+{{
+  "confidence_score": 85,
+  "trend": "BULLISH/BEARISH/NEUTRAL",
+  "candlestick_patterns": ["pattern1", "pattern2"],
+  "chart_patterns": ["pattern1", "pattern2"],
+  "support_levels": [12.50, 11.80],
+  "resistance_levels": [14.20, 15.00],
+  "short_term_trade": {{
+    "signal": "LONG/SHORT/NONE",
+    "entry": 13.50,
+    "stop_loss": 12.80,
+    "take_profit": 15.20,
+    "risk_reward": 2.5,
+    "position_size": "2-3%"
+  }},
+  "medium_term_trade": {{
+    "signal": "LONG/SHORT/NONE",
+    "entry": 13.00,
+    "stop_loss": 11.50,
+    "take_profit": 17.00,
+    "risk_reward": 3.0,
+    "position_size": "5-7%"
+  }},
+  "reasoning": "Detailed explanation of your analysis"
+}}
+
+IMPORTANT: Only provide trades if confidence >= 70%. Be conservative."""
+
+        # Call OpenAI API
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "model": "gpt-4o-mini",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{image_data}"
+                            }
+                        }
+                    ]
+                }
+            ],
+            "max_tokens": 2000,
+            "temperature": 0.3
+        }
+        
+        async with session.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers=headers,
+            json=payload
+        ) as response:
+            response.raise_for_status()
+            result = await response.json()
+            
+            ai_response = result['choices'][0]['message']['content']
+            
+            # Extract JSON from response
+            if "```json" in ai_response:
+                json_str = ai_response.split("```json")[1].split("```")[0].strip()
+            else:
+                json_str = ai_response
+            
+            analysis_result = json.loads(json_str)
+            print(f"✅ AI Analysis completed for {analysis_data['symbol']}")
+            return analysis_result
+            
+    except Exception as e:
+        print(f"❌ GPT-4o Mini analysis error: {e}")
+        return None
 
 # ==================== TELEGRAM ALERT ====================
-async def send_telegram_alert(bot, symbol, chart_file, market_data):
-    """Send alert to Telegram"""
+async def send_trade_alert(bot, symbol, analysis_result, chart_file):
+    """Send trading alert if confidence >= 70%"""
     try:
+        confidence = analysis_result.get('confidence_score', 0)
+        
+        if confidence < ANALYSIS_ACCURACY_THRESHOLD:
+            print(f"⚠️ {symbol}: Confidence {confidence}% < 70%, skipping alert")
+            return
+        
+        # Send chart
         with open(chart_file, 'rb') as photo:
-            caption = f"📊 **{symbol} Market Data**\n_Last 4 Months Chart (1H) - HD Wide_"
             await bot.send_photo(
                 chat_id=TELEGRAM_CHAT_ID,
                 photo=photo,
-                caption=caption,
-                parse_mode='Markdown'
+                caption=f"🤖 **AI Trading Signal: {symbol}**\n📊 Confidence: {confidence}%"
             )
         
-        if len(market_data) > 4000:
-            chunks = [market_data[i:i+4000] for i in range(0, len(market_data), 4000)]
+        # Format alert message
+        msg = f"🎯 **{symbol} TRADING SIGNAL**\n\n"
+        msg += f"🔮 **Confidence:** {confidence}%\n"
+        msg += f"📈 **Trend:** {analysis_result.get('trend', 'N/A')}\n\n"
+        
+        # Patterns
+        if analysis_result.get('candlestick_patterns'):
+            msg += f"🕯️ **Candlestick Patterns:**\n"
+            for pattern in analysis_result['candlestick_patterns']:
+                msg += f"   • {pattern}\n"
+            msg += "\n"
+        
+        if analysis_result.get('chart_patterns'):
+            msg += f"📊 **Chart Patterns:**\n"
+            for pattern in analysis_result['chart_patterns']:
+                msg += f"   • {pattern}\n"
+            msg += "\n"
+        
+        # Support & Resistance
+        if analysis_result.get('support_levels'):
+            msg += f"🛡️ **Support Levels:**\n"
+            for level in analysis_result['support_levels']:
+                msg += f"   • ${level:,.2f}\n"
+            msg += "\n"
+        
+        if analysis_result.get('resistance_levels'):
+            msg += f"⚔️ **Resistance Levels:**\n"
+            for level in analysis_result['resistance_levels']:
+                msg += f"   • ${level:,.2f}\n"
+            msg += "\n"
+        
+        # Short Term Trade
+        st = analysis_result.get('short_term_trade', {})
+        if st.get('signal') and st['signal'] != 'NONE':
+            msg += f"⚡ **SHORT TERM (1-7 Days):**\n"
+            msg += f"   Signal: **{st['signal']}**\n"
+            msg += f"   Entry: ${st.get('entry', 0):,.2f}\n"
+            msg += f"   Stop Loss: ${st.get('stop_loss', 0):,.2f}\n"
+            msg += f"   Take Profit: ${st.get('take_profit', 0):,.2f}\n"
+            msg += f"   Risk/Reward: {st.get('risk_reward', 0):.1f}\n"
+            msg += f"   Position: {st.get('position_size', 'N/A')}\n\n"
+        
+        # Medium Term Trade
+        mt = analysis_result.get('medium_term_trade', {})
+        if mt.get('signal') and mt['signal'] != 'NONE':
+            msg += f"📅 **MEDIUM TERM (1-4 Weeks):**\n"
+            msg += f"   Signal: **{mt['signal']}**\n"
+            msg += f"   Entry: ${mt.get('entry', 0):,.2f}\n"
+            msg += f"   Stop Loss: ${mt.get('stop_loss', 0):,.2f}\n"
+            msg += f"   Take Profit: ${mt.get('take_profit', 0):,.2f}\n"
+            msg += f"   Risk/Reward: {mt.get('risk_reward', 0):.1f}\n"
+            msg += f"   Position: {mt.get('position_size', 'N/A')}\n\n"
+        
+        # Reasoning
+        msg += f"💡 **Analysis:**\n{analysis_result.get('reasoning', 'N/A')}\n\n"
+        msg += f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        
+        # Send message
+        if len(msg) > 4000:
+            chunks = [msg[i:i+4000] for i in range(0, len(msg), 4000)]
             for chunk in chunks:
                 await bot.send_message(
                     chat_id=TELEGRAM_CHAT_ID,
@@ -418,67 +508,73 @@ async def send_telegram_alert(bot, symbol, chart_file, market_data):
         else:
             await bot.send_message(
                 chat_id=TELEGRAM_CHAT_ID,
-                text=market_data,
+                text=msg,
                 parse_mode='Markdown'
             )
         
-        print(f"✅ Alert sent for {symbol}")
+        print(f"✅ Trade alert sent for {symbol}")
+        
     except Exception as e:
-        print(f"❌ Telegram error: {e}")
+        print(f"❌ Alert error: {e}")
 
 # ==================== MAIN SCANNER ====================
 async def scan_cryptos(bot: Bot):
-    """Main scanner"""
+    """Main AI scanner - runs every 1 hour"""
     try:
         await bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
-            text=f"🚀 **Crypto Scanner Started!**\n\n📊 Binance: {', '.join(BINANCE_COINS)}\n🎯 Deribit Options: {', '.join(DERIBIT_OPTIONS)}\n⏰ Scan: Every {SCAN_INTERVAL//60} mins\n📈 Chart: 4 Months (32\" HD Wide)",
+            text=f"🚀 **AI Trading Scanner Started!**\n\n🤖 Model: GPT-4o Mini\n📊 Coins: {len(ALL_COINS)}\n⏰ Analysis: Every 1 hour\n🎯 Min Confidence: {ANALYSIS_ACCURACY_THRESHOLD}%",
             parse_mode='Markdown'
         )
     except Exception as e:
         print(f"❌ Startup error: {e}")
     
-    print(f"📊 Monitoring {len(ALL_COINS)} coins (4 months data, 32\" wide charts)\n")
+    print(f"🤖 AI Scanner: {len(ALL_COINS)} coins | Every 1 hour | Min confidence: {ANALYSIS_ACCURACY_THRESHOLD}%\n")
     
     async with aiohttp.ClientSession() as session:
         while True:
-            # Scan Binance altcoins
+            # Scan Binance coins
             for symbol in BINANCE_COINS:
                 print(f"\n{'='*60}")
-                print(f"🔍 Binance {symbol} at {datetime.now().strftime('%H:%M:%S')}")
+                print(f"🔍 Analyzing {symbol} at {datetime.now().strftime('%H:%M:%S')}")
                 
                 df = await fetch_binance_candles(session, symbol)
                 ticker = await fetch_binance_ticker(session, symbol)
                 funding = await fetch_binance_funding_rate(session, symbol)
                 oi = await fetch_binance_open_interest(session, symbol)
-                order_book = await fetch_binance_orderbook(session, symbol)
                 
                 if df is None or df.empty:
                     print(f"⚠️ Skipping {symbol}")
                     continue
                 
+                # Create chart
                 chart_file = create_chart(df, symbol, "Binance")
                 if not chart_file:
                     continue
                 
-                market_data = format_binance_data(symbol, ticker, funding, oi, order_book)
-                await send_telegram_alert(bot, symbol, chart_file, market_data)
+                # Prepare analysis data
+                analysis_data = prepare_analysis_data(df, ticker, funding, oi, symbol)
+                
+                # AI Analysis
+                analysis_result = await analyze_with_gpt4o_mini(chart_file, analysis_data, session)
+                
+                if analysis_result:
+                    await send_trade_alert(bot, symbol, analysis_result, chart_file)
                 
                 try:
                     os.remove(chart_file)
                 except:
                     pass
                 
-                await asyncio.sleep(5)
+                await asyncio.sleep(10)
             
-            # Scan Deribit BTC/ETH with options
+            # Scan Deribit BTC/ETH
             for symbol in DERIBIT_OPTIONS:
                 print(f"\n{'='*60}")
-                print(f"🎯 Deribit {symbol} OPTIONS at {datetime.now().strftime('%H:%M:%S')}")
+                print(f"🎯 Analyzing {symbol} (Deribit) at {datetime.now().strftime('%H:%M:%S')}")
                 
                 df = await fetch_deribit_candles(session, symbol)
                 ticker = await fetch_deribit_ticker(session, symbol)
-                options_df = await fetch_deribit_options_chain(session, symbol)
                 
                 if df is None or df.empty:
                     continue
@@ -487,43 +583,43 @@ async def scan_cryptos(bot: Bot):
                 if not chart_file:
                     continue
                 
-                current_price = ticker['last_price'] if ticker else 0
-                perpetual_data = format_deribit_data(symbol, ticker)
-                options_data = format_options_data(options_df, current_price, symbol)
+                analysis_data = prepare_analysis_data(df, ticker, 0, 0, symbol)
+                analysis_result = await analyze_with_gpt4o_mini(chart_file, analysis_data, session)
                 
-                combined_data = perpetual_data + "\n\n" + options_data
-                await send_telegram_alert(bot, symbol, chart_file, combined_data)
+                if analysis_result:
+                    await send_trade_alert(bot, symbol, analysis_result, chart_file)
                 
                 try:
                     os.remove(chart_file)
                 except:
                     pass
                 
-                await asyncio.sleep(5)
+                await asyncio.sleep(10)
             
-            print(f"\n⏳ Waiting {SCAN_INTERVAL//60} minutes...\n")
+            print(f"\n⏳ Next scan in 1 hour...\n")
             await asyncio.sleep(SCAN_INTERVAL)
 
 # ==================== TELEGRAM COMMANDS ====================
 async def start(update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🤖 **Crypto Market Scanner**\n\n"
-        f"📊 Binance: {len(BINANCE_COINS)} coins\n"
-        f"🎯 Deribit: BTC/ETH options\n"
-        f"⏰ Every 5 mins\n"
-        f"📈 Chart: 4 Months (32\" HD Wide)\n\n/start /status",
+        "🤖 **AI Crypto Trading Scanner**\n\n"
+        f"🧠 Model: GPT-4o Mini Vision\n"
+        f"📊 Coins: {len(ALL_COINS)}\n"
+        f"⏰ Analysis: Every 1 hour\n"
+        f"🎯 Min Confidence: {ANALYSIS_ACCURACY_THRESHOLD}%\n\n"
+        f"Commands: /start /status",
         parse_mode='Markdown'
     )
 
 async def status(update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        f"✅ Running | 📊 {len(ALL_COINS)} coins | 📈 4 Months (32\" HD)",
+        f"✅ Running | 🤖 AI Active | 📊 {len(ALL_COINS)} coins | ⏰ Every 1hr",
         parse_mode='Markdown'
     )
 
 # ==================== POST INIT ====================
 async def post_init(application: Application):
-    print("🚀 Starting scanner with 32\" HD wide charts...")
+    print("🚀 Starting AI Trading Scanner...")
     asyncio.create_task(scan_cryptos(application.bot))
 
 # ==================== RUN BOT ====================
@@ -539,7 +635,7 @@ def main():
     application.add_handler(CommandHandler("status", status))
     application.post_init = post_init
     
-    print("🤖 Starting bot with 32\" wide HD charts...")
+    print("🤖 Starting AI Trading Bot...")
     application.run_polling()
 
 if __name__ == "__main__":

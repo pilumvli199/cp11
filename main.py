@@ -385,8 +385,15 @@ async def post_init(application: Application):
     asyncio.create_task(scan_cryptos(application.bot))
 
 # ==================== RUN BOT ====================
-async def main():
+def main():
     """Start bot and scanner"""
+    try:
+        # Check if event loop is already running
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     
     # Add command handlers
@@ -398,10 +405,10 @@ async def main():
     
     # Start polling
     print("🤖 Starting Telegram bot...")
-    await application.run_polling()
+    application.run_polling()
 
 if __name__ == "__main__":
     if gemini_model:
-        asyncio.run(main())
+        main()
     else:
         print("🔴 Bot cannot start - Gemini initialization failed.")

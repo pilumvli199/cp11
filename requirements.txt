@@ -1,11 +1,36 @@
-# Core dependencies
-python-telegram-bot[job-queue]==20.7
+# Telegram Bot
+python-telegram-bot==20.7
+telegram==0.0.1
+
+# HTTP Requests
 aiohttp==3.9.1
+requests==2.31.0
+
+# Data Processing
 pandas==2.1.4
+numpy==1.26.2
+
+# Charting
 mplfinance==0.12.10b0
+matplotlib==3.8.2
 Pillow==10.1.0
 
-# Additional dependencies
+# OpenAI API
+openai==1.6.1
+
+# Environment Variables
 python-dotenv==1.0.0
-numpy==1.26.2
-matplotlib==3.8.2
+
+# Async Support
+asyncio==3.4.3
+
+# Date/Time
+python-dateutil==2.8.2
+pytz==2023.3
+
+# JSON Processing
+ujson==5.9.0
+
+# HTTP/SSL Support
+certifi==2023.11.17
+urllib3==2.1.0

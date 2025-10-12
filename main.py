@@ -310,6 +310,48 @@ def send_telegram_alert(symbol, timeframe, analysis, current_price, chart_img=No
     except Exception as e:
         print(f"❌ Telegram send error: {e}")
 
+def send_scan_summary(signal_count, signal_details):
+    """Send scan cycle summary to Telegram"""
+    if not bot or not TELEGRAM_CHAT_ID:
+        return
+    
+    try:
+        # Build signal lists
+        long_list = "\n".join([f"  • {s}" for s in signal_details["LONG"]]) if signal_details["LONG"] else "  • None"
+        short_list = "\n".join([f"  • {s}" for s in signal_details["SHORT"]]) if signal_details["SHORT"] else "  • None"
+        
+        summary_msg = f"""
+📊 **SCAN CYCLE COMPLETED**
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🟢 **LONG Signals: {signal_count['LONG']}**
+{long_list}
+
+🔴 **SHORT Signals: {signal_count['SHORT']}**
+{short_list}
+
+⚪ **NO TRADE: {signal_count['NO TRADE']}**
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✅ Total Scans: {sum(signal_count.values())}
+⏰ Completed: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+⏱️ Next Scan: 1 hour
+
+🤖 Bot Status: Active
+        """
+        
+        bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text=summary_msg,
+            parse_mode='Markdown'
+        )
+        print("📲 Scan summary sent to Telegram!")
+        
+    except Exception as e:
+        print(f"❌ Failed to send scan summary: {e}")
+
 def scan_coin(symbol, timeframe):
     """Complete scan workflow for one coin"""
     print(f"\n🔍 Scanning {symbol} on {timeframe}...")
@@ -382,6 +424,7 @@ def scan_all_coins():
     
     results = {}
     signal_count = {"LONG": 0, "SHORT": 0, "NO TRADE": 0}
+    signal_details = {"LONG": [], "SHORT": []}
     
     for coin in COINS:
         for tf in TIMEFRAMES:
@@ -394,6 +437,10 @@ def scan_all_coins():
                 # Count signals
                 if "signal_type" in result:
                     signal_count[result["signal_type"]] += 1
+                    
+                    # Store signal details
+                    if result["signal_type"] in ["LONG", "SHORT"]:
+                        signal_details[result["signal_type"]].append(f"{coin} ({tf})")
                 
                 time.sleep(2)  # Rate limit protection
             except Exception as e:
@@ -411,6 +458,9 @@ def scan_all_coins():
     print(f"⏰ Completed At:     {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"⏱️  Next Scan In:     1 hour")
     print("="*80 + "\n")
+    
+    # Send summary to Telegram
+    send_scan_summary(signal_count, signal_details)
     
     return results
 

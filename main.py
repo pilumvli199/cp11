@@ -17,25 +17,20 @@ from matplotlib.lines import Line2D
 import io
 from PIL import Image
 
-# Logging setup
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Environment variables
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 
-# Initialize OpenAI client
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# In-memory storage for OI data (replaces Redis)
 oi_storage = {}
 
-# Constants
 DERIBIT_BASE = "https://www.deribit.com/api/v2/public"
 SYMBOLS = ['BTC-PERPETUAL', 'ETH-PERPETUAL']
 TIMEFRAMES = ['30', '60', '240']
@@ -43,7 +38,6 @@ MAX_TRADES_PER_DAY = 8
 CANDLE_COUNT = 500
 
 class DeribitClient:
-    """Fetch data from Deribit public API"""
     
     RESOLUTION_MAP = {
         '30': '30',
@@ -53,7 +47,6 @@ class DeribitClient:
     
     @staticmethod
     def get_candles(symbol: str, timeframe: str, count: int = CANDLE_COUNT) -> pd.DataFrame:
-        """Fetch OHLCV data - 500 candles"""
         
         logger.info(f"📊 Fetching {count} candles for {symbol} {timeframe}m...")
         
@@ -117,9 +110,6 @@ class DeribitClient:
             
             df.set_index('timestamp', inplace=True)
             
-            if timeframe == '240':
-                logger.info(f"ℹ️ Using daily data for 4hr timeframe {symbol}")
-            
             logger.info(f"✅ Fetched {len(df)} candles for {symbol} {resolution}")
             return df.tail(count)
             
@@ -132,7 +122,6 @@ class DeribitClient:
     
     @staticmethod
     def get_order_book(symbol: str, depth: int = 10) -> Dict:
-        """Fetch order book for OI analysis"""
         logger.info(f"📖 Fetching order book for {symbol}...")
         
         url = f"{DERIBIT_BASE}/get_order_book"
@@ -160,11 +149,9 @@ class DeribitClient:
         return {'open_interest': 0, 'volume_24h': 0, 'mark_price': 0}
 
 class TechnicalAnalyzer:
-    """Technical analysis functions"""
     
     @staticmethod
     def find_swing_points(df: pd.DataFrame, period: int = 5) -> Tuple[List, List]:
-        """Identify swing highs and lows"""
         swing_highs = []
         swing_lows = []
         
@@ -185,7 +172,6 @@ class TechnicalAnalyzer:
         
         current_price = df['close'].iloc[-1]
         
-        # Filter relevant highs (within 5% above current price)
         relevant_highs = [
             s for s in swing_highs 
             if s['index'] >= len(df) - 50 and
@@ -193,7 +179,6 @@ class TechnicalAnalyzer:
                s['price'] <= current_price * 1.05
         ]
         
-        # Filter relevant lows (within 5% below current price)
         relevant_lows = [
             s for s in swing_lows 
             if s['index'] >= len(df) - 50 and
@@ -216,7 +201,6 @@ class TechnicalAnalyzer:
     
     @staticmethod
     def detect_patterns(df: pd.DataFrame) -> List[Dict]:
-        """Detect candlestick and chart patterns"""
         patterns = []
         
         if len(df) < 3:
@@ -269,7 +253,6 @@ class TechnicalAnalyzer:
     
     @staticmethod
     def calculate_volume_profile(df: pd.DataFrame) -> Dict:
-        """Calculate high volume nodes"""
         price_range = df['high'].max() - df['low'].min()
         bins = 20
         bin_size = price_range / bins
@@ -290,11 +273,9 @@ class TechnicalAnalyzer:
         return {'poc': None, 'high_volume_nodes': []}
 
 class OITracker:
-    """Track OI changes using in-memory storage"""
     
     @staticmethod
     def store_oi(symbol: str, oi_data: Dict):
-        """Store current OI in memory with timestamp"""
         timestamp = int(datetime.now().timestamp())
         
         if symbol not in oi_storage:
@@ -305,7 +286,6 @@ class OITracker:
             'data': oi_data
         })
         
-        # Clean old data (keep only last 3 hours)
         cutoff = timestamp - (3 * 3600)
         oi_storage[symbol] = [
             entry for entry in oi_storage[symbol] 
@@ -316,7 +296,6 @@ class OITracker:
     
     @staticmethod
     def get_oi_history(symbol: str, hours: int = 2) -> List[Dict]:
-        """Get OI history from memory"""
         cutoff = int((datetime.now() - timedelta(hours=hours)).timestamp())
         
         if symbol not in oi_storage:
@@ -333,7 +312,6 @@ class OITracker:
     
     @staticmethod
     def analyze_oi_trend(symbol: str) -> Dict:
-        """Analyze OI trend over last 2 hours"""
         history = OITracker.get_oi_history(symbol, hours=2)
         
         if len(history) < 2:
@@ -366,11 +344,9 @@ class OITracker:
         }
 
 class ChartGenerator:
-    """Generate annotated charts based on GPT analysis"""
     
     @staticmethod
     def create_chart(df: pd.DataFrame, analysis: Dict, ai_result: Dict, symbol: str) -> io.BytesIO:
-        """Create chart with GPT analysis overlayed"""
         
         logger.info(f"📈 Generating chart for {symbol} based on GPT analysis...")
         
@@ -406,7 +382,6 @@ class ChartGenerator:
         
         ax = axes[0]
         
-        # Draw support/resistance levels
         if 'swing_lows_30m' in analysis and analysis['swing_lows_30m']:
             for swing in analysis['swing_lows_30m'][-3:]:
                 price = swing['price']
@@ -423,11 +398,9 @@ class ChartGenerator:
         if analysis.get('resistance_4h'):
             ax.axhline(y=analysis['resistance_4h'], color='#c62828', linestyle='-', linewidth=2, label='Resistance 4H')
         
-        # Current price
         current_price = df['close'].iloc[-1]
         ax.axhline(y=current_price, color='#ff9800', linestyle=':', linewidth=2, label=f'Current: ${current_price:.2f}')
         
-        # Draw GPT suggested entry, SL, target
         if ai_result.get('entry') and ai_result['signal'] in ['LONG', 'SHORT']:
             entry_price = ai_result['entry']
             ax.axhline(y=entry_price, color='#2196f3', linestyle='-.', linewidth=2.5, label=f'Entry: ${entry_price:.2f}')
@@ -440,7 +413,6 @@ class ChartGenerator:
                 target_price = ai_result['target']
                 ax.axhline(y=target_price, color='#388e3c', linestyle='-.', linewidth=2, label=f'Target: ${target_price:.2f}')
         
-        # Add patterns box
         if analysis.get('patterns'):
             pattern_text = "\n".join([p['name'] for p in analysis['patterns'][:3]])
             ax.text(
@@ -452,7 +424,6 @@ class ChartGenerator:
                 fontsize=10
             )
         
-        # Add GPT signal box
         if ai_result.get('signal'):
             signal = ai_result['signal']
             signal_color = '#4caf50' if 'LONG' in signal else '#f44336' if 'SHORT' in signal else '#9e9e9e'
@@ -479,7 +450,6 @@ class ChartGenerator:
                 fontweight='bold'
             )
         
-        # Legend
         handles, labels = ax.get_legend_handles_labels()
         by_label = dict(zip(labels, handles))
         ax.legend(by_label.values(), by_label.keys(), loc='upper left', fontsize=8)
@@ -494,11 +464,9 @@ class ChartGenerator:
         return buf
 
 class TradeAnalyzer:
-    """Main trade analysis engine"""
     
     @staticmethod
     def analyze_setup(symbol: str) -> Dict:
-        """Comprehensive trade analysis with 500 candles per TF"""
         logger.info(f"\n{'='*60}")
         logger.info(f"🔍 ANALYZING {symbol}")
         logger.info(f"{'='*60}")
@@ -534,9 +502,8 @@ class TradeAnalyzer:
         volume_ratio = current_volume / avg_volume if avg_volume > 0 else 0
         
         logger.info(f"💰 Price: ${current_price:.2f}")
-        logger.info(f"📊 Volume: {volume_ratio:.2f}x (current: {current_volume:.2f}, avg: {avg_volume:.2f})")
+        logger.info(f"📊 Volume: {volume_ratio:.2f}x")
         
-        # Get 4H S/R - closest to current price
         resistance_4h = None
         support_4h = None
         
@@ -574,7 +541,6 @@ class TradeAnalyzer:
     
     @staticmethod
     def get_ai_analysis(analysis: Dict) -> Dict:
-        """Get GPT-4o mini analysis"""
         
         logger.info(f"\n🤖 Calling OpenAI GPT-4o-mini for {analysis['symbol']}...")
         
@@ -665,25 +631,28 @@ REASON: [why not]"""
                 elif 'ENTRY:' in line:
                     try:
                         entry_str = line.split('ENTRY:')[-1].strip()
-                        entry_str = entry_str.replace(', '').replace(',', '')
+                        entry_str = entry_str.replace('$', '')
+                        entry_str = entry_str.replace(',', '')
                         result['entry'] = float(entry_str.split()[0])
-                    except:
+                    except Exception:
                         result['entry'] = analysis['current_price']
                 
                 elif 'SL:' in line or 'STOP' in line:
                     try:
                         sl_str = line.split(':')[-1].strip()
-                        sl_str = sl_str.replace(', '').replace(',', '')
+                        sl_str = sl_str.replace('$', '')
+                        sl_str = sl_str.replace(',', '')
                         result['sl'] = float(sl_str.split()[0])
-                    except:
+                    except Exception:
                         pass
                 
                 elif 'TARGET:' in line:
                     try:
                         tgt_str = line.split('TARGET:')[-1].strip()
-                        tgt_str = tgt_str.replace(', '').replace(',', '')
+                        tgt_str = tgt_str.replace(', '')
+                        tgt_str = tgt_str.replace(',', '')
                         result['target'] = float(tgt_str.split()[0])
-                    except:
+                    except Exception:
                         pass
                 
                 elif 'PATTERN:' in line:
@@ -712,7 +681,6 @@ REASON: [why not]"""
             }
 
 class TradingBot:
-    """Main bot logic"""
     
     def __init__(self):
         self.trade_count_today = 0
@@ -720,14 +688,12 @@ class TradingBot:
         self.bot_start_time = datetime.now()
     
     def reset_daily_counter(self):
-        """Reset trade counter at midnight"""
         if datetime.now().date() > self.last_reset:
             self.trade_count_today = 0
             self.last_reset = datetime.now().date()
             logger.info("🔄 Trade counter reset for new day")
     
     async def scan_markets(self, context: ContextTypes.DEFAULT_TYPE):
-        """Scan all symbols for setups"""
         logger.info(f"\n{'='*80}")
         logger.info(f"🚀 STARTING MARKET SCAN - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         logger.info(f"{'='*80}")
@@ -747,9 +713,8 @@ class TradingBot:
                     logger.warning(f"⚠️ {symbol}: Invalid data, skipping")
                     continue
                 
-                logger.info(f"💵 {symbol}: Price=${analysis['current_price']:.2f}, Volume={analysis['volume_ratio']}x, Patterns={len(analysis.get('patterns', []))}")
+                logger.info(f"💵 {symbol}: Price=${analysis['current_price']:.2f}, Volume={analysis['volume_ratio']}x")
                 
-                # Always send to GPT for analysis
                 logger.info(f"✅ {symbol}: Sending to GPT-4o-mini analysis...")
                 
                 ai_result = TradeAnalyzer.get_ai_analysis(analysis)
@@ -774,7 +739,6 @@ class TradingBot:
         logger.info(f"{'='*80}\n")
     
     async def send_alert(self, context: ContextTypes.DEFAULT_TYPE, symbol: str, analysis: Dict, ai_result: Dict):
-        """Send trade alert with GPT-generated chart to Telegram"""
         
         logger.info(f"📤 Sending alert for {symbol} with GPT analysis...")
         
@@ -794,7 +758,7 @@ class TradingBot:
                 rr = abs((ai_result['target'] - ai_result['entry']) / (ai_result['entry'] - ai_result['sl']))
             else:
                 rr = 0
-        except:
+        except Exception:
             rr = 0
         
         message = f"""{signal_emoji} **{analysis['symbol']} - {ai_result['signal']} SETUP**
@@ -847,7 +811,6 @@ class TradingBot:
             logger.error(f"❌ Error sending alert: {e}")
     
     async def send_startup_alert(self, context: ContextTypes.DEFAULT_TYPE):
-        """Send startup notification"""
         startup_message = f"""🤖 **TRADING BOT STARTED**
 
 ✅ Status: Online and Active
@@ -880,7 +843,6 @@ class TradingBot:
             logger.error(f"❌ Failed to send startup alert: {e}")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start command"""
     await update.message.reply_text(
         "🤖 **Trading Bot Active!**\n\n"
         "📊 **Tracking:** BTC & ETH (Deribit)\n"
@@ -897,7 +859,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Status command"""
     bot = context.bot_data.get('trading_bot')
     if bot:
         uptime = datetime.now() - bot.bot_start_time
@@ -918,7 +879,6 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 async def scan_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Manual scan command"""
     await update.message.reply_text("🔍 Starting manual scan with GPT-4o-mini analysis...")
     bot = context.bot_data.get('trading_bot')
     if bot:
@@ -926,7 +886,6 @@ async def scan_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Scan complete!")
 
 async def analyze_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Analyze specific symbol with GPT"""
     if not context.args:
         await update.message.reply_text("Usage: /analyze BTC or /analyze ETH")
         return
@@ -980,7 +939,6 @@ async def analyze_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Error analyzing {symbol}: {str(e)}")
 
 def main():
-    """Main function"""
     logger.info("="*80)
     logger.info("🚀 INITIALIZING CRYPTO TRADING BOT WITH GPT-4O-MINI")
     logger.info("="*80)

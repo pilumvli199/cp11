@@ -6,7 +6,7 @@ import aiohttp
 import pandas as pd
 import mplfinance as mpf
 from telegram import Bot
-from telegram.ext import Application, CommandHandler
+from telegram.ext import Application, CommandHandler, ContextTypes
 import google.generativeai as genai
 from PIL import Image
 
@@ -16,7 +16,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY")
 
 CRYPTO_PAIRS = ["BTC", "ETH", "SOL"]  # Deribit supports these
-TIMEFRAME = "1h"  # Deribit timeframe
+TIMEFRAME = "60"  # 60 minutes = 1 hour
 SCAN_INTERVAL = 300  # 5 minutes = 300 seconds
 GEMINI_MODEL = "gemini-1.5-flash-latest"
 
@@ -93,7 +93,7 @@ async def fetch_deribit_options_chain(session, symbol):
                 for opt in options:
                     chain_data.append({
                         'instrument': opt['instrument_name'],
-                        'type': 'CALL' if 'C' in opt['instrument_name'] else 'PUT',
+                        'type': 'CALL' if '-C' in opt['instrument_name'] else 'PUT',
                         'strike': opt['instrument_name'].split('-')[2] if len(opt['instrument_name'].split('-')) > 2 else 'N/A',
                         'expiry': opt['instrument_name'].split('-')[1] if len(opt['instrument_name'].split('-')) > 1 else 'N/A',
                         'bid_price': opt.get('bid_price', 0),
@@ -169,7 +169,7 @@ def create_chart(df, symbol):
         return None
 
 # ==================== OPTIONS CHAIN FORMATTING ====================
-def format_options_data(options_df, current_price):
+def format_options_data(options_df, current_price, symbol):
     """Format options chain data for Telegram message"""
     if options_df is None or options_df.empty:
         return "❌ No options data available"
@@ -181,33 +181,33 @@ def format_options_data(options_df, current_price):
         (options_df['strike_num'] <= current_price * 1.2)
     ].copy()
     
-    # Sort by expiry and strike
-    filtered = filtered.sort_values(['expiry', 'strike_num'])
-    
-    # Get top 10 by volume
+    # Sort by volume and get top 10
     top_volume = filtered.nlargest(10, 'volume')
     
-    message = f"📊 **Options Chain Summary**\n\n"
+    message = f"📊 **{symbol} Options Chain Summary**\n\n"
     message += f"💰 Current Price: ${current_price:,.2f}\n"
     message += f"📈 Total Options: {len(options_df)}\n\n"
-    message += f"**🔥 Top 10 by Volume (Near Money):**\n\n"
+    message += f"**🔥 Top 10 by Volume (±20% from spot):**\n\n"
     
     for idx, row in top_volume.iterrows():
-        message += f"{'📗' if row['type'] == 'CALL' else '📕'} **{row['instrument']}**\n"
-        message += f"   Strike: ${row['strike']} | Type: {row['type']}\n"
-        message += f"   Bid/Ask: ${row['bid_price']:.4f} / ${row['ask_price']:.4f}\n"
-        message += f"   Volume: {row['volume']:.2f} | OI: {row['open_interest']:.2f}\n\n"
+        emoji = '📗' if row['type'] == 'CALL' else '📕'
+        message += f"{emoji} **{row['instrument']}**\n"
+        message += f"   Strike: ${row['strike']} | {row['type']}\n"
+        message += f"   Bid/Ask: ${row['bid_price']:.4f}/${row['ask_price']:.4f}\n"
+        message += f"   Vol: {row['volume']:.2f} | OI: {row['open_interest']:.2f}\n\n"
     
-    # Add summary statistics
+    # Summary statistics
     total_call_volume = filtered[filtered['type'] == 'CALL']['volume'].sum()
     total_put_volume = filtered[filtered['type'] == 'PUT']['volume'].sum()
     total_call_oi = filtered[filtered['type'] == 'CALL']['open_interest'].sum()
     total_put_oi = filtered[filtered['type'] == 'PUT']['open_interest'].sum()
     
-    message += f"\n📊 **Statistics (±20% from spot):**\n"
-    message += f"CALL Volume: {total_call_volume:,.2f} | PUT Volume: {total_put_volume:,.2f}\n"
-    message += f"CALL OI: {total_call_oi:,.2f} | PUT OI: {total_put_oi:,.2f}\n"
-    message += f"Put/Call Ratio: {(total_put_volume/total_call_volume if total_call_volume > 0 else 0):.2f}"
+    pcr = (total_put_volume/total_call_volume if total_call_volume > 0 else 0)
+    
+    message += f"\n📊 **Statistics (±20%):**\n"
+    message += f"📗 CALL Vol: {total_call_volume:,.2f} | OI: {total_call_oi:,.2f}\n"
+    message += f"📕 PUT Vol: {total_put_volume:,.2f} | OI: {total_put_oi:,.2f}\n"
+    message += f"📊 Put/Call Ratio: {pcr:.2f}"
     
     return message
 
@@ -218,32 +218,31 @@ def analyze_chart_with_gemini(chart_file, ohlc_data, symbol, options_summary):
         return "Gemini model is not initialized."
         
     prompt = f"""
-    You are an expert crypto options trader analyzing {symbol} on Deribit.
-    
-    **Last 10 candles OHLC data (1H timeframe):**
-    {ohlc_data.tail(10).to_string()}
-    
-    **Options Chain Context:**
-    {options_summary}
-    
-    **Your task:**
-    Analyze this 30-day chart for:
-    1. Major Support & Resistance levels
-    2. Trend analysis (bullish/bearish/sideways)
-    3. Key candlestick patterns
-    4. Chart patterns (triangles, H&S, channels, etc.)
-    5. Volume analysis
-    6. Options market sentiment based on Put/Call ratio
-    7. Potential trade setups considering options data
-    
-    **IMPORTANT:**
-    - If there's a HIGH-PROBABILITY setup, respond with: "TRADE SETUP FOUND"
-    - Provide: Entry, Stop Loss, Target, Risk/Reward
-    - Consider options flow in your analysis
-    - If no clear setup, respond with: "NO TRADE SETUP"
-    
-    Keep analysis concise and actionable.
-    """
+You are an expert crypto options trader analyzing {symbol} on Deribit.
+
+**Last 10 candles OHLC (1H):**
+{ohlc_data.tail(10).to_string()}
+
+**Options Context:**
+{options_summary[:500]}
+
+**Analyze:**
+1. Key Support & Resistance
+2. Trend (bullish/bearish/sideways)
+3. Candlestick patterns
+4. Chart patterns
+5. Volume analysis
+6. Options sentiment (Put/Call ratio)
+7. Trade setup potential
+
+**Format:**
+- If HIGH-PROBABILITY setup exists: "TRADE SETUP FOUND"
+  Then: Entry, Stop Loss, Target, Risk/Reward, Reasoning
+- If no setup: "NO TRADE SETUP"
+  Then: Brief market analysis
+
+Keep it concise and actionable.
+"""
     
     try:
         img = Image.open(chart_file)
@@ -259,19 +258,32 @@ async def send_telegram_alert(bot, symbol, chart_file, options_message, analysis
     try:
         # Send chart with analysis
         with open(chart_file, 'rb') as photo:
+            caption = f"📊 **{symbol}-PERPETUAL Analysis**\n\n{analysis[:900]}"
+            if len(analysis) > 900:
+                caption += "..."
+            
             await bot.send_photo(
                 chat_id=TELEGRAM_CHAT_ID,
                 photo=photo,
-                caption=f"📊 **{symbol}-PERPETUAL Analysis**\n\n{analysis[:800]}...",
+                caption=caption,
                 parse_mode='Markdown'
             )
         
-        # Send options chain data
-        await bot.send_message(
-            chat_id=TELEGRAM_CHAT_ID,
-            text=options_message,
-            parse_mode='Markdown'
-        )
+        # Send options chain data (split if too long)
+        if len(options_message) > 4000:
+            chunks = [options_message[i:i+4000] for i in range(0, len(options_message), 4000)]
+            for chunk in chunks:
+                await bot.send_message(
+                    chat_id=TELEGRAM_CHAT_ID,
+                    text=chunk,
+                    parse_mode='Markdown'
+                )
+        else:
+            await bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID,
+                text=options_message,
+                parse_mode='Markdown'
+            )
         
         print(f"✅ Alert sent for {symbol}")
     except Exception as e:
@@ -280,11 +292,14 @@ async def send_telegram_alert(bot, symbol, chart_file, options_message, analysis
 # ==================== MAIN SCANNER ====================
 async def scan_cryptos(bot: Bot):
     """Main scanner loop - runs every 5 minutes"""
-    await bot.send_message(
-        chat_id=TELEGRAM_CHAT_ID, 
-        text=f"🚀 **Deribit Options Bot Started!**\n\n📊 Monitoring: {', '.join(CRYPTO_PAIRS)}\n⏰ Scan Interval: {SCAN_INTERVAL//60} minutes",
-        parse_mode='Markdown'
-    )
+    try:
+        await bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID, 
+            text=f"🚀 **Deribit Options Bot Started!**\n\n📊 Monitoring: {', '.join(CRYPTO_PAIRS)}\n⏰ Scan Interval: {SCAN_INTERVAL//60} minutes\n\n_Scanner is now running..._",
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        print(f"❌ Startup message error: {e}")
     
     print(f"📊 Monitoring: {', '.join(CRYPTO_PAIRS)}")
     print(f"⏰ Scan Interval: Every {SCAN_INTERVAL//60} minutes\n")
@@ -315,14 +330,14 @@ async def scan_cryptos(bot: Bot):
                     continue
                 
                 # Format options data
-                options_message = format_options_data(options_df, current_price)
+                options_message = format_options_data(options_df, current_price, symbol)
                 
                 # Analyze with Gemini
                 print("🤖 Analyzing with Gemini AI...")
                 analysis = analyze_chart_with_gemini(chart_file, df, symbol, options_message[:500])
                 print(f"📋 Analysis Preview:\n{analysis[:300]}...")
                 
-                # Send alert (always send for monitoring)
+                # Send alert
                 if "TRADE SETUP FOUND" in analysis.upper():
                     print(f"🎯 Trade setup detected for {symbol}!")
                 else:
@@ -343,37 +358,46 @@ async def scan_cryptos(bot: Bot):
             await asyncio.sleep(SCAN_INTERVAL)
 
 # ==================== TELEGRAM COMMANDS ====================
-async def start(update, context):
+async def start(update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 **Deribit Options Chain Bot**\n\n"
         f"📊 Coins: BTC, ETH, SOL\n"
         f"⏰ Scans every 5 minutes\n"
-        f"📈 30-day charts with options data\n\n"
-        f"Commands:\n"
+        f"📈 30-day charts + options data\n\n"
+        f"**Commands:**\n"
         f"/start - Bot info\n"
         f"/status - Check status",
         parse_mode='Markdown'
     )
 
-async def status(update, context):
+async def status(update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"✅ **Bot Status: Running**\n\n"
         f"📊 Monitoring: {', '.join(CRYPTO_PAIRS)}\n"
-        f"⏰ Next scan in progress...",
+        f"⏰ Scanner is active",
         parse_mode='Markdown'
     )
+
+# ==================== POST INIT ====================
+async def post_init(application: Application):
+    """Called after bot initialization to start scanner"""
+    print("🚀 Starting scanner task...")
+    asyncio.create_task(scan_cryptos(application.bot))
 
 # ==================== RUN BOT ====================
 async def main():
     """Start bot and scanner"""
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    
+    # Add command handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("status", status))
     
-    # Start scanner in background
-    application.job_queue.run_once(lambda ctx: asyncio.create_task(scan_cryptos(ctx.bot)), 0)
+    # Set post_init callback to start scanner
+    application.post_init = post_init
     
     # Start polling
+    print("🤖 Starting Telegram bot...")
     await application.run_polling()
 
 if __name__ == "__main__":

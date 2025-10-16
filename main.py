@@ -1,406 +1,694 @@
 import os
-import asyncio
-import logging
-from datetime import datetime, timedelta
+import time
 import json
-from telegram import Update, InputFile
-from telegram.ext import Application, CommandHandler, ContextTypes
 import requests
-from openai import OpenAI
-import pandas as pd
-import numpy as np
-from typing import Dict, List, Tuple
-import mplfinance as mpf
-import matplotlib.pyplot as plt
-import io
+from datetime import datetime, timedelta
+from dotenv import load_dotenv
+import openai
+import asyncio
+from telegram import Bot
+from telegram.error import TelegramError
+import redis
+import hashlib
 
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+# Load environment variables
+load_dotenv()
+
+# Configuration
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
+REDIS_DB = int(os.getenv("REDIS_DB", 0))
+DERIBIT_API_URL = "https://www.deribit.com/api/v2/public"
+SCAN_INTERVAL = 1800  # 30 minutes in seconds
+MAX_MEMORY_MB = int(os.getenv("MAX_MEMORY_MB", 500))  # Max Redis memory for data
+
+# DeepSeek Client Setup
+deepseek_client = openai.OpenAI(
+    api_key=DEEPSEEK_API_KEY,
+    base_url="https://api.deepseek.com"
 )
-logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
-CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
+# Telegram Bot Setup
+telegram_bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
-client = OpenAI(api_key=OPENAI_API_KEY)
-oi_storage = {}
+# Redis Connection
+try:
+    redis_client = redis.Redis(
+        host=REDIS_HOST,
+        port=REDIS_PORT,
+        db=REDIS_DB,
+        decode_responses=True,
+        socket_connect_timeout=5
+    )
+    redis_client.ping()
+    print("✅ Redis connected successfully")
+except Exception as e:
+    print(f"❌ Redis connection failed: {e}")
+    print("⚠️  Bot will continue without Redis caching")
+    redis_client = None
 
-DERIBIT_BASE = "https://www.deribit.com/api/v2/public"
-SYMBOLS = ['BTC-PERPETUAL', 'ETH-PERPETUAL']
-MAX_TRADES_PER_DAY = 8
-CANDLE_COUNT = 500
 
-class DeribitClient:
-    RESOLUTION_MAP = {'30': '30', '60': '60', '240': '1D'}
+class CryptoAnalyzer:
+    """Main crypto analysis bot with DeepSeek V3 + Redis caching"""
     
-    @staticmethod
-    def get_candles(symbol: str, timeframe: str, count: int = CANDLE_COUNT) -> pd.DataFrame:
-        logger.info(f"Fetching {count} candles for {symbol} {timeframe}m...")
-        resolution = DeribitClient.RESOLUTION_MAP.get(timeframe, timeframe)
-        url = f"{DERIBIT_BASE}/get_tradingview_chart_data"
-        tf_minutes = int(timeframe)
-        days_needed = count + 10 if timeframe == '240' else (count * tf_minutes) // (24 * 60) + 10
+    def __init__(self):
+        self.symbols = ["BTC", "ETH"]
+        self.timeframe = "30"  # 30 minutes
+        self.ema_periods = [9, 21, 50, 200]
+        self.redis_client = redis_client
+        self.option_chain_cache_key = "option_chain_data"
+        self.signal_history_key = "signal_history"
         
-        params = {
-            'instrument_name': symbol,
-            'resolution': resolution,
-            'start_timestamp': int((datetime.now() - timedelta(days=days_needed)).timestamp() * 1000),
-            'end_timestamp': int(datetime.now().timestamp() * 1000)
-        }
+    def _get_cache_key(self, symbol, data_type):
+        """Generate cache key for Redis"""
+        return f"crypto_analysis:{symbol}:{data_type}:{datetime.now().strftime('%Y%m%d_%H%M')}"
+    
+    def _manage_redis_memory(self):
+        """Delete old data if memory is getting full"""
+        if not self.redis_client:
+            return
         
         try:
-            response = requests.get(url, params=params, timeout=15)
-            if response.status_code != 200:
-                return pd.DataFrame()
+            info = self.redis_client.info('memory')
+            used_memory_mb = info['used_memory'] / (1024 * 1024)
             
-            data = response.json()
-            if 'result' not in data or data['result'].get('status') != 'ok':
-                return pd.DataFrame()
+            if used_memory_mb > MAX_MEMORY_MB:
+                print(f"⚠️  Redis memory high ({used_memory_mb:.2f}MB). Cleaning old data...")
+                
+                # Get all keys
+                all_keys = self.redis_client.keys("crypto_analysis:*")
+                
+                # Sort by timestamp and delete oldest 20%
+                if all_keys:
+                    keys_to_delete = sorted(all_keys)[:len(all_keys) // 5]
+                    if keys_to_delete:
+                        self.redis_client.delete(*keys_to_delete)
+                        print(f"🗑️  Deleted {len(keys_to_delete)} old cache entries")
+        except Exception as e:
+            print(f"❌ Error managing Redis memory: {e}")
+    
+    def _store_option_chain(self, symbol, option_data):
+        """Store option chain data in Redis for comparison"""
+        if not self.redis_client or not option_data:
+            return
+        
+        try:
+            key = f"{self.option_chain_cache_key}:{symbol}"
+            timestamp = datetime.now().isoformat()
             
-            result = data['result']
-            df = pd.DataFrame({
-                'timestamp': pd.to_datetime(result['ticks'], unit='ms'),
-                'open': result['open'],
-                'high': result['high'],
-                'low': result['low'],
-                'close': result['close'],
-                'volume': result['volume']
-            })
-            df.set_index('timestamp', inplace=True)
-            logger.info(f"Fetched {len(df)} candles for {symbol}")
-            return df.tail(count)
-        except Exception as e:
-            logger.error(f"Error fetching {symbol}: {e}")
-            return pd.DataFrame()
-    
-    @staticmethod
-    def get_order_book(symbol: str) -> Dict:
-        url = f"{DERIBIT_BASE}/get_order_book"
-        params = {'instrument_name': symbol, 'depth': 10}
-        try:
-            response = requests.get(url, params=params, timeout=10)
-            data = response.json()
-            if 'result' in data:
-                return {
-                    'open_interest': data['result'].get('open_interest', 0),
-                    'volume_24h': data['result'].get('stats', {}).get('volume', 0),
-                    'mark_price': data['result'].get('mark_price', 0)
-                }
-        except Exception as e:
-            logger.error(f"Error fetching order book: {e}")
-        return {'open_interest': 0, 'volume_24h': 0, 'mark_price': 0}
-
-class TechnicalAnalyzer:
-    @staticmethod
-    def find_swing_points(df: pd.DataFrame, period: int = 5) -> Tuple[List, List]:
-        swing_highs = []
-        swing_lows = []
-        for i in range(period, len(df) - period):
-            if df['high'].iloc[i] == df['high'].iloc[i-period:i+period+1].max():
-                swing_highs.append({'price': df['high'].iloc[i], 'index': i, 'timestamp': df.index[i]})
-            if df['low'].iloc[i] == df['low'].iloc[i-period:i+period+1].min():
-                swing_lows.append({'price': df['low'].iloc[i], 'index': i, 'timestamp': df.index[i]})
-        
-        current_price = df['close'].iloc[-1]
-        relevant_highs = [s for s in swing_highs if s['index'] >= len(df) - 50 and s['price'] >= current_price and s['price'] <= current_price * 1.05]
-        relevant_lows = [s for s in swing_lows if s['index'] >= len(df) - 50 and s['price'] <= current_price and s['price'] >= current_price * 0.95]
-        
-        if not relevant_highs:
-            relevant_highs = sorted(swing_highs, key=lambda x: abs(x['price'] - current_price))[:3]
-        if not relevant_lows:
-            relevant_lows = sorted(swing_lows, key=lambda x: abs(x['price'] - current_price))[:3]
-        
-        return sorted(relevant_highs, key=lambda x: x['index'], reverse=True)[:3], sorted(relevant_lows, key=lambda x: x['index'], reverse=True)[:3]
-    
-    @staticmethod
-    def detect_patterns(df: pd.DataFrame) -> List[Dict]:
-        patterns = []
-        if len(df) < 3:
-            return patterns
-        last = df.iloc[-1]
-        prev = df.iloc[-2]
-        body = abs(last['close'] - last['open'])
-        candle_range = last['high'] - last['low']
-        if candle_range > 0 and body < candle_range * 0.1:
-            patterns.append({'name': 'Doji', 'signal': 'neutral'})
-        return patterns
-
-class OITracker:
-    @staticmethod
-    def store_oi(symbol: str, oi_data: Dict):
-        timestamp = int(datetime.now().timestamp())
-        if symbol not in oi_storage:
-            oi_storage[symbol] = []
-        oi_storage[symbol].append({'timestamp': timestamp, 'data': oi_data})
-        cutoff = timestamp - (3 * 3600)
-        oi_storage[symbol] = [e for e in oi_storage[symbol] if e['timestamp'] >= cutoff]
-    
-    @staticmethod
-    def analyze_oi_trend(symbol: str) -> Dict:
-        if symbol not in oi_storage or len(oi_storage[symbol]) < 2:
-            return {'trend': 'insufficient_data', 'change': 0}
-        history = oi_storage[symbol]
-        current_oi = history[-1]['data']['open_interest']
-        old_oi = history[0]['data']['open_interest']
-        change = ((current_oi - old_oi) / old_oi * 100) if old_oi > 0 else 0
-        
-        if change > 5:
-            trend = 'strongly_increasing'
-        elif change > 2:
-            trend = 'increasing'
-        elif change < -5:
-            trend = 'strongly_decreasing'
-        elif change < -2:
-            trend = 'decreasing'
-        else:
-            trend = 'stable'
-        return {'trend': trend, 'change': round(change, 2), 'current_oi': current_oi, 'previous_oi': old_oi}
-
-class ChartGenerator:
-    @staticmethod
-    def create_chart(df: pd.DataFrame, analysis: Dict, ai_result: Dict, symbol: str) -> io.BytesIO:
-        mc = mpf.make_marketcolors(up='#26a69a', down='#ef5350', edge='inherit', wick='inherit', volume='in', alpha=0.9)
-        s = mpf.make_mpf_style(marketcolors=mc, gridstyle='-', gridcolor='#e0e0e0', facecolor='white', figcolor='white')
-        
-        fig, axes = mpf.plot(df.tail(100), type='candle', style=s, volume=True, returnfig=True, figsize=(14, 8), title=f"{symbol} - {ai_result.get('pattern', 'Analysis')}")
-        ax = axes[0]
-        
-        if analysis.get('swing_lows_30m'):
-            for swing in analysis['swing_lows_30m'][-3:]:
-                ax.axhline(y=swing['price'], color='#4caf50', linestyle='--', linewidth=1.5, alpha=0.7)
-        
-        if analysis.get('swing_highs_30m'):
-            for swing in analysis['swing_highs_30m'][-3:]:
-                ax.axhline(y=swing['price'], color='#f44336', linestyle='--', linewidth=1.5, alpha=0.7)
-        
-        current_price = df['close'].iloc[-1]
-        ax.axhline(y=current_price, color='#ff9800', linestyle=':', linewidth=2)
-        
-        if ai_result.get('entry') and ai_result['signal'] in ['LONG', 'SHORT']:
-            ax.axhline(y=ai_result['entry'], color='#2196f3', linestyle='-.', linewidth=2.5)
-            if ai_result.get('sl'):
-                ax.axhline(y=ai_result['sl'], color='#d32f2f', linestyle='-.', linewidth=2)
-            if ai_result.get('target'):
-                ax.axhline(y=ai_result['target'], color='#388e3c', linestyle='-.', linewidth=2)
-        
-        buf = io.BytesIO()
-        fig.savefig(buf, format='png', dpi=150, facecolor='white')
-        buf.seek(0)
-        plt.close(fig)
-        return buf
-
-class TradeAnalyzer:
-    @staticmethod
-    def analyze_setup(symbol: str) -> Dict:
-        df_30m = DeribitClient.get_candles(symbol, '30', CANDLE_COUNT)
-        df_1h = DeribitClient.get_candles(symbol, '60', CANDLE_COUNT)
-        df_4h = DeribitClient.get_candles(symbol, '240', CANDLE_COUNT)
-        
-        if df_30m.empty or df_1h.empty or df_4h.empty:
-            return {'valid': False, 'symbol': symbol}
-        
-        oi_data = DeribitClient.get_order_book(symbol)
-        OITracker.store_oi(symbol, oi_data)
-        oi_trend = OITracker.analyze_oi_trend(symbol)
-        
-        swing_highs_30m, swing_lows_30m = TechnicalAnalyzer.find_swing_points(df_30m)
-        swing_highs_4h, swing_lows_4h = TechnicalAnalyzer.find_swing_points(df_4h)
-        patterns = TechnicalAnalyzer.detect_patterns(df_30m)
-        
-        current_price = df_30m['close'].iloc[-1]
-        volume_ratio = df_30m['volume'].iloc[-1] / df_30m['volume'].tail(20).mean() if df_30m['volume'].tail(20).mean() > 0 else 0
-        
-        resistance_4h = min([s['price'] for s in swing_highs_4h if s['price'] >= current_price], default=None)
-        support_4h = max([s['price'] for s in swing_lows_4h if s['price'] <= current_price], default=None)
-        
-        return {
-            'symbol': symbol,
-            'current_price': current_price,
-            'patterns': patterns,
-            'volume_ratio': round(volume_ratio, 2),
-            'oi_trend': oi_trend,
-            'swing_highs_30m': swing_highs_30m,
-            'swing_lows_30m': swing_lows_30m,
-            'resistance_4h': resistance_4h,
-            'support_4h': support_4h,
-            'df_30m': df_30m,
-            'valid': True
-        }
-    
-    @staticmethod
-    def get_ai_analysis(analysis: Dict) -> Dict:
-        patterns_text = ', '.join([p['name'] for p in analysis.get('patterns', [])]) or 'None'
-        prompt = f"""Analyze {analysis['symbol']}:
-Price: ${analysis['current_price']:.2f}
-Patterns: {patterns_text}
-Volume: {analysis['volume_ratio']}x
-OI Trend: {analysis['oi_trend']['trend']}
-
-Decide: LONG, SHORT, or NO_TRADE
-If tradeable, provide ENTRY, SL, TARGET, REASON"""
-
-        try:
-            response = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": "You are a crypto trader. Be conservative."},
-                    {"role": "user", "content": prompt}
-                ],
-                max_tokens=300,
-                temperature=0.3
+            data_with_time = {
+                "timestamp": timestamp,
+                "data": option_data
+            }
+            
+            # Store as JSON
+            self.redis_client.setex(
+                key,
+                3600,  # 1 hour expiry
+                json.dumps(data_with_time)
             )
             
-            ai_text = response.choices[0].message.content
-            result = {'signal': 'NO_TRADE', 'entry': None, 'sl': None, 'target': None, 'pattern': 'None', 'reason': ai_text}
-            
-            for line in ai_text.split('\n'):
-                line = line.strip()
-                if 'SIGNAL:' in line:
-                    if 'LONG' in line.upper():
-                        result['signal'] = 'LONG'
-                    elif 'SHORT' in line.upper():
-                        result['signal'] = 'SHORT'
-                elif 'ENTRY:' in line:
-                    try:
-                        val = line.split('ENTRY:')[-1].strip().replace('$', '').replace(',', '')
-                        result['entry'] = float(val.split()[0])
-                    except:
-                        pass
-                elif 'SL:' in line or 'STOP' in line:
-                    try:
-                        val = line.split(':')[-1].strip().replace('$', '').replace(',', '')
-                        result['sl'] = float(val.split()[0])
-                    except:
-                        pass
-                elif 'TARGET:' in line:
-                    try:
-                        val = line.split('TARGET:')[-1].strip().replace('$', '').replace(',', '')
-                        result['target'] = float(val.split()[0])
-                    except:
-                        pass
-            
-            return result
+            print(f"✅ Option chain stored in Redis for {symbol}")
         except Exception as e:
-            logger.error(f"GPT error: {e}")
-            return {'signal': 'ERROR', 'reason': str(e), 'entry': None, 'sl': None, 'target': None, 'pattern': 'Error'}
+            print(f"❌ Error storing option chain: {e}")
+    
+    def _get_previous_option_chain(self, symbol):
+        """Get previous option chain data for comparison"""
+        if not self.redis_client:
+            return None
+        
+        try:
+            key = f"{self.option_chain_cache_key}:{symbol}"
+            data = self.redis_client.get(key)
+            
+            if data:
+                return json.loads(data)
+            return None
+        except Exception as e:
+            print(f"❌ Error retrieving previous option chain: {e}")
+            return None
+    
+    def _compare_option_chains(self, symbol, current_options, previous_options):
+        """Compare current and previous option chain data"""
+        if not previous_options or not current_options:
+            return {}
+        
+        try:
+            curr_data = current_options
+            prev_data = previous_options.get("data", {})
+            
+            comparison = {
+                "pcr_change": curr_data.get("pcr_ratio", 0) - prev_data.get("pcr_ratio", 0),
+                "call_oi_change": curr_data.get("total_call_oi", 0) - prev_data.get("total_call_oi", 0),
+                "put_oi_change": curr_data.get("total_put_oi", 0) - prev_data.get("total_put_oi", 0),
+                "previous_pcr": prev_data.get("pcr_ratio", 0),
+                "current_pcr": curr_data.get("pcr_ratio", 0),
+                "timestamp": previous_options.get("timestamp")
+            }
+            
+            return comparison
+        except Exception as e:
+            print(f"❌ Error comparing option chains: {e}")
+            return {}
 
-class TradingBot:
-    def __init__(self):
-        self.trade_count_today = 0
-        self.last_reset = datetime.now().date()
-        self.bot_start_time = datetime.now()
+    def fetch_candlestick_data(self, symbol, count=100):
+        """Fetch historical candlestick data from Deribit"""
+        try:
+            instrument = f"{symbol}-PERPETUAL"
+            endpoint = f"{DERIBIT_API_URL}/get_tradingview_chart_data"
+            
+            params = {
+                "instrument_name": instrument,
+                "resolution": self.timeframe,
+                "start_timestamp": int(time.time() * 1000) - (count * 30 * 60 * 1000),
+                "end_timestamp": int(time.time() * 1000)
+            }
+            
+            response = requests.get(endpoint, params=params, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            
+            if data.get("result"):
+                result = data["result"]
+                candles = []
+                for i in range(len(result["ticks"])):
+                    candles.append({
+                        "timestamp": result["ticks"][i],
+                        "open": result["open"][i],
+                        "high": result["high"][i],
+                        "low": result["low"][i],
+                        "close": result["close"][i],
+                        "volume": result["volume"][i]
+                    })
+                return candles[-100:]
+            return None
+            
+        except Exception as e:
+            print(f"❌ Error fetching candlestick data for {symbol}: {e}")
+            return None
     
-    def reset_daily_counter(self):
-        if datetime.now().date() > self.last_reset:
-            self.trade_count_today = 0
-            self.last_reset = datetime.now().date()
+    def fetch_option_chain_data(self, symbol):
+        """Fetch option chain data from Deribit"""
+        try:
+            currency = symbol.replace("-PERPETUAL", "")
+            endpoint = f"{DERIBIT_API_URL}/get_book_summary_by_currency"
+            
+            params = {
+                "currency": currency,
+                "kind": "option"
+            }
+            
+            response = requests.get(endpoint, params=params, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            
+            if data.get("result"):
+                options = data["result"]
+                
+                call_oi = sum(opt.get("open_interest", 0) for opt in options if "C" in opt["instrument_name"])
+                put_oi = sum(opt.get("open_interest", 0) for opt in options if "P" in opt["instrument_name"])
+                
+                pcr = put_oi / call_oi if call_oi > 0 else 0
+                
+                strikes_data = {}
+                for opt in options[:50]:
+                    strike = opt.get("instrument_name", "").split("-")[2] if len(opt.get("instrument_name", "").split("-")) > 2 else None
+                    if strike and strike.isdigit():
+                        if strike not in strikes_data:
+                            strikes_data[strike] = {"call_oi": 0, "put_oi": 0}
+                        if "C" in opt["instrument_name"]:
+                            strikes_data[strike]["call_oi"] += opt.get("open_interest", 0)
+                        else:
+                            strikes_data[strike]["put_oi"] += opt.get("open_interest", 0)
+                
+                option_data = {
+                    "pcr_ratio": round(pcr, 2),
+                    "total_call_oi": call_oi,
+                    "total_put_oi": put_oi,
+                    "significant_strikes": dict(sorted(strikes_data.items(), 
+                                                      key=lambda x: x[1]["call_oi"] + x[1]["put_oi"], 
+                                                      reverse=True)[:10])
+                }
+                
+                # Store in Redis for comparison
+                self._store_option_chain(symbol, option_data)
+                
+                return option_data
+            return None
+            
+        except Exception as e:
+            print(f"❌ Error fetching option chain for {symbol}: {e}")
+            return None
     
-    async def scan_markets(self, context: ContextTypes.DEFAULT_TYPE):
-        logger.info("STARTING SCAN")
-        self.reset_daily_counter()
+    def calculate_ema(self, candles, period):
+        """Calculate Exponential Moving Average"""
+        prices = [c["close"] for c in candles]
+        if len(prices) < period:
+            return None
         
-        if self.trade_count_today >= MAX_TRADES_PER_DAY:
-            return
+        multiplier = 2 / (period + 1)
+        ema = sum(prices[:period]) / period
         
-        for symbol in SYMBOLS:
+        for price in prices[period:]:
+            ema = (price - ema) * multiplier + ema
+        
+        return round(ema, 2)
+    
+    def analyze_candlestick_patterns(self, candles):
+        """Identify candlestick patterns (last 3 candles)"""
+        if len(candles) < 3:
+            return []
+        
+        patterns = []
+        last = candles[-1]
+        prev = candles[-2]
+        prev2 = candles[-3]
+        
+        # Bullish patterns
+        if last["close"] > last["open"] and prev["close"] < prev["open"]:
+            body_ratio = abs(last["close"] - last["open"]) / abs(prev["close"] - prev["open"]) if abs(prev["close"] - prev["open"]) > 0 else 0
+            if body_ratio > 1.5:
+                patterns.append("Bullish Engulfing")
+        
+        # Bearish patterns
+        if last["close"] < last["open"] and prev["close"] > prev["open"]:
+            body_ratio = abs(last["close"] - last["open"]) / abs(prev["close"] - prev["open"]) if abs(prev["close"] - prev["open"]) > 0 else 0
+            if body_ratio > 1.5:
+                patterns.append("Bearish Engulfing")
+        
+        # Doji
+        body = abs(last["close"] - last["open"])
+        range_size = last["high"] - last["low"]
+        if range_size > 0 and body / range_size < 0.1:
+            patterns.append("Doji")
+        
+        # Hammer
+        if last["close"] > last["open"]:
+            lower_wick = last["open"] - last["low"]
+            body_size = last["close"] - last["open"]
+            if body_size > 0 and lower_wick > body_size * 2:
+                patterns.append("Hammer (Bullish)")
+        
+        return patterns
+    
+    def identify_support_resistance(self, candles):
+        """Identify key support and resistance levels"""
+        highs = [c["high"] for c in candles[-50:]]
+        lows = [c["low"] for c in candles[-50:]]
+        
+        resistance = max(highs)
+        support = min(lows)
+        
+        current_price = candles[-1]["close"]
+        
+        return {
+            "resistance": round(resistance, 2),
+            "support": round(support, 2),
+            "current": round(current_price, 2),
+            "distance_to_resistance": round((resistance - current_price) / current_price * 100, 2),
+            "distance_to_support": round((current_price - support) / current_price * 100, 2)
+        }
+    
+    def prepare_analysis_data(self, symbol):
+        """Prepare complete data for AI analysis (80% bot work)"""
+        print(f"\n{'='*50}")
+        print(f"Analyzing {symbol}...")
+        print(f"{'='*50}")
+        
+        # Fetch data
+        candles = self.fetch_candlestick_data(symbol)
+        options = self.fetch_option_chain_data(symbol)
+        
+        if not candles:
+            print(f"❌ Failed to fetch candle data for {symbol}")
+            return None
+        
+        # Get previous option chain for comparison
+        previous_options = self._get_previous_option_chain(symbol)
+        option_comparison = self._compare_option_chains(symbol, options, previous_options) if options else {}
+        
+        # Calculate EMAs
+        emas = {}
+        for period in self.ema_periods:
+            ema = self.calculate_ema(candles, period)
+            if ema:
+                emas[f"EMA_{period}"] = ema
+        
+        # Get patterns and levels
+        patterns = self.analyze_candlestick_patterns(candles)
+        sr_levels = self.identify_support_resistance(candles)
+        
+        # Recent price action
+        last_5_candles = candles[-5:]
+        
+        analysis_data = {
+            "symbol": symbol,
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "current_price": candles[-1]["close"],
+            "emas": emas,
+            "candlestick_patterns": patterns,
+            "support_resistance": sr_levels,
+            "option_chain": options,
+            "option_chain_comparison": option_comparison,
+            "recent_candles": [
+                {
+                    "time": datetime.fromtimestamp(c["timestamp"]/1000).strftime("%H:%M"),
+                    "o": c["open"],
+                    "h": c["high"],
+                    "l": c["low"],
+                    "c": c["close"],
+                    "v": c["volume"]
+                } for c in last_5_candles
+            ],
+            "volume_trend": "Increasing" if last_5_candles[-1]["volume"] > sum(c["volume"] for c in last_5_candles[:-1])/4 else "Decreasing"
+        }
+        
+        print(f"✅ Data collected for {symbol}")
+        print(f"Current Price: ${analysis_data['current_price']}")
+        print(f"Patterns Found: {', '.join(patterns) if patterns else 'None'}")
+        print(f"PCR Ratio: {options['pcr_ratio'] if options else 'N/A'}")
+        if option_comparison:
+            print(f"PCR Change: {option_comparison.get('pcr_change', 0):+.2f}")
+        
+        # Manage memory
+        self._manage_redis_memory()
+        
+        return analysis_data
+    
+    def _is_high_probability_signal(self, analysis_data):
+        """Check if technical setup is high probability before AI analysis"""
+        checks = []
+        
+        # EMA alignment check
+        emas = analysis_data['emas']
+        if emas:
+            ema_9 = emas.get('EMA_9', 0)
+            ema_21 = emas.get('EMA_21', 0)
+            ema_50 = emas.get('EMA_50', 0)
+            current = analysis_data['current_price']
+            
+            # Bullish alignment: price > EMA9 > EMA21 > EMA50
+            bullish_aligned = current > ema_9 > ema_21 > ema_50
+            # Bearish alignment: price < EMA9 < EMA21 < EMA50
+            bearish_aligned = current < ema_9 < ema_21 < ema_50
+            
+            checks.append(bullish_aligned or bearish_aligned)
+        
+        # Pattern check
+        patterns = analysis_data.get('candlestick_patterns', [])
+        has_pattern = len(patterns) > 0
+        checks.append(has_pattern)
+        
+        # Volume check
+        volume_trend = analysis_data.get('volume_trend') == "Increasing"
+        checks.append(volume_trend)
+        
+        # Support/Resistance proximity check
+        sr = analysis_data['support_resistance']
+        near_support_or_resistance = (sr['distance_to_support'] < 2) or (sr['distance_to_resistance'] < 2)
+        checks.append(near_support_or_resistance)
+        
+        # Option chain sentiment check
+        option_chain = analysis_data.get('option_chain')
+        if option_chain:
+            pcr = option_chain.get('pcr_ratio', 0)
+            # Strong sentiment if PCR is extreme
+            strong_sentiment = pcr > 1.5 or pcr < 0.7
+            checks.append(strong_sentiment)
+        else:
+            checks.append(True)  # Don't penalize if no data
+        
+        # Need at least 3 out of 5 checks to pass
+        probability = sum(checks) / len(checks)
+        is_high_prob = sum(checks) >= 3
+        
+        return is_high_prob, probability
+
+    def get_ai_analysis(self, analysis_data, is_high_prob=True):
+        """Get AI analysis from DeepSeek V3 (20% AI work)"""
+        try:
+            option_comparison_str = ""
+            if analysis_data.get('option_chain_comparison'):
+                comp = analysis_data['option_chain_comparison']
+                option_comparison_str = f"""
+OPTION CHAIN COMPARISON (30 min ago):
+- Previous PCR: {comp.get('previous_pcr', 'N/A')}
+- Current PCR: {comp.get('current_pcr', 'N/A')}
+- PCR Change: {comp.get('pcr_change', 0):+.2f}
+- Call OI Change: {comp.get('call_oi_change', 0):+,.0f}
+- Put OI Change: {comp.get('put_oi_change', 0):+,.0f}
+"""
+            
+            prompt = f"""
+You are an expert crypto trader analyzing {analysis_data['symbol']} for HIGH-PROBABILITY trading signals.
+
+⚠️ IMPORTANT: This setup has already passed initial technical filters. 
+Only provide BUY/SELL if you confirm HIGH confidence with multiple converging factors.
+Otherwise, return NEUTRAL.
+
+MARKET DATA:
+- Current Price: ${analysis_data['current_price']}
+- EMAs: {json.dumps(analysis_data['emas'], indent=2)}
+- Support: ${analysis_data['support_resistance']['support']} ({analysis_data['support_resistance']['distance_to_support']}% away)
+- Resistance: ${analysis_data['support_resistance']['resistance']} ({analysis_data['support_resistance']['distance_to_resistance']}% away)
+- Candlestick Patterns: {', '.join(analysis_data['candlestick_patterns']) if analysis_data['candlestick_patterns'] else 'None'}
+- Volume Trend: {analysis_data['volume_trend']}
+
+CURRENT OPTION DATA:
+{json.dumps(analysis_data['option_chain'], indent=2) if analysis_data['option_chain'] else 'Not available'}
+
+{option_comparison_str}
+
+RECENT PRICE ACTION (Last 5 candles):
+{json.dumps(analysis_data['recent_candles'], indent=2)}
+
+ANALYSIS REQUIREMENTS:
+1. Analyze EMA alignment and price position
+2. Evaluate candlestick patterns significance
+3. Check support/resistance and option flow
+4. Compare with 30-min-ago option data for shifts
+5. Assess volume and momentum
+6. Look for confluence of multiple factors
+
+Provide EXACT format:
+
+SIGNAL: [BUY/SELL/NEUTRAL]
+CONFIDENCE: [HIGH/MEDIUM/LOW]
+ENTRY: $[price]
+TARGET: $[price]
+STOP_LOSS: $[price]
+REASONING: [2-3 sentences max]
+RISK_REWARD: [ratio]
+
+Be STRICT - only HIGH confidence signals for BUY/SELL when multiple factors align.
+"""
+            
+            print(f"\n🤖 AI analyzing {analysis_data['symbol']} (High Probability Pre-Check: {'PASS ✅' if is_high_prob else 'FAIL ❌'})")
+            
+            response = deepseek_client.chat.completions.create(
+                model="deepseek-chat",
+                messages=[
+                    {"role": "system", "content": "You are a professional crypto trader providing ONLY high-probability trading signals. Be conservative."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=1000,
+                temperature=0.2  # More conservative
+            )
+            
+            ai_response = response.choices[0].message.content
+            print(f"✅ AI analysis completed")
+            
+            return ai_response
+            
+        except Exception as e:
+            print(f"❌ Error getting AI analysis: {e}")
+            return None
+    
+    async def send_telegram_alert(self, symbol, analysis_data, ai_analysis):
+        """Send trading signal to Telegram"""
+        try:
+            option_comp_str = ""
+            if analysis_data.get('option_chain_comparison'):
+                comp = analysis_data['option_chain_comparison']
+                option_comp_str = f"""
+<b>📊 Option Change (30 min):</b>
+• PCR: {comp.get('previous_pcr', 0):.2f} → {comp.get('current_pcr', 0):.2f} ({comp.get('pcr_change', 0):+.2f})
+• Call OI: {comp.get('call_oi_change', 0):+,.0f}
+• Put OI: {comp.get('put_oi_change', 0):+,.0f}
+"""
+            
+            message = f"""
+🚨 <b>CRYPTO TRADING SIGNAL</b> 🚨
+
+<b>Symbol:</b> {symbol}
+<b>Time:</b> {analysis_data['timestamp']}
+<b>Current Price:</b> ${analysis_data['current_price']}
+
+<b>🤖 AI ANALYSIS:</b>
+<code>{ai_analysis}</code>
+
+<b>📊 TECHNICAL DATA:</b>
+• EMAs: {', '.join([f'{k}: ${v}' for k, v in analysis_data['emas'].items()])}
+• Support: ${analysis_data['support_resistance']['support']}
+• Resistance: ${analysis_data['support_resistance']['resistance']}
+• Patterns: {', '.join(analysis_data['candlestick_patterns']) if analysis_data['candlestick_patterns'] else 'None'}
+
+<b>📈 OPTION DATA:</b>
+• PCR Ratio: {analysis_data['option_chain']['pcr_ratio'] if analysis_data['option_chain'] else 'N/A'}
+• Volume Trend: {analysis_data['volume_trend']}
+
+{option_comp_str}
+
+⚠️ <i>Trade at your own risk. Not financial advice.</i>
+"""
+            
+            await telegram_bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID,
+                text=message,
+                parse_mode='HTML'
+            )
+            
+            print(f"✅ Alert sent to Telegram for {symbol}")
+            return True
+            
+        except TelegramError as e:
+            print(f"❌ Telegram error: {e}")
+            return False
+        except Exception as e:
+            print(f"❌ Error sending alert: {e}")
+            return False
+    
+    def should_send_alert(self, ai_analysis):
+        """Check if signal is high probability and should be sent"""
+        if not ai_analysis:
+            return False
+        
+        analysis_upper = ai_analysis.upper()
+        
+        # STRICT: Only BUY/SELL with HIGH confidence
+        has_buy_signal = "SIGNAL: BUY" in analysis_upper
+        has_sell_signal = "SIGNAL: SELL" in analysis_upper
+        has_signal = has_buy_signal or has_sell_signal
+        has_high_confidence = "CONFIDENCE: HIGH" in analysis_upper
+        
+        should_send = has_signal and has_high_confidence
+        
+        if not should_send:
+            signal_type = "NEUTRAL" if "SIGNAL: NEUTRAL" in analysis_upper else "UNKNOWN"
+            confidence = "N/A"
+            if "CONFIDENCE: HIGH" in analysis_upper:
+                confidence = "HIGH"
+            elif "CONFIDENCE: MEDIUM" in analysis_upper:
+                confidence = "MEDIUM"
+            elif "CONFIDENCE: LOW" in analysis_upper:
+                confidence = "LOW"
+            print(f"⏭️  Signal: {signal_type}, Confidence: {confidence} - Not sending alert")
+        
+        return should_send
+    
+    async def run_analysis_cycle(self):
+        """Run one complete analysis cycle for all symbols"""
+        print(f"\n{'='*60}")
+        print(f"🔄 Starting Analysis Cycle - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"{'='*60}")
+        
+        for symbol in self.symbols:
             try:
-                analysis = TradeAnalyzer.analyze_setup(symbol)
-                if not analysis.get('valid'):
+                # 80% work - bot does data collection
+                analysis_data = self.prepare_analysis_data(symbol)
+                
+                if not analysis_data:
                     continue
                 
-                ai_result = TradeAnalyzer.get_ai_analysis(analysis)
+                # Pre-check: Is this high probability setup?
+                is_high_prob, prob_score = self._is_high_probability_signal(analysis_data)
+                print(f"📊 Technical Probability Score: {prob_score:.0%}")
                 
-                if ai_result['signal'] in ['LONG', 'SHORT']:
-                    self.trade_count_today += 1
-                    await self.send_alert(context, symbol, analysis, ai_result)
+                if not is_high_prob:
+                    print(f"⏭️  {symbol} - Low probability setup, skipping AI analysis")
+                    await asyncio.sleep(1)
+                    continue
+                
+                # 20% work - AI does analysis for high prob signals only
+                ai_analysis = self.get_ai_analysis(analysis_data, is_high_prob)
+                
+                if not ai_analysis:
+                    continue
+                
+                # Send alert only for HIGH confidence signals
+                if self.should_send_alert(ai_analysis):
+                    print(f"\n🎯 HIGH PROBABILITY SIGNAL DETECTED for {symbol}!")
+                    await self.send_telegram_alert(symbol, analysis_data, ai_analysis)
+                
+                await asyncio.sleep(2)
+                
             except Exception as e:
-                logger.error(f"Error scanning {symbol}: {e}")
-            await asyncio.sleep(3)
+                print(f"❌ Error analyzing {symbol}: {e}")
+                continue
+        
+        print(f"\n✅ Analysis cycle completed")
+        print(f"{'='*60}\n")
     
-    async def send_alert(self, context: ContextTypes.DEFAULT_TYPE, symbol: str, analysis: Dict, ai_result: Dict):
+    async def start(self):
+        """Start the bot with continuous monitoring"""
+        print("""
+╔══════════════════════════════════════════════════════════╗
+║                                                          ║
+║      🚀 CRYPTO TRADING BOT WITH DEEPSEEK V3 🚀          ║
+║           + REDIS MEMORY + OPTION TRACKING              ║
+║                                                          ║
+║  Analyzing: BTC & ETH                                    ║
+║  Timeframe: 30 minutes                                   ║
+║  Signals: HIGH-PROBABILITY only (Pre-filtered + AI)     ║
+║  Memory: Redis with auto-cleanup                         ║
+║                                                          ║
+╚══════════════════════════════════════════════════════════╝
+        """)
+        
+        # Test Telegram connection
         try:
-            chart_buf = ChartGenerator.create_chart(analysis['df_30m'], analysis, ai_result, symbol)
+            await telegram_bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID,
+                text="✅ Bot started with Redis caching! Monitoring BTC & ETH for HIGH-PROBABILITY signals...",
+                parse_mode='HTML'
+            )
+            print("✅ Telegram connection verified\n")
         except Exception as e:
-            chart_buf = None
+            print(f"❌ Telegram connection failed: {e}\n")
         
-        patterns_text = ', '.join([p['name'] for p in analysis['patterns']]) if analysis.get('patterns') else 'None'
-        
-        message = f"""**{symbol} - {ai_result['signal']}**
+        # Continuous monitoring loop
+        while True:
+            try:
+                await self.run_analysis_cycle()
+                
+                print(f"⏰ Next scan in {SCAN_INTERVAL//60} minutes...")
+                await asyncio.sleep(SCAN_INTERVAL)
+                
+            except KeyboardInterrupt:
+                print("\n\n🛑 Bot stopped by user")
+                break
+            except Exception as e:
+                print(f"❌ Error in main loop: {e}")
+                print("⏰ Retrying in 5 minutes...")
+                await asyncio.sleep(300)
 
-Price: ${analysis['current_price']:.2f}
-Entry: ${ai_result.get('entry', 0):.2f}
-SL: ${ai_result.get('sl', 0):.2f}
-Target: ${ai_result.get('target', 0):.2f}
-
-Patterns: {patterns_text}
-Volume: {analysis['volume_ratio']}x
-OI: {analysis['oi_trend']['trend']}
-
-Reason: {ai_result.get('reason', '')[:150]}
-"""
-        
-        try:
-            if chart_buf:
-                await context.bot.send_photo(chat_id=CHAT_ID, photo=chart_buf, caption=message, parse_mode='Markdown')
-            else:
-                await context.bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='Markdown')
-        except Exception as e:
-            logger.error(f"Alert send error: {e}")
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Bot Active! Use /scan or /analyze BTC")
-
-async def scan_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Scanning...")
-    bot = context.bot_data.get('trading_bot')
-    if bot:
-        await bot.scan_markets(context)
-        await update.message.reply_text("Scan complete!")
-
-async def analyze_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Usage: /analyze BTC or ETH")
-        return
-    
-    symbol = f"{context.args[0].upper()}-PERPETUAL"
-    if symbol not in SYMBOLS:
-        await update.message.reply_text("Invalid symbol")
-        return
-    
-    try:
-        analysis = TradeAnalyzer.analyze_setup(symbol)
-        if not analysis.get('valid'):
-            await update.message.reply_text("Cannot analyze")
-            return
-        
-        ai_result = TradeAnalyzer.get_ai_analysis(analysis)
-        chart_buf = ChartGenerator.create_chart(analysis['df_30m'], analysis, ai_result, symbol)
-        
-        message = f"""{symbol}: {ai_result['signal']}
-Price: ${analysis['current_price']:.2f}
-{ai_result.get('reason', '')[:200]}"""
-        
-        await context.bot.send_photo(chat_id=update.effective_chat.id, photo=chart_buf, caption=message)
-    except Exception as e:
-        await update.message.reply_text(f"Error: {e}")
 
 def main():
-    logger.info("STARTING BOT")
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
-    trading_bot = TradingBot()
-    application.bot_data['trading_bot'] = trading_bot
+    """Main entry point"""
+    if not DEEPSEEK_API_KEY:
+        print("❌ ERROR: DEEPSEEK_API_KEY not found in .env file")
+        return
     
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("scan", scan_now))
-    application.add_handler(CommandHandler("analyze", analyze_symbol))
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("❌ ERROR: Telegram credentials not found in .env file")
+        return
     
-    job_queue = application.job_queue
-    if job_queue:
-        job_queue.run_repeating(trading_bot.scan_markets, interval=1800, first=10)
-    
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    analyzer = CryptoAnalyzer()
+    asyncio.run(analyzer.start())
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()

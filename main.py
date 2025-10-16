@@ -18,9 +18,7 @@ load_dotenv()
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
-REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
-REDIS_DB = int(os.getenv("REDIS_DB", 0))
+REDIS_URL = os.getenv("REDIS_URL")
 DERIBIT_API_URL = "https://www.deribit.com/api/v2/public"
 SCAN_INTERVAL = 1800  # 30 minutes in seconds
 MAX_MEMORY_MB = int(os.getenv("MAX_MEMORY_MB", 500))  # Max Redis memory for data
@@ -35,20 +33,41 @@ deepseek_client = openai.OpenAI(
 telegram_bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
 # Redis Connection
-try:
-    redis_client = redis.Redis(
-        host=REDIS_HOST,
-        port=REDIS_PORT,
-        db=REDIS_DB,
-        decode_responses=True,
-        socket_connect_timeout=5
-    )
-    redis_client.ping()
-    print("✅ Redis connected successfully")
-except Exception as e:
-    print(f"❌ Redis connection failed: {e}")
-    print("⚠️  Bot will continue without Redis caching")
-    redis_client = None
+def get_redis_client():
+    """Connect to Redis from URL or localhost"""
+    try:
+        if REDIS_URL:
+            # Redis from Railway.app or other cloud service
+            redis_client = redis.from_url(
+                REDIS_URL,
+                decode_responses=True,
+                socket_connect_timeout=5,
+                socket_keepalive=True,
+                health_check_interval=30
+            )
+        else:
+            # Local Redis fallback
+            redis_client = redis.Redis(
+                host="localhost",
+                port=6379,
+                db=0,
+                decode_responses=True,
+                socket_connect_timeout=5
+            )
+        
+        redis_client.ping()
+        print("✅ Redis connected successfully")
+        if REDIS_URL:
+            print("📍 Using Railway.app Redis")
+        else:
+            print("📍 Using Local Redis")
+        return redis_client
+    except Exception as e:
+        print(f"❌ Redis connection failed: {e}")
+        print("⚠️  Bot will continue without Redis caching")
+        return None
+
+redis_client = get_redis_client()
 
 
 class CryptoAnalyzer:

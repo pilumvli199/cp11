@@ -366,104 +366,162 @@ class ChartGenerator:
     
     @staticmethod
     def create_dual_tf_chart(coin, tf_data, analysis):
-        """Create 2-panel chart: 4H top, 1H bottom"""
+        """Create 2-panel chart: 4H top, 1H bottom with clear trade levels"""
         
-        fig = plt.figure(figsize=(16, 10), facecolor='white')
-        gs = fig.add_gridspec(2, 1, height_ratios=[1, 1], hspace=0.3)
+        fig = plt.figure(figsize=(18, 11), facecolor='#0a0e27')
+        gs = fig.add_gridspec(2, 1, height_ratios=[1, 1], hspace=0.25)
         
         timeframes = ['4h', '1h']
         titles = [
-            '4-Hour Chart - Trend & Setup Zone',
-            '1-Hour Chart - Entry Timing'
+            '4-HOUR CHART - Trend & Setup Zone',
+            '1-HOUR CHART - Entry Timing'
         ]
         
+        axes = []
         for idx, (tf, title) in enumerate(zip(timeframes, titles)):
             ax = fig.add_subplot(gs[idx])
-            df = tf_data[tf]['dataframe'].tail(100)
+            ax.set_facecolor('#0f1429')
+            df = tf_data[tf]['dataframe'].tail(100).reset_index(drop=True)
             
             # Plot candlesticks
             for i in range(len(df)):
-                color = 'green' if df['close'].iloc[i] >= df['open'].iloc[i] else 'red'
+                o, h, l, c = df['open'].iloc[i], df['high'].iloc[i], df['low'].iloc[i], df['close'].iloc[i]
+                color = '#00ff88' if c >= o else '#ff3366'
                 
-                body_height = abs(df['close'].iloc[i] - df['open'].iloc[i])
-                body_bottom = min(df['open'].iloc[i], df['close'].iloc[i])
+                body_height = abs(c - o)
+                body_bottom = min(o, c)
                 
+                # Candle body
                 ax.add_patch(patches.Rectangle(
-                    (i, body_bottom), 0.8, body_height,
-                    facecolor=color, edgecolor='black', linewidth=0.5, alpha=0.8
+                    (i - 0.4, body_bottom), 0.8, body_height,
+                    facecolor=color, edgecolor=color, linewidth=1, alpha=0.9
                 ))
                 
-                ax.plot([i + 0.4, i + 0.4], 
-                       [df['low'].iloc[i], df['high'].iloc[i]], 
-                       color='black', linewidth=1, alpha=0.6)
+                # Wicks
+                ax.plot([i, i], [l, h], color=color, linewidth=1.2, alpha=0.7)
             
-            # Plot support/resistance from this timeframe
+            # Support/Resistance
             if tf_data[tf]['support']:
                 for level in tf_data[tf]['support'][-2:]:
-                    ax.axhline(y=level, color='green', linestyle='--', 
-                              alpha=0.4, linewidth=2, label='Support')
+                    ax.axhline(y=level, color='#00ff88', linestyle='--', 
+                              alpha=0.4, linewidth=1.5)
             
             if tf_data[tf]['resistance']:
                 for level in tf_data[tf]['resistance'][-2:]:
-                    ax.axhline(y=level, color='red', linestyle='--', 
-                              alpha=0.4, linewidth=2, label='Resistance')
+                    ax.axhline(y=level, color='#ff3366', linestyle='--', 
+                              alpha=0.4, linewidth=1.5)
             
-            # Highlight order blocks on 4H
+            # Order blocks on 4H
             if tf == '4h':
                 obs = tf_data[tf]['order_blocks']
-                # Latest bullish OB
                 if obs['bullish']:
                     latest_bull_ob = obs['bullish'][-1]
                     ax.axhspan(latest_bull_ob['price'], latest_bull_ob['high'],
-                              alpha=0.15, color='green', label='Bull OB')
-                # Latest bearish OB
+                              alpha=0.12, color='#00ff88')
                 if obs['bearish']:
                     latest_bear_ob = obs['bearish'][-1]
                     ax.axhspan(latest_bear_ob['low'], latest_bear_ob['price'],
-                              alpha=0.15, color='red', label='Bear OB')
+                              alpha=0.12, color='#ff3366')
             
             ax.set_title(f'{title} | Trend: {tf_data[tf]["trend"]}', 
-                        fontsize=12, fontweight='bold', pad=10)
-            ax.set_ylabel('Price (USDT)', fontsize=10)
-            ax.grid(True, alpha=0.2, linestyle=':')
+                        fontsize=13, fontweight='bold', color='white', pad=12)
+            ax.set_ylabel('Price (USDT)', fontsize=11, color='white')
+            ax.tick_params(colors='white', labelsize=9)
+            ax.grid(True, alpha=0.15, linestyle=':', color='white')
             ax.spines['top'].set_visible(False)
             ax.spines['right'].set_visible(False)
+            ax.spines['left'].set_color('white')
+            ax.spines['bottom'].set_color('white')
+            axes.append(ax)
         
-        # Add signal box
+        # MARK ENTRY, SL, TPs on BOTH charts
         if analysis and analysis['signal'] in ['BUY', 'SELL']:
-            color = 'green' if analysis['signal'] == 'BUY' else 'red'
+            signal_color = '#00ff88' if analysis['signal'] == 'BUY' else '#ff3366'
+            entry_lower, entry_upper = analysis['entry_range']
+            stop_loss = analysis['stop_loss']
+            tp1, tp2, tp3 = analysis['take_profits']
+            
+            for ax_idx, ax in enumerate(axes):
+                # Entry Zone (shaded box)
+                ax.axhspan(entry_lower, entry_upper, 
+                          alpha=0.25, color=signal_color, zorder=1)
+                ax.axhline(y=entry_lower, color=signal_color, linestyle='-', 
+                          linewidth=2.5, alpha=0.9, label='Entry Zone')
+                ax.axhline(y=entry_upper, color=signal_color, linestyle='-', 
+                          linewidth=2.5, alpha=0.9)
+                
+                # Add ENTRY text
+                ax.text(len(tf_data[timeframes[ax_idx]]['dataframe'].tail(100)) - 5, 
+                       (entry_lower + entry_upper) / 2, 
+                       f'  ENTRY\n  ${entry_lower:,.0f}-${entry_upper:,.0f}',
+                       color=signal_color, fontsize=9, fontweight='bold',
+                       bbox=dict(boxstyle='round,pad=0.5', facecolor='black', 
+                                edgecolor=signal_color, linewidth=2, alpha=0.8),
+                       verticalalignment='center')
+                
+                # Stop Loss (red line)
+                ax.axhline(y=stop_loss, color='#ff0000', linestyle='--', 
+                          linewidth=2.5, alpha=0.9, label='Stop Loss')
+                ax.text(len(tf_data[timeframes[ax_idx]]['dataframe'].tail(100)) - 5, 
+                       stop_loss, 
+                       f'  STOP LOSS: ${stop_loss:,.0f}',
+                       color='#ff0000', fontsize=9, fontweight='bold',
+                       bbox=dict(boxstyle='round,pad=0.4', facecolor='black', 
+                                edgecolor='#ff0000', linewidth=2, alpha=0.8),
+                       verticalalignment='center')
+                
+                # Take Profits
+                for tp_num, tp_val in enumerate([tp1, tp2, tp3], 1):
+                    ax.axhline(y=tp_val, color='#ffdd00', linestyle='-.', 
+                              linewidth=2, alpha=0.85)
+                    ax.text(len(tf_data[timeframes[ax_idx]]['dataframe'].tail(100)) - 5, 
+                           tp_val, 
+                           f'  TP{tp_num}: ${tp_val:,.0f}',
+                           color='#ffdd00', fontsize=8, fontweight='bold',
+                           bbox=dict(boxstyle='round,pad=0.3', facecolor='black', 
+                                    edgecolor='#ffdd00', linewidth=1.5, alpha=0.8),
+                           verticalalignment='center')
+            
+            # Signal Info Box
             signal_text = f"""
-━━━━━━━━━━━━━━━
-{analysis['signal']} SIGNAL
-━━━━━━━━━━━━━━━
+╔═══════════════════════╗
+║  {analysis['signal']} SIGNAL  ║
+╚═══════════════════════╝
 
 Confidence: {analysis['confidence']}%
 4H Bias: {analysis['4h_bias']}
 1H Confirm: {analysis['1h_confirmation']}
 TF Sync: {analysis['timeframe_sync']}
 
-Entry: ${analysis['entry_range'][0]:,.0f}-${analysis['entry_range'][1]:,.0f}
-Stop: ${analysis['stop_loss']:,.0f}
+ENTRY: ${entry_lower:,.0f} - ${entry_upper:,.0f}
+STOP LOSS: ${stop_loss:,.0f}
+
+TARGETS:
+  TP1: ${tp1:,.0f}
+  TP2: ${tp2:,.0f}
+  TP3: ${tp3:,.0f}
+
 Risk:Reward: {analysis['risk_reward']}
 """
-            fig.text(0.98, 0.5, signal_text,
+            fig.text(0.985, 0.5, signal_text,
                     transform=fig.transFigure,
-                    fontsize=10, fontweight='bold',
+                    fontsize=9.5, fontweight='bold',
                     family='monospace',
-                    color=color,
-                    bbox=dict(boxstyle='round,pad=1', facecolor=color, alpha=0.15, edgecolor=color, linewidth=2),
+                    color=signal_color,
+                    bbox=dict(boxstyle='round,pad=0.8', facecolor='#0a0e27', 
+                             edgecolor=signal_color, linewidth=2.5, alpha=0.95),
                     verticalalignment='center',
                     horizontalalignment='right')
         
         plt.suptitle(f'{coin}/USDT - 4H + 1H Strategy Analysis', 
-                    fontsize=16, fontweight='bold', y=0.98)
+                    fontsize=17, fontweight='bold', color='white', y=0.985)
         
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')
         fig.text(0.99, 0.01, f'Generated: {timestamp}', 
                 ha='right', fontsize=8, color='gray')
         
         buf = BytesIO()
-        plt.savefig(buf, format='png', dpi=150, facecolor='white', bbox_inches='tight')
+        plt.savefig(buf, format='png', dpi=160, facecolor='#0a0e27', bbox_inches='tight')
         buf.seek(0)
         plt.close()
         
@@ -558,89 +616,4 @@ class TradingBot:
                     print(f"  ⚠️ Insufficient data for {tf}")
                     return
                 
-                # SMC Analysis
-                order_blocks = SMCAnalyzer.find_order_blocks(df)
-                bos_signals = SMCAnalyzer.detect_bos_choch(df)
-                fvg = SMCAnalyzer.find_fvg(df)
-                sr_levels = SMCAnalyzer.find_support_resistance(df)
-                trend = SMCAnalyzer.analyze_trend(df)
-                patterns = SMCAnalyzer.detect_candlestick_patterns(df)
-                
-                tf_data[tf] = {
-                    'dataframe': df,
-                    'current_price': float(df['close'].iloc[-1]),
-                    'high_24h': float(df['high'].tail(24 if tf == '1h' else 6).max()),
-                    'low_24h': float(df['low'].tail(24 if tf == '1h' else 6).min()),
-                    'volume_trend': 'Increasing' if df['volume'].tail(10).mean() > df['volume'].tail(30).mean() else 'Decreasing',
-                    'trend': trend,
-                    'order_blocks': order_blocks,
-                    'bos_signals': bos_signals,
-                    'fvg': fvg,
-                    'support': sr_levels['support'],
-                    'resistance': sr_levels['resistance'],
-                    'patterns': patterns
-                }
-                
-                print(f"  ✓ {tf}: Trend={trend} | OB: {len(order_blocks['bullish'])}B/{len(order_blocks['bearish'])}S")
-                await asyncio.sleep(0.3)
-            
-            # Get AI analysis
-            print(f"  🤖 Getting 4H+1H combined analysis...")
-            analysis = await DeepSeekAnalyzer.analyze_4h_1h_strategy(session, coin, tf_data)
-            
-            if analysis and analysis['signal'] in ['BUY', 'SELL']:
-                print(f"  🎯 SIGNAL: {analysis['signal']} | Confidence: {analysis['confidence']}%")
-                
-                # Generate chart
-                chart_buffer = ChartGenerator.create_dual_tf_chart(coin, tf_data, analysis)
-                
-                # Send alert
-                await self.send_telegram_alert(coin, analysis, chart_buffer)
-            else:
-                print(f"  ⏸️ {coin}: WAIT (No clear 4H+1H alignment)")
-            
-        except Exception as e:
-            print(f"❌ Error analyzing {coin}: {str(e)}")
-            traceback.print_exc()
-    
-    async def scan_all_coins(self):
-        """Scan all coins"""
-        connector = aiohttp.TCPConnector(limit=30, limit_per_host=10)
-        timeout = aiohttp.ClientTimeout(total=60, connect=15, sock_read=30)
-        
-        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-            for coin in COINS:
-                await self.analyze_coin_4h_1h(session, coin)
-                await asyncio.sleep(2)  # Rate limiting between coins
-    
-    async def run(self):
-        """Main bot loop"""
-        self.is_running = True
-        print("🚀 4H + 1H Trading Bot Started!")
-        print(f"📊 Strategy: 4H for trend/setup, 1H for entry timing")
-        print(f"💰 Coins: {', '.join(COINS)}")
-        print(f"🔄 Scan Interval: {SCAN_INTERVAL}s (1 hour)\n")
-        
-        while self.is_running:
-            try:
-                print(f"\n{'='*70}")
-                print(f"🔍 4H + 1H Scan Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-                print(f"{'='*70}")
-                
-                await self.scan_all_coins()
-                
-                print(f"\n✅ Scan completed. Next scan in {SCAN_INTERVAL}s ({SCAN_INTERVAL//60} min)")
-                await asyncio.sleep(SCAN_INTERVAL)
-                
-            except KeyboardInterrupt:
-                print("\n🛑 Bot stopped by user")
-                self.is_running = False
-                break
-            except Exception as e:
-                print(f"\n❌ Critical error: {str(e)}")
-                traceback.print_exc()
-                await asyncio.sleep(60)
-
-if __name__ == "__main__":
-    bot = TradingBot()
-    asyncio.run(bot.run())
+                #

@@ -4,7 +4,8 @@ import aiohttp
 from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
-from telegram import Bot, InputFile
+from telegram import Bot
+from telegram.request import HTTPXRequest
 from telegram.error import TelegramError
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
@@ -20,11 +21,11 @@ TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 DEEPSEEK_API_KEY = os.getenv('DEEPSEEK_API_KEY')
 
 COINS = ['BTC', 'ETH', 'BNB', 'XRP', 'SOL', 'DOGE', 'TRX', 'ADA', 'AVAX', 'LINK']
-TIMEFRAMES = ['1h', '4h', '1d']
+TIMEFRAMES = ['1d', '4h', '1h']  # Higher to lower for proper analysis
 SCAN_INTERVAL = 3600  # 1 hour in seconds
 
 class BinanceAPI:
-    """Binance Futures API - More reliable and supports all coins"""
+    """Binance Futures API"""
     BASE_URL = "https://fapi.binance.com/fapi/v1"
     
     @staticmethod
@@ -35,11 +36,11 @@ class BinanceAPI:
         params = {
             'symbol': f"{symbol}USDT",
             'interval': timeframe,
-            'limit': min(limit, 1500)  # Binance max limit
+            'limit': min(limit, 1500)
         }
         
         try:
-            async with session.get(url, params=params, timeout=10) as response:
+            async with session.get(url, params=params, timeout=15) as response:
                 if response.status == 200:
                     data = await response.json()
                     
@@ -50,7 +51,6 @@ class BinanceAPI:
                             'taker_buy_base', 'taker_buy_quote', 'ignore'
                         ])
                         
-                        # Convert to proper types
                         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
                         df['open'] = df['open'].astype(float)
                         df['high'] = df['high'].astype(float)
@@ -58,74 +58,16 @@ class BinanceAPI:
                         df['close'] = df['close'].astype(float)
                         df['volume'] = df['volume'].astype(float)
                         
-                        # Keep only needed columns
                         df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
-                        
-                        print(f"✓ Fetched {len(df)} candles for {symbol} {timeframe}")
                         return df
                     
-        except asyncio.TimeoutError:
-            print(f"⚠️ Timeout fetching {symbol} {timeframe}")
         except Exception as e:
             print(f"❌ Error fetching {symbol} {timeframe}: {str(e)}")
         
         return None
 
-
-class DeribitAPI:
-    """Deribit API - Only for BTC and ETH"""
-    BASE_URL = "https://www.deribit.com/api/v2/public"
-    
-    @staticmethod
-    async def get_candlestick_data(session, symbol, timeframe, limit=1000):
-        """Fetch candlestick data from Deribit public API"""
-        # Deribit only has BTC and ETH perpetuals
-        if symbol not in ['BTC', 'ETH']:
-            return None
-            
-        # Convert timeframe to minutes
-        tf_map = {'1h': 60, '4h': 240, '1d': 1440}
-        resolution = tf_map.get(timeframe, 60)
-        
-        # Calculate timestamps
-        end_timestamp = int(datetime.now().timestamp() * 1000)
-        start_timestamp = end_timestamp - (limit * resolution * 60 * 1000)
-        
-        # Deribit instrument naming
-        instrument = f"{symbol}-PERPETUAL"
-        url = f"{DeribitAPI.BASE_URL}/get_tradingview_chart_data"
-        
-        params = {
-            'instrument_name': instrument,
-            'resolution': resolution,
-            'start_timestamp': start_timestamp,
-            'end_timestamp': end_timestamp
-        }
-        
-        try:
-            async with session.get(url, params=params, timeout=10) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    if 'result' in data and data['result']['status'] == 'ok':
-                        result = data['result']
-                        df = pd.DataFrame({
-                            'timestamp': result['ticks'],
-                            'open': result['open'],
-                            'high': result['high'],
-                            'low': result['low'],
-                            'close': result['close'],
-                            'volume': result['volume']
-                        })
-                        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-                        print(f"✓ Fetched {len(df)} candles for {symbol} {timeframe} from Deribit")
-                        return df
-        except Exception as e:
-            print(f"⚠️ Deribit error for {symbol} {timeframe}: {str(e)}")
-        
-        return None
-
 class SMCAnalyzer:
-    """Smart Money Concepts Analyzer"""
+    """Smart Money Concepts Analyzer with Multi-Timeframe Support"""
     
     @staticmethod
     def find_order_blocks(df, lookback=20):
@@ -133,49 +75,55 @@ class SMCAnalyzer:
         order_blocks = {'bullish': [], 'bearish': []}
         
         for i in range(lookback, len(df) - 1):
-            # Bullish Order Block: Strong buying candle followed by upward movement
+            # Bullish Order Block
             if df['close'].iloc[i] > df['open'].iloc[i]:
                 body_size = df['close'].iloc[i] - df['open'].iloc[i]
                 avg_body = abs(df['close'].iloc[i-lookback:i] - df['open'].iloc[i-lookback:i]).mean()
                 
                 if body_size > avg_body * 1.5:
                     order_blocks['bullish'].append({
-                        'index': i,
-                        'price': df['low'].iloc[i],
-                        'high': df['high'].iloc[i],
-                        'strength': body_size
+                        'price': float(df['low'].iloc[i]),
+                        'high': float(df['high'].iloc[i]),
+                        'strength': float(body_size),
+                        'timestamp': str(df['timestamp'].iloc[i])
                     })
             
-            # Bearish Order Block: Strong selling candle followed by downward movement
+            # Bearish Order Block
             elif df['close'].iloc[i] < df['open'].iloc[i]:
                 body_size = df['open'].iloc[i] - df['close'].iloc[i]
                 avg_body = abs(df['close'].iloc[i-lookback:i] - df['open'].iloc[i-lookback:i]).mean()
                 
                 if body_size > avg_body * 1.5:
                     order_blocks['bearish'].append({
-                        'index': i,
-                        'price': df['high'].iloc[i],
-                        'low': df['low'].iloc[i],
-                        'strength': body_size
+                        'price': float(df['high'].iloc[i]),
+                        'low': float(df['low'].iloc[i]),
+                        'strength': float(body_size),
+                        'timestamp': str(df['timestamp'].iloc[i])
                     })
         
         return order_blocks
     
     @staticmethod
     def detect_bos_choch(df, swing_period=10):
-        """Detect Break of Structure (BOS) and Change of Character (ChoCH)"""
+        """Detect Break of Structure and Change of Character"""
         signals = []
         highs = df['high'].rolling(window=swing_period).max()
         lows = df['low'].rolling(window=swing_period).min()
         
         for i in range(swing_period, len(df) - 1):
-            # Bullish BOS: Break above previous swing high
             if df['close'].iloc[i] > highs.iloc[i-1]:
-                signals.append({'type': 'BOS_BULL', 'index': i, 'price': df['close'].iloc[i]})
+                signals.append({
+                    'type': 'BOS_BULL',
+                    'price': float(df['close'].iloc[i]),
+                    'timestamp': str(df['timestamp'].iloc[i])
+                })
             
-            # Bearish BOS: Break below previous swing low
             if df['close'].iloc[i] < lows.iloc[i-1]:
-                signals.append({'type': 'BOS_BEAR', 'index': i, 'price': df['close'].iloc[i]})
+                signals.append({
+                    'type': 'BOS_BEAR',
+                    'price': float(df['close'].iloc[i]),
+                    'timestamp': str(df['timestamp'].iloc[i])
+                })
         
         return signals
     
@@ -185,103 +133,130 @@ class SMCAnalyzer:
         fvgs = {'bullish': [], 'bearish': []}
         
         for i in range(2, len(df)):
-            # Bullish FVG: Gap between candle[i-2] high and candle[i] low
+            # Bullish FVG
             if df['low'].iloc[i] > df['high'].iloc[i-2]:
                 gap_size = df['low'].iloc[i] - df['high'].iloc[i-2]
                 fvgs['bullish'].append({
-                    'index': i,
-                    'top': df['low'].iloc[i],
-                    'bottom': df['high'].iloc[i-2],
-                    'size': gap_size
+                    'top': float(df['low'].iloc[i]),
+                    'bottom': float(df['high'].iloc[i-2]),
+                    'size': float(gap_size)
                 })
             
-            # Bearish FVG: Gap between candle[i-2] low and candle[i] high
+            # Bearish FVG
             if df['high'].iloc[i] < df['low'].iloc[i-2]:
                 gap_size = df['low'].iloc[i-2] - df['high'].iloc[i]
                 fvgs['bearish'].append({
-                    'index': i,
-                    'top': df['low'].iloc[i-2],
-                    'bottom': df['high'].iloc[i],
-                    'size': gap_size
+                    'top': float(df['low'].iloc[i-2]),
+                    'bottom': float(df['high'].iloc[i]),
+                    'size': float(gap_size)
                 })
         
         return fvgs
     
     @staticmethod
-    def detect_candlestick_patterns(df):
-        """Detect common candlestick patterns"""
-        patterns = []
+    def find_support_resistance(df, window=20):
+        """Find key support and resistance levels"""
+        highs = df['high'].rolling(window=window, center=True).max()
+        lows = df['low'].rolling(window=window, center=True).min()
         
-        for i in range(2, len(df)):
-            # Bullish Engulfing
-            if (df['close'].iloc[i] > df['open'].iloc[i] and
-                df['close'].iloc[i-1] < df['open'].iloc[i-1] and
-                df['open'].iloc[i] < df['close'].iloc[i-1] and
-                df['close'].iloc[i] > df['open'].iloc[i-1]):
-                patterns.append({'type': 'Bullish_Engulfing', 'index': i})
-            
-            # Bearish Engulfing
-            if (df['close'].iloc[i] < df['open'].iloc[i] and
-                df['close'].iloc[i-1] > df['open'].iloc[i-1] and
-                df['open'].iloc[i] > df['close'].iloc[i-1] and
-                df['close'].iloc[i] < df['open'].iloc[i-1]):
-                patterns.append({'type': 'Bearish_Engulfing', 'index': i})
-            
-            # Hammer (Bullish)
-            body = abs(df['close'].iloc[i] - df['open'].iloc[i])
-            lower_shadow = min(df['close'].iloc[i], df['open'].iloc[i]) - df['low'].iloc[i]
-            upper_shadow = df['high'].iloc[i] - max(df['close'].iloc[i], df['open'].iloc[i])
-            
-            if lower_shadow > body * 2 and upper_shadow < body * 0.3:
-                patterns.append({'type': 'Hammer', 'index': i})
-            
-            # Shooting Star (Bearish)
-            if upper_shadow > body * 2 and lower_shadow < body * 0.3:
-                patterns.append({'type': 'Shooting_Star', 'index': i})
+        resistance_levels = []
+        support_levels = []
         
-        return patterns
+        for i in range(window, len(df) - window):
+            if df['high'].iloc[i] == highs.iloc[i]:
+                resistance_levels.append(float(df['high'].iloc[i]))
+            if df['low'].iloc[i] == lows.iloc[i]:
+                support_levels.append(float(df['low'].iloc[i]))
+        
+        # Get recent unique levels
+        resistance = sorted(list(set(resistance_levels)))[-5:] if resistance_levels else []
+        support = sorted(list(set(support_levels)))[-5:] if support_levels else []
+        
+        return {'resistance': resistance, 'support': support}
+    
+    @staticmethod
+    def analyze_trend(df):
+        """Determine overall trend"""
+        # Simple moving averages
+        df['sma20'] = df['close'].rolling(window=20).mean()
+        df['sma50'] = df['close'].rolling(window=50).mean()
+        
+        current_price = df['close'].iloc[-1]
+        sma20 = df['sma20'].iloc[-1]
+        sma50 = df['sma50'].iloc[-1]
+        
+        if current_price > sma20 > sma50:
+            return 'BULLISH'
+        elif current_price < sma20 < sma50:
+            return 'BEARISH'
+        else:
+            return 'NEUTRAL'
 
 class DeepSeekAnalyzer:
-    """DeepSeek V3 API Integration"""
+    """DeepSeek V3 API with Multi-Timeframe Analysis"""
     
     API_URL = "https://api.deepseek.com/v1/chat/completions"
     
     @staticmethod
-    async def analyze_with_deepseek(session, coin, mtf_data, smc_data):
-        """Send multi-timeframe data to DeepSeek V3 for analysis"""
+    async def analyze_multi_timeframe(session, coin, tf_data):
+        """Analyze using combined multi-timeframe data"""
         
-        # Prepare analysis prompt
-        prompt = f"""You are an expert cryptocurrency trader specializing in Smart Money Concepts (SMC). 
+        prompt = f"""You are a professional crypto trader using Smart Money Concepts and Multi-Timeframe Analysis.
 
-Analyze {coin}/USDT using the following multi-timeframe data and SMC indicators:
+Analyze {coin}/USDT across multiple timeframes:
 
-MULTI-TIMEFRAME DATA:
-{mtf_data}
+🕐 DAILY TIMEFRAME (1D):
+- Current Price: ${tf_data['1d']['current_price']:,.2f}
+- Trend: {tf_data['1d']['trend']}
+- Support Levels: {tf_data['1d']['support']}
+- Resistance Levels: {tf_data['1d']['resistance']}
+- Bullish Order Blocks: {len(tf_data['1d']['order_blocks']['bullish'])}
+- Bearish Order Blocks: {len(tf_data['1d']['order_blocks']['bearish'])}
+- BOS Signals: {len(tf_data['1d']['bos_signals'])}
 
-SMC ANALYSIS:
-{smc_data}
+⏰ 4-HOUR TIMEFRAME (4H):
+- Trend: {tf_data['4h']['trend']}
+- Support Levels: {tf_data['4h']['support']}
+- Resistance Levels: {tf_data['4h']['resistance']}
+- Bullish FVG: {len(tf_data['4h']['fvg']['bullish'])}
+- Bearish FVG: {len(tf_data['4h']['fvg']['bearish'])}
+- Recent Order Blocks: Bull={len(tf_data['4h']['order_blocks']['bullish'])}, Bear={len(tf_data['4h']['order_blocks']['bearish'])}
 
-Based on this information, provide:
-1. **Overall Market Structure**: Bullish/Bearish/Neutral
-2. **Key Support/Resistance Levels**
-3. **Entry Signal**: BUY/SELL/WAIT with confidence level (0-100%)
-4. **Entry Price Range**
-5. **Stop Loss Level**
-6. **Take Profit Targets** (TP1, TP2, TP3)
-7. **Risk Assessment**: Low/Medium/High
-8. **Key Reasoning** (2-3 sentences max)
+⏱️ 1-HOUR TIMEFRAME (1H):
+- Current Price: ${tf_data['1h']['current_price']:,.2f}
+- Trend: {tf_data['1h']['trend']}
+- Recent Highs: ${tf_data['1h']['high_24h']:,.2f}
+- Recent Lows: ${tf_data['1h']['low_24h']:,.2f}
+- Volume Trend: {tf_data['1h']['volume_trend']}
 
-Format your response as JSON:
+MULTI-TIMEFRAME ANALYSIS RULES:
+1. Use 1D for overall market structure and major trend
+2. Use 4H for intermediate levels and entry zone identification
+3. Use 1H for precise entry/exit timing and targets
+4. Only give BUY signal if: 1D bullish + 4H setup ready + 1H confirms entry
+5. Only give SELL signal if: 1D bearish + 4H setup ready + 1H confirms entry
+6. Otherwise signal is WAIT
+
+Provide analysis in JSON format:
 {{
     "signal": "BUY/SELL/WAIT",
-    "confidence": 85,
-    "entry_range": [45000, 45500],
-    "stop_loss": 44000,
-    "take_profits": [46000, 47000, 48000],
-    "risk": "Medium",
-    "structure": "Bullish",
-    "reasoning": "Strong bullish order block with FVG fill..."
-}}"""
+    "confidence": 0-100,
+    "timeframe_alignment": "ALIGNED/PARTIAL/CONFLICTING",
+    "daily_structure": "Bullish/Bearish/Neutral",
+    "4h_setup": "Ready/Forming/Weak",
+    "1h_entry": "Confirmed/Wait/Invalid",
+    "entry_range": [lower, upper],
+    "stop_loss": price,
+    "take_profits": [tp1, tp2, tp3],
+    "risk_reward": "1:3",
+    "key_levels": {{
+        "support": [s1, s2],
+        "resistance": [r1, r2]
+    }},
+    "reasoning": "2-3 sentence analysis explaining the multi-timeframe alignment"
+}}
+
+Be strict: Only give actionable BUY/SELL when all timeframes align properly."""
 
         headers = {
             'Authorization': f'Bearer {DEEPSEEK_API_KEY}',
@@ -291,264 +266,271 @@ Format your response as JSON:
         payload = {
             'model': 'deepseek-chat',
             'messages': [
-                {'role': 'system', 'content': 'You are a professional crypto trader expert in Smart Money Concepts.'},
+                {'role': 'system', 'content': 'You are a professional trader expert in Smart Money Concepts and Multi-Timeframe Analysis.'},
                 {'role': 'user', 'content': prompt}
             ],
-            'temperature': 0.3,
-            'max_tokens': 1000
+            'temperature': 0.2,
+            'max_tokens': 1500
         }
         
         try:
-            async with session.post(DeepSeekAnalyzer.API_URL, json=payload, headers=headers) as response:
+            async with session.post(DeepSeekAnalyzer.API_URL, json=payload, headers=headers, timeout=30) as response:
                 if response.status == 200:
                     data = await response.json()
                     content = data['choices'][0]['message']['content']
-                    # Extract JSON from response
+                    
                     import json
                     import re
                     json_match = re.search(r'\{.*\}', content, re.DOTALL)
                     if json_match:
                         return json.loads(json_match.group())
+                else:
+                    print(f"⚠️ DeepSeek API error: {response.status}")
+                    
+        except asyncio.TimeoutError:
+            print(f"⚠️ DeepSeek timeout for {coin}")
         except Exception as e:
-            print(f"DeepSeek API Error for {coin}: {str(e)}")
+            print(f"❌ DeepSeek error for {coin}: {str(e)}")
         
         return None
 
 class ChartGenerator:
-    """Generate beautiful candlestick charts"""
+    """Generate multi-timeframe charts"""
     
     @staticmethod
-    def create_chart(df, coin, timeframe, smc_data, analysis):
-        """Create PNG chart with white background and SMC indicators"""
+    def create_mtf_chart(coin, tf_data, analysis):
+        """Create combined multi-timeframe chart"""
         
-        fig, ax = plt.subplots(figsize=(14, 8), facecolor='white')
-        ax.set_facecolor('white')
+        fig = plt.figure(figsize=(16, 10), facecolor='white')
+        gs = fig.add_gridspec(3, 1, height_ratios=[1, 1, 1], hspace=0.3)
         
-        # Plot candlesticks
-        for i in range(len(df)):
-            color = 'green' if df['close'].iloc[i] >= df['open'].iloc[i] else 'red'
-            
-            # Candle body
-            body_height = abs(df['close'].iloc[i] - df['open'].iloc[i])
-            body_bottom = min(df['open'].iloc[i], df['close'].iloc[i])
-            
-            ax.add_patch(patches.Rectangle(
-                (i, body_bottom), 0.8, body_height,
-                facecolor=color, edgecolor='black', linewidth=0.5
-            ))
-            
-            # Wicks
-            ax.plot([i + 0.4, i + 0.4], 
-                   [df['low'].iloc[i], df['high'].iloc[i]], 
-                   color='black', linewidth=1)
+        timeframes = ['1d', '4h', '1h']
+        titles = ['Daily (1D) - Market Structure', '4-Hour (4H) - Entry Setup', '1-Hour (1H) - Timing']
         
-        # Plot Order Blocks
-        if 'order_blocks' in smc_data:
-            for ob in smc_data['order_blocks']['bullish'][-3:]:
-                idx = ob['index']
-                if idx < len(df):
-                    ax.axhspan(ob['price'], ob['high'], 
-                              alpha=0.2, color='green', label='Bullish OB')
+        for idx, (tf, title) in enumerate(zip(timeframes, titles)):
+            ax = fig.add_subplot(gs[idx])
+            df = tf_data[tf]['dataframe'].tail(100)
             
-            for ob in smc_data['order_blocks']['bearish'][-3:]:
-                idx = ob['index']
-                if idx < len(df):
-                    ax.axhspan(ob['low'], ob['price'], 
-                              alpha=0.2, color='red', label='Bearish OB')
-        
-        # Plot FVG
-        if 'fvg' in smc_data:
-            for fvg in smc_data['fvg']['bullish'][-2:]:
-                idx = fvg['index']
-                if idx < len(df):
-                    ax.axhspan(fvg['bottom'], fvg['top'], 
-                              alpha=0.15, color='blue', linestyle='--')
+            # Plot candlesticks
+            for i in range(len(df)):
+                color = 'green' if df['close'].iloc[i] >= df['open'].iloc[i] else 'red'
+                
+                body_height = abs(df['close'].iloc[i] - df['open'].iloc[i])
+                body_bottom = min(df['open'].iloc[i], df['close'].iloc[i])
+                
+                ax.add_patch(patches.Rectangle(
+                    (i, body_bottom), 0.8, body_height,
+                    facecolor=color, edgecolor='black', linewidth=0.5, alpha=0.8
+                ))
+                
+                ax.plot([i + 0.4, i + 0.4], 
+                       [df['low'].iloc[i], df['high'].iloc[i]], 
+                       color='black', linewidth=1, alpha=0.6)
+            
+            # Plot support/resistance
+            if 'support' in tf_data[tf] and tf_data[tf]['support']:
+                for level in tf_data[tf]['support'][-2:]:
+                    ax.axhline(y=level, color='green', linestyle='--', alpha=0.3, linewidth=1.5)
+            
+            if 'resistance' in tf_data[tf] and tf_data[tf]['resistance']:
+                for level in tf_data[tf]['resistance'][-2:]:
+                    ax.axhline(y=level, color='red', linestyle='--', alpha=0.3, linewidth=1.5)
+            
+            ax.set_title(f'{title} | Trend: {tf_data[tf]["trend"]}', 
+                        fontsize=12, fontweight='bold', pad=10)
+            ax.set_ylabel('Price (USDT)', fontsize=10)
+            ax.grid(True, alpha=0.2, linestyle=':')
+            ax.spines['top'].set_visible(False)
+            ax.spines['right'].set_visible(False)
         
         # Add signal annotation
         if analysis and analysis['signal'] in ['BUY', 'SELL']:
             color = 'green' if analysis['signal'] == 'BUY' else 'red'
-            y_pos = df['low'].min() if analysis['signal'] == 'BUY' else df['high'].max()
-            
-            ax.annotate(f"{analysis['signal']}\n{analysis['confidence']}%",
-                       xy=(len(df)-10, y_pos),
-                       xytext=(len(df)-20, y_pos),
-                       fontsize=14, fontweight='bold', color=color,
-                       bbox=dict(boxstyle='round', facecolor=color, alpha=0.3),
-                       arrowprops=dict(arrowstyle='->', color=color, lw=2))
+            signal_text = f"""
+{analysis['signal']} SIGNAL
+Confidence: {analysis['confidence']}%
+TF Alignment: {analysis['timeframe_alignment']}
+Risk:Reward = {analysis.get('risk_reward', 'N/A')}
+"""
+            fig.text(0.98, 0.5, signal_text,
+                    transform=fig.transFigure,
+                    fontsize=11, fontweight='bold',
+                    color=color,
+                    bbox=dict(boxstyle='round', facecolor=color, alpha=0.2),
+                    verticalalignment='center',
+                    horizontalalignment='right')
         
-        # Styling
-        ax.set_title(f'{coin}/USDT - {timeframe.upper()} | SMC Analysis', 
-                    fontsize=16, fontweight='bold', pad=20)
-        ax.set_xlabel('Candles', fontsize=12)
-        ax.set_ylabel('Price (USDT)', fontsize=12)
-        ax.grid(True, alpha=0.3, linestyle='--')
-        ax.spines['top'].set_visible(False)
-        ax.spines['right'].set_visible(False)
+        plt.suptitle(f'{coin}/USDT - Multi-Timeframe SMC Analysis', 
+                    fontsize=16, fontweight='bold', y=0.98)
         
-        # Add timestamp
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')
         fig.text(0.99, 0.01, f'Generated: {timestamp}', 
                 ha='right', fontsize=8, color='gray')
         
-        plt.tight_layout()
-        
-        # Save to BytesIO
         buf = BytesIO()
-        plt.savefig(buf, format='png', dpi=150, facecolor='white')
+        plt.savefig(buf, format='png', dpi=150, facecolor='white', bbox_inches='tight')
         buf.seek(0)
         plt.close()
         
         return buf
 
 class TradingBot:
-    """Main Trading Bot Controller"""
+    """Main Trading Bot with Multi-Timeframe Analysis"""
     
     def __init__(self):
-        self.telegram_bot = Bot(token=TELEGRAM_BOT_TOKEN)
+        # Configure Telegram with larger connection pool
+        request = HTTPXRequest(
+            connection_pool_size=20,
+            connect_timeout=30,
+            read_timeout=30,
+            write_timeout=30,
+            pool_timeout=30
+        )
+        self.telegram_bot = Bot(token=TELEGRAM_BOT_TOKEN, request=request)
         self.is_running = False
+        self.alert_semaphore = asyncio.Semaphore(3)  # Max 3 parallel alerts
     
-    async def send_telegram_alert(self, coin, timeframe, analysis, chart_buffer):
-        """Send trading alert to Telegram"""
-        try:
-            if analysis['signal'] == 'WAIT':
-                return  # Don't send WAIT signals
-            
-            signal_emoji = "🟢" if analysis['signal'] == 'BUY' else "🔴"
-            
-            message = f"""
+    async def send_telegram_alert(self, coin, analysis, chart_buffer):
+        """Send trading alert with rate limiting"""
+        async with self.alert_semaphore:
+            try:
+                if analysis['signal'] == 'WAIT':
+                    return
+                
+                signal_emoji = "🟢" if analysis['signal'] == 'BUY' else "🔴"
+                
+                message = f"""
 {signal_emoji} **{analysis['signal']} ALERT** {signal_emoji}
 
 **Coin:** {coin}/USDT
-**Timeframe:** {timeframe.upper()}
 **Confidence:** {analysis['confidence']}%
-**Market Structure:** {analysis['structure']}
+**Timeframe Alignment:** {analysis['timeframe_alignment']}
 
-**Entry Range:** ${analysis['entry_range'][0]:,.2f} - ${analysis['entry_range'][1]:,.2f}
+📊 **Multi-Timeframe Structure:**
+• Daily: {analysis['daily_structure']}
+• 4H Setup: {analysis['4h_setup']}
+• 1H Entry: {analysis['1h_entry']}
+
+💰 **Trade Setup:**
+**Entry:** ${analysis['entry_range'][0]:,.2f} - ${analysis['entry_range'][1]:,.2f}
 **Stop Loss:** ${analysis['stop_loss']:,.2f}
-**Take Profits:**
+**Targets:**
   TP1: ${analysis['take_profits'][0]:,.2f}
   TP2: ${analysis['take_profits'][1]:,.2f}
   TP3: ${analysis['take_profits'][2]:,.2f}
 
-**Risk Level:** {analysis['risk']}
+**Risk:Reward:** {analysis.get('risk_reward', 'N/A')}
+
+📈 **Key Levels:**
+Support: {', '.join([f'${s:,.0f}' for s in analysis['key_levels']['support']])}
+Resistance: {', '.join([f'${r:,.0f}' for r in analysis['key_levels']['resistance']])}
 
 **Analysis:**
 {analysis['reasoning']}
 
 ⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}
-            """
-            
-            # Send chart
-            chart_buffer.seek(0)
-            await self.telegram_bot.send_photo(
-                chat_id=TELEGRAM_CHAT_ID,
-                photo=InputFile(chart_buffer, filename=f'{coin}_{timeframe}.png'),
-                caption=message,
-                parse_mode='Markdown'
-            )
-            
-            print(f"✅ Alert sent for {coin} {timeframe}: {analysis['signal']}")
-            
-        except TelegramError as e:
-            print(f"Telegram Error: {str(e)}")
-        except Exception as e:
-            print(f"Error sending alert: {str(e)}")
-    
-    async def analyze_coin(self, session, coin, timeframe):
-        """Analyze single coin on single timeframe"""
-        try:
-            # Try Binance first (more reliable and supports all coins)
-            df = await BinanceAPI.get_candlestick_data(session, coin, timeframe, limit=1000)
-            
-            # Fallback to Deribit only for BTC/ETH if Binance fails
-            if df is None and coin in ['BTC', 'ETH']:
-                print(f"⚠️ Binance failed, trying Deribit for {coin}...")
-                df = await DeribitAPI.get_candlestick_data(session, coin, timeframe, limit=1000)
-            
-            if df is None or len(df) < 100:
-                print(f"⚠️ Insufficient data for {coin} {timeframe} (got {len(df) if df is not None else 0} candles)")
-                return
-            
-            # Perform SMC Analysis
-            order_blocks = SMCAnalyzer.find_order_blocks(df)
-            bos_choch = SMCAnalyzer.detect_bos_choch(df)
-            fvg = SMCAnalyzer.find_fvg(df)
-            patterns = SMCAnalyzer.detect_candlestick_patterns(df)
-            
-            smc_data = {
-                'order_blocks': order_blocks,
-                'bos_choch': bos_choch,
-                'fvg': fvg,
-                'patterns': patterns
-            }
-            
-            # Prepare data for DeepSeek
-            recent_data = df.tail(50).to_dict('records')
-            mtf_summary = {
-                'current_price': float(df['close'].iloc[-1]),
-                'change_24h': float((df['close'].iloc[-1] - df['close'].iloc[-24]) / df['close'].iloc[-24] * 100),
-                'high_24h': float(df['high'].tail(24).max()),
-                'low_24h': float(df['low'].tail(24).min()),
-                'volume': float(df['volume'].tail(24).sum())
-            }
-            
-            smc_summary = {
-                'bullish_order_blocks': len(order_blocks['bullish']),
-                'bearish_order_blocks': len(order_blocks['bearish']),
-                'bullish_fvg': len(fvg['bullish']),
-                'bearish_fvg': len(fvg['bearish']),
-                'recent_patterns': [p['type'] for p in patterns[-5:]],
-                'bos_signals': len([s for s in bos_choch if 'BULL' in s['type']])
-            }
-            
-            # Get DeepSeek analysis
-            analysis = await DeepSeekAnalyzer.analyze_with_deepseek(
-                session, coin, str(mtf_summary), str(smc_summary)
-            )
-            
-            if analysis:
-                # Generate chart
-                chart_buffer = ChartGenerator.create_chart(
-                    df.tail(100), coin, timeframe, smc_data, analysis
+                """
+                
+                chart_buffer.seek(0)
+                await self.telegram_bot.send_photo(
+                    chat_id=TELEGRAM_CHAT_ID,
+                    photo=chart_buffer,
+                    caption=message,
+                    parse_mode='Markdown'
                 )
                 
-                # Send alert if signal is BUY or SELL
-                await self.send_telegram_alert(coin, timeframe, analysis, chart_buffer)
+                print(f"✅ Alert sent for {coin}: {analysis['signal']} ({analysis['confidence']}%)")
+                await asyncio.sleep(1)  # Rate limiting
+                
+            except TelegramError as e:
+                print(f"⚠️ Telegram error for {coin}: {str(e)}")
+            except Exception as e:
+                print(f"❌ Error sending alert for {coin}: {str(e)}")
+    
+    async def analyze_coin_mtf(self, session, coin):
+        """Analyze single coin across all timeframes"""
+        try:
+            print(f"\n📊 Analyzing {coin} across multiple timeframes...")
+            
+            # Fetch data for all timeframes
+            tf_data = {}
+            for tf in TIMEFRAMES:
+                df = await BinanceAPI.get_candlestick_data(session, coin, tf, limit=1000)
+                
+                if df is None or len(df) < 100:
+                    print(f"⚠️ Insufficient data for {coin} {tf}")
+                    return
+                
+                # Perform SMC analysis
+                order_blocks = SMCAnalyzer.find_order_blocks(df)
+                bos_signals = SMCAnalyzer.detect_bos_choch(df)
+                fvg = SMCAnalyzer.find_fvg(df)
+                sr_levels = SMCAnalyzer.find_support_resistance(df)
+                trend = SMCAnalyzer.analyze_trend(df)
+                
+                tf_data[tf] = {
+                    'dataframe': df,
+                    'current_price': float(df['close'].iloc[-1]),
+                    'high_24h': float(df['high'].tail(24).max() if tf == '1h' else df['high'].tail(7).max()),
+                    'low_24h': float(df['low'].tail(24).min() if tf == '1h' else df['low'].tail(7).min()),
+                    'volume_trend': 'Increasing' if df['volume'].tail(10).mean() > df['volume'].tail(30).mean() else 'Decreasing',
+                    'trend': trend,
+                    'order_blocks': order_blocks,
+                    'bos_signals': bos_signals,
+                    'fvg': fvg,
+                    'support': sr_levels['support'],
+                    'resistance': sr_levels['resistance']
+                }
+                
+                print(f"  ✓ {tf}: {len(df)} candles | Trend: {trend}")
+                await asyncio.sleep(0.3)  # Rate limiting
+            
+            # Get DeepSeek multi-timeframe analysis
+            print(f"🤖 Getting AI analysis for {coin}...")
+            analysis = await DeepSeekAnalyzer.analyze_multi_timeframe(session, coin, tf_data)
+            
+            if analysis and analysis['signal'] in ['BUY', 'SELL']:
+                print(f"  🎯 Signal: {analysis['signal']} | Confidence: {analysis['confidence']}% | Alignment: {analysis['timeframe_alignment']}")
+                
+                # Generate chart
+                chart_buffer = ChartGenerator.create_mtf_chart(coin, tf_data, analysis)
+                
+                # Send alert
+                await self.send_telegram_alert(coin, analysis, chart_buffer)
+            else:
+                print(f"  ⏸️ {coin}: No actionable signal (WAIT)")
             
         except Exception as e:
-            print(f"❌ Error analyzing {coin} {timeframe}: {str(e)}")
+            print(f"❌ Error analyzing {coin}: {str(e)}")
             traceback.print_exc()
     
     async def scan_all_coins(self):
-        """Scan all coins across all timeframes"""
-        async with aiohttp.ClientSession() as session:
-            tasks = []
-            
+        """Scan all coins with multi-timeframe analysis"""
+        connector = aiohttp.TCPConnector(limit=30, limit_per_host=10)
+        timeout = aiohttp.ClientTimeout(total=60, connect=15, sock_read=30)
+        
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
             for coin in COINS:
-                for timeframe in TIMEFRAMES:
-                    task = self.analyze_coin(session, coin, timeframe)
-                    tasks.append(task)
-                    await asyncio.sleep(0.5)  # Rate limiting
-            
-            await asyncio.gather(*tasks, return_exceptions=True)
+                await self.analyze_coin_mtf(session, coin)
+                await asyncio.sleep(2)  # Spacing between coins
     
     async def run(self):
         """Main bot loop"""
         self.is_running = True
-        print("🚀 Trading Bot Started!")
-        print(f"📊 Scanning: {', '.join(COINS)}")
-        print(f"⏱️ Timeframes: {', '.join(TIMEFRAMES)}")
-        print(f"🔄 Scan Interval: {SCAN_INTERVAL}s (1 hour)\n")
+        print("🚀 Multi-Timeframe Trading Bot Started!")
+        print(f"📊 Coins: {', '.join(COINS)}")
+        print(f"⏱️ Timeframes: {' → '.join(TIMEFRAMES)} (HTF to LTF)")
+        print(f"🔄 Scan Interval: {SCAN_INTERVAL}s\n")
         
         while self.is_running:
             try:
-                print(f"\n{'='*50}")
-                print(f"🔍 Starting scan at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-                print(f"{'='*50}\n")
+                print(f"\n{'='*60}")
+                print(f"🔍 Multi-Timeframe Scan: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                print(f"{'='*60}")
                 
                 await self.scan_all_coins()
                 
-                print(f"\n✅ Scan completed. Next scan in {SCAN_INTERVAL}s")
+                print(f"\n✅ Scan completed. Next scan in {SCAN_INTERVAL}s ({SCAN_INTERVAL//60} minutes)")
                 await asyncio.sleep(SCAN_INTERVAL)
                 
             except KeyboardInterrupt:
@@ -558,7 +540,7 @@ class TradingBot:
             except Exception as e:
                 print(f"\n❌ Critical error: {str(e)}")
                 traceback.print_exc()
-                await asyncio.sleep(60)  # Wait before retry
+                await asyncio.sleep(60)
 
 if __name__ == "__main__":
     bot = TradingBot()

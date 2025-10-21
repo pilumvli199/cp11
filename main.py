@@ -23,12 +23,66 @@ COINS = ['BTC', 'ETH', 'BNB', 'XRP', 'SOL', 'DOGE', 'TRX', 'ADA', 'AVAX', 'LINK'
 TIMEFRAMES = ['1h', '4h', '1d']
 SCAN_INTERVAL = 3600  # 1 hour in seconds
 
+class BinanceAPI:
+    """Binance Futures API - More reliable and supports all coins"""
+    BASE_URL = "https://fapi.binance.com/fapi/v1"
+    
+    @staticmethod
+    async def get_candlestick_data(session, symbol, timeframe, limit=1000):
+        """Fetch candlestick data from Binance Futures API"""
+        url = f"{BinanceAPI.BASE_URL}/klines"
+        
+        params = {
+            'symbol': f"{symbol}USDT",
+            'interval': timeframe,
+            'limit': min(limit, 1500)  # Binance max limit
+        }
+        
+        try:
+            async with session.get(url, params=params, timeout=10) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    
+                    if len(data) > 0:
+                        df = pd.DataFrame(data, columns=[
+                            'timestamp', 'open', 'high', 'low', 'close', 'volume',
+                            'close_time', 'quote_volume', 'trades', 
+                            'taker_buy_base', 'taker_buy_quote', 'ignore'
+                        ])
+                        
+                        # Convert to proper types
+                        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                        df['open'] = df['open'].astype(float)
+                        df['high'] = df['high'].astype(float)
+                        df['low'] = df['low'].astype(float)
+                        df['close'] = df['close'].astype(float)
+                        df['volume'] = df['volume'].astype(float)
+                        
+                        # Keep only needed columns
+                        df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+                        
+                        print(f"✓ Fetched {len(df)} candles for {symbol} {timeframe}")
+                        return df
+                    
+        except asyncio.TimeoutError:
+            print(f"⚠️ Timeout fetching {symbol} {timeframe}")
+        except Exception as e:
+            print(f"❌ Error fetching {symbol} {timeframe}: {str(e)}")
+        
+        return None
+
+
 class DeribitAPI:
+    """Deribit API - Only for BTC and ETH"""
     BASE_URL = "https://www.deribit.com/api/v2/public"
     
     @staticmethod
     async def get_candlestick_data(session, symbol, timeframe, limit=1000):
         """Fetch candlestick data from Deribit public API"""
+        # Deribit only has BTC and ETH perpetuals
+        if symbol not in ['BTC', 'ETH']:
+            return None
+            
         # Convert timeframe to minutes
         tf_map = {'1h': 60, '4h': 240, '1d': 1440}
         resolution = tf_map.get(timeframe, 60)
@@ -37,7 +91,8 @@ class DeribitAPI:
         end_timestamp = int(datetime.now().timestamp() * 1000)
         start_timestamp = end_timestamp - (limit * resolution * 60 * 1000)
         
-        instrument = f"{symbol}_USDT-PERPETUAL"
+        # Deribit instrument naming
+        instrument = f"{symbol}-PERPETUAL"
         url = f"{DeribitAPI.BASE_URL}/get_tradingview_chart_data"
         
         params = {
@@ -48,10 +103,10 @@ class DeribitAPI:
         }
         
         try:
-            async with session.get(url, params=params) as response:
+            async with session.get(url, params=params, timeout=10) as response:
                 if response.status == 200:
                     data = await response.json()
-                    if data['result']['status'] == 'ok':
+                    if 'result' in data and data['result']['status'] == 'ok':
                         result = data['result']
                         df = pd.DataFrame({
                             'timestamp': result['ticks'],
@@ -62,9 +117,11 @@ class DeribitAPI:
                             'volume': result['volume']
                         })
                         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                        print(f"✓ Fetched {len(df)} candles for {symbol} {timeframe} from Deribit")
                         return df
         except Exception as e:
-            print(f"Error fetching {symbol} {timeframe}: {str(e)}")
+            print(f"⚠️ Deribit error for {symbol} {timeframe}: {str(e)}")
+        
         return None
 
 class SMCAnalyzer:
@@ -400,11 +457,16 @@ class TradingBot:
     async def analyze_coin(self, session, coin, timeframe):
         """Analyze single coin on single timeframe"""
         try:
-            # Fetch candlestick data
-            df = await DeribitAPI.get_candlestick_data(session, coin, timeframe, limit=1000)
+            # Try Binance first (more reliable and supports all coins)
+            df = await BinanceAPI.get_candlestick_data(session, coin, timeframe, limit=1000)
+            
+            # Fallback to Deribit only for BTC/ETH if Binance fails
+            if df is None and coin in ['BTC', 'ETH']:
+                print(f"⚠️ Binance failed, trying Deribit for {coin}...")
+                df = await DeribitAPI.get_candlestick_data(session, coin, timeframe, limit=1000)
             
             if df is None or len(df) < 100:
-                print(f"⚠️ Insufficient data for {coin} {timeframe}")
+                print(f"⚠️ Insufficient data for {coin} {timeframe} (got {len(df) if df is not None else 0} candles)")
                 return
             
             # Perform SMC Analysis

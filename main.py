@@ -616,4 +616,89 @@ class TradingBot:
                     print(f"  ⚠️ Insufficient data for {tf}")
                     return
                 
-                #
+                # SMC Analysis
+                order_blocks = SMCAnalyzer.find_order_blocks(df)
+                bos_signals = SMCAnalyzer.detect_bos_choch(df)
+                fvg = SMCAnalyzer.find_fvg(df)
+                sr_levels = SMCAnalyzer.find_support_resistance(df)
+                trend = SMCAnalyzer.analyze_trend(df)
+                patterns = SMCAnalyzer.detect_candlestick_patterns(df)
+                
+                tf_data[tf] = {
+                    'dataframe': df,
+                    'current_price': float(df['close'].iloc[-1]),
+                    'high_24h': float(df['high'].tail(24 if tf == '1h' else 6).max()),
+                    'low_24h': float(df['low'].tail(24 if tf == '1h' else 6).min()),
+                    'volume_trend': 'Increasing' if df['volume'].tail(10).mean() > df['volume'].tail(30).mean() else 'Decreasing',
+                    'trend': trend,
+                    'order_blocks': order_blocks,
+                    'bos_signals': bos_signals,
+                    'fvg': fvg,
+                    'support': sr_levels['support'],
+                    'resistance': sr_levels['resistance'],
+                    'patterns': patterns
+                }
+                
+                print(f"  ✓ {tf}: Trend={trend} | OB: {len(order_blocks['bullish'])}B/{len(order_blocks['bearish'])}S")
+                await asyncio.sleep(0.3)
+            
+            # Get AI analysis
+            print(f"  🤖 Getting 4H+1H combined analysis...")
+            analysis = await DeepSeekAnalyzer.analyze_4h_1h_strategy(session, coin, tf_data)
+            
+            if analysis and analysis['signal'] in ['BUY', 'SELL']:
+                print(f"  🎯 SIGNAL: {analysis['signal']} | Confidence: {analysis['confidence']}%")
+                
+                # Generate chart
+                chart_buffer = ChartGenerator.create_dual_tf_chart(coin, tf_data, analysis)
+                
+                # Send alert
+                await self.send_telegram_alert(coin, analysis, chart_buffer)
+            else:
+                print(f"  ⏸️ {coin}: WAIT (No clear 4H+1H alignment)")
+            
+        except Exception as e:
+            print(f"❌ Error analyzing {coin}: {str(e)}")
+            traceback.print_exc()
+    
+    async def scan_all_coins(self):
+        """Scan all coins"""
+        connector = aiohttp.TCPConnector(limit=30, limit_per_host=10)
+        timeout = aiohttp.ClientTimeout(total=60, connect=15, sock_read=30)
+        
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+            for coin in COINS:
+                await self.analyze_coin_4h_1h(session, coin)
+                await asyncio.sleep(2)  # Rate limiting between coins
+    
+    async def run(self):
+        """Main bot loop"""
+        self.is_running = True
+        print("🚀 4H + 1H Trading Bot Started!")
+        print(f"📊 Strategy: 4H for trend/setup, 1H for entry timing")
+        print(f"💰 Coins: {', '.join(COINS)}")
+        print(f"🔄 Scan Interval: {SCAN_INTERVAL}s (1 hour)\n")
+        
+        while self.is_running:
+            try:
+                print(f"\n{'='*70}")
+                print(f"🔍 4H + 1H Scan Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                print(f"{'='*70}")
+                
+                await self.scan_all_coins()
+                
+                print(f"\n✅ Scan completed. Next scan in {SCAN_INTERVAL}s ({SCAN_INTERVAL//60} min)")
+                await asyncio.sleep(SCAN_INTERVAL)
+                
+            except KeyboardInterrupt:
+                print("\n🛑 Bot stopped by user")
+                self.is_running = False
+                break
+            except Exception as e:
+                print(f"\n❌ Critical error: {str(e)}")
+                traceback.print_exc()
+                await asyncio.sleep(60)
+
+if __name__ == "__main__":
+    bot = TradingBot()
+    asyncio.run(bot.run())

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-DERIBIT & BINANCE OPTIONS DASHBOARD
-====================================
-- Fetches option chain data from both exchanges
-- Uses PUBLIC endpoints (no API key needed)
-- Shows OI, Volume, IV, Greeks, etc.
+FIXED DERIBIT & BINANCE OPTIONS DASHBOARD
+==========================================
+Key fixes:
+- IV extraction corrected
+- Better error handling for missing data
+- More robust data parsing
 """
 
 import os
@@ -12,7 +13,6 @@ import time
 import requests
 import pandas as pd
 import matplotlib.pyplot as plt
-import mplfinance as mpf
 import asyncio
 from io import BytesIO
 from datetime import datetime
@@ -26,7 +26,6 @@ logger = logging.getLogger(__name__)
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 
-# Base URLs
 DERIBIT_URL = "https://www.deribit.com/api/v2"
 BINANCE_URL = "https://eapi.binance.com"
 
@@ -34,7 +33,7 @@ plt.style.use('dark_background')
 
 
 class DeribitDashboard:
-    """Deribit Options Chain - Public API"""
+    """Deribit Options Chain - Public API - FIXED VERSION"""
     
     def __init__(self):
         self.session = requests.Session()
@@ -96,7 +95,7 @@ class DeribitDashboard:
             return []
 
     def get_chain_data(self, currency='BTC'):
-        """Fetch Deribit option chain"""
+        """Fetch Deribit option chain - FIXED VERSION"""
         try:
             # 1. Get spot
             spot = self.get_spot_price(currency)
@@ -141,7 +140,7 @@ class DeribitDashboard:
             calls_data = {}
             puts_data = {}
             
-            for inst_name in target_instruments[:50]:  # Limit to avoid rate limits
+            for inst_name in target_instruments[:50]:
                 try:
                     ticker_url = f"{DERIBIT_URL}/public/ticker"
                     ticker_res = self.session.get(ticker_url, 
@@ -161,32 +160,66 @@ class DeribitDashboard:
                     strike = self.safe_float(parts[2])
                     opt_type = parts[3]  # C or P
                     
-                    # Extract data
+                    # FIX 1: Extract IV properly
+                    # Deribit returns mark_iv as decimal (0.5 = 50%)
+                    raw_iv = ticker.get('mark_iv')
+                    iv_value = 0
+                    if raw_iv is not None and raw_iv > 0:
+                        # If mark_iv is already percentage (>1), use as-is
+                        # If it's decimal (<1), multiply by 100
+                        if raw_iv < 1:
+                            iv_value = self.safe_float(raw_iv) * 100
+                        else:
+                            iv_value = self.safe_float(raw_iv)
+                    
+                    # FIX 2: Get volume properly
+                    # Check multiple possible volume fields
+                    volume = 0
+                    stats = ticker.get('stats', {})
+                    if stats:
+                        # Try volume_usd first
+                        volume = self.safe_float(stats.get('volume_usd', 0))
+                        # If zero, try volume
+                        if volume == 0:
+                            volume = self.safe_float(stats.get('volume', 0))
+                    
+                    # FIX 3: Get greeks with better error handling
+                    greeks = ticker.get('greeks', {})
+                    
                     data = {
                         'ltp': self.safe_float(ticker.get('mark_price')),
-                        'oi': self.safe_float(ticker.get('open_interest')),  # In contracts
-                        'vol': self.safe_float(ticker.get('stats', {}).get('volume_usd')),
-                        'iv': self.safe_float(ticker.get('mark_iv')) * 100,  # Convert to %
-                        'delta': self.safe_float(ticker.get('greeks', {}).get('delta')),
-                        'gamma': self.safe_float(ticker.get('greeks', {}).get('gamma')),
-                        'theta': self.safe_float(ticker.get('greeks', {}).get('theta')),
-                        'vega': self.safe_float(ticker.get('greeks', {}).get('vega'))
+                        'oi': self.safe_float(ticker.get('open_interest')),
+                        'vol': volume,
+                        'iv': iv_value,
+                        'delta': self.safe_float(greeks.get('delta')) if greeks else 0,
+                        'gamma': self.safe_float(greeks.get('gamma')) if greeks else 0,
+                        'theta': self.safe_float(greeks.get('theta')) if greeks else 0,
+                        'vega': self.safe_float(greeks.get('vega')) if greeks else 0
                     }
+                    
+                    # Debug log for first few
+                    if len(calls_data) + len(puts_data) < 3:
+                        logger.info(f"Sample {inst_name}: IV={iv_value:.1f}%, OI={data['oi']}, Vol={data['vol']}")
                     
                     if opt_type == 'C':
                         calls_data[strike] = data
                     else:
                         puts_data[strike] = data
                     
-                    time.sleep(0.05)  # Rate limit protection
+                    time.sleep(0.05)
                     
                 except Exception as e:
+                    logger.error(f"Error parsing {inst_name}: {e}")
                     continue
             
             logger.info(f"✅ Parsed: {len(calls_data)} calls, {len(puts_data)} puts")
             
             # 5. Build DataFrame
             all_strikes = sorted(set(list(calls_data.keys()) + list(puts_data.keys())))
+            
+            if not all_strikes:
+                logger.error("No strikes found!")
+                return None, 0, ""
             
             rows = []
             for strike in all_strikes:
@@ -215,6 +248,10 @@ class DeribitDashboard:
             filtered_strikes = all_strikes[start_idx:end_idx]
             
             chain = chain.loc[filtered_strikes]
+            
+            # Debug: Check if IV values are present
+            iv_check = chain[['c_iv', 'p_iv']].describe()
+            logger.info(f"IV Stats:\n{iv_check}")
             
             return chain, spot, exp_dt.strftime('%d-%b')
             
@@ -261,14 +298,12 @@ class BinanceDashboard:
     def get_chain_data(self, underlying='BTC'):
         """Fetch Binance option chain"""
         try:
-            # 1. Get spot
             spot = self.get_spot_price(f"{underlying}USDT")
             if spot == 0:
                 return None, 0, ""
             
             logger.info(f"💰 Binance {underlying} Spot: ${spot:,.2f}")
 
-            # 2. Get exchange info for expiries
             info_url = f"{BINANCE_URL}/eapi/v1/exchangeInfo"
             info_res = self.session.get(info_url, timeout=10)
             
@@ -278,7 +313,6 @@ class BinanceDashboard:
             info_data = info_res.json()
             symbols = info_data.get('optionSymbols', [])
             
-            # Find nearest expiry
             expiries = {}
             now = datetime.utcnow()
             
@@ -304,7 +338,6 @@ class BinanceDashboard:
             exp_str, exp_dt = sorted(expiries.items(), key=lambda x: x[1])[0]
             logger.info(f"📅 Binance Using expiry: {exp_str}")
 
-            # 3. Get mark prices and OI
             mark_url = f"{BINANCE_URL}/eapi/v1/mark"
             mark_res = self.session.get(mark_url, timeout=15)
             
@@ -313,7 +346,6 @@ class BinanceDashboard:
             
             marks = mark_res.json()
             
-            # 4. Get open interest
             oi_data = {}
             try:
                 oi_url = f"{BINANCE_URL}/eapi/v1/openInterest"
@@ -330,18 +362,15 @@ class BinanceDashboard:
             except:
                 pass
 
-            # 5. Parse data
             calls_data = {}
             puts_data = {}
             
             for mark in marks:
                 symbol = mark.get('symbol', '')
                 
-                # Filter by underlying and expiry
                 if not symbol.startswith(underlying):
                     continue
                 
-                # Parse: BTC-241227-90000-C
                 parts = symbol.split('-')
                 if len(parts) != 4:
                     continue
@@ -350,7 +379,6 @@ class BinanceDashboard:
                 strike = self.safe_float(parts[2])
                 opt_type = parts[3]
                 
-                # Check expiry match
                 try:
                     exp_check = datetime.strptime(exp_part, '%y%m%d').strftime('%d%b%y').upper()
                     if exp_check != exp_str:
@@ -358,12 +386,19 @@ class BinanceDashboard:
                 except:
                     continue
                 
-                # Extract data
+                raw_iv = mark.get('markIV')
+                iv_value = 0
+                if raw_iv is not None and raw_iv > 0:
+                    if raw_iv < 1:
+                        iv_value = self.safe_float(raw_iv) * 100
+                    else:
+                        iv_value = self.safe_float(raw_iv)
+                
                 data = {
                     'ltp': self.safe_float(mark.get('markPrice')),
                     'oi': oi_data.get(symbol, 0),
-                    'vol': 0,  # Binance doesn't provide 24h volume easily
-                    'iv': self.safe_float(mark.get('markIV')) * 100,  # Convert to %
+                    'vol': 0,
+                    'iv': iv_value,
                     'delta': self.safe_float(mark.get('delta')),
                     'gamma': self.safe_float(mark.get('gamma')),
                     'theta': self.safe_float(mark.get('theta')),
@@ -377,7 +412,6 @@ class BinanceDashboard:
             
             logger.info(f"✅ Parsed: {len(calls_data)} calls, {len(puts_data)} puts")
             
-            # 6. Build DataFrame
             all_strikes = sorted(set(list(calls_data.keys()) + list(puts_data.keys())))
             
             rows = []
@@ -399,7 +433,6 @@ class BinanceDashboard:
             
             chain = pd.DataFrame(rows).set_index('strike')
             
-            # 7. Filter ATM
             atm_strike = min(all_strikes, key=lambda x: abs(x - spot))
             atm_idx = all_strikes.index(atm_strike)
             start_idx = max(0, atm_idx - 8)
@@ -433,7 +466,6 @@ def format_value(val, is_price=False, is_iv=False):
         else:
             return f"{val:.4f}"
     
-    # OI/Volume
     if val >= 1_000_000:
         return f"{val/1_000_000:.2f}M"
     elif val >= 1_000:
@@ -483,7 +515,6 @@ def generate_dashboard(exchange, chain_df, spot, exp, underlying='BTC'):
     table.set_fontsize(10)
     table.scale(1.2, 2.5)
 
-    # Style
     for (row, col), cell in table.get_celld().items():
         if row == 0:
             cell.set_text_props(weight='bold', color='white')
@@ -493,7 +524,6 @@ def generate_dashboard(exchange, chain_df, spot, exp, underlying='BTC'):
             cell.set_facecolor('black')
             cell.set_text_props(color='white')
 
-            # Highlight ATM
             try:
                 stk_str = table_data[row-1][4].replace(',', '')
                 stk = float(stk_str)
@@ -503,7 +533,6 @@ def generate_dashboard(exchange, chain_df, spot, exp, underlying='BTC'):
             except:
                 pass
 
-            # Colors
             if col < 4:
                 cell.set_text_props(color='#00FF00')
             elif col > 4:
@@ -520,7 +549,6 @@ def generate_dashboard(exchange, chain_df, spot, exp, underlying='BTC'):
     return buf
 
 
-# ==================== MAIN ====================
 async def main():
     if not TELEGRAM_BOT_TOKEN:
         logger.error("❌ TELEGRAM_BOT_TOKEN missing!")
@@ -530,11 +558,10 @@ async def main():
     deribit = DeribitDashboard()
     binance = BinanceDashboard()
     
-    logger.info("🚀 Multi-Exchange Dashboard Started...")
+    logger.info("🚀 Multi-Exchange Dashboard Started (FIXED VERSION)...")
 
     while True:
         try:
-            # DERIBIT BTC
             logger.info("\n" + "="*50)
             logger.info("Fetching DERIBIT BTC...")
             chain, spot, exp = deribit.get_chain_data('BTC')
@@ -547,7 +574,6 @@ async def main():
             
             await asyncio.sleep(15)
 
-            # BINANCE BTC
             logger.info("\n" + "="*50)
             logger.info("Fetching BINANCE BTC...")
             chain, spot, exp = binance.get_chain_data('BTC')
@@ -560,7 +586,6 @@ async def main():
             
             await asyncio.sleep(15)
 
-            # DERIBIT ETH
             logger.info("\n" + "="*50)
             logger.info("Fetching DERIBIT ETH...")
             chain, spot, exp = deribit.get_chain_data('ETH')
@@ -573,7 +598,6 @@ async def main():
             
             await asyncio.sleep(15)
 
-            # BINANCE ETH
             logger.info("\n" + "="*50)
             logger.info("Fetching BINANCE ETH...")
             chain, spot, exp = binance.get_chain_data('ETH')
@@ -593,37 +617,38 @@ async def main():
 
 
 if __name__ == "__main__":
-    # Test mode
     if os.getenv('TEST_MODE'):
-        print("=" * 60)
-        print("TESTING DERIBIT")
-        print("=" * 60)
+        print("="*60)
+        print("TESTING DERIBIT (FIXED)")
+        print("="*60)
         deribit = DeribitDashboard()
         chain, spot, exp = deribit.get_chain_data('BTC')
         if chain is not None:
             print(f"Spot: ${spot:,.2f}, Expiry: {exp}")
-            print("\nSample data:")
-            print(chain.head())
+            print("\nFull chain data:")
+            print(chain)
+            print("\nIV Check:")
+            print(chain[['c_iv', 'p_iv']].describe())
             img = generate_dashboard('deribit', chain, spot, exp, 'BTC')
             if img:
-                with open('deribit_btc_test.png', 'wb') as f:
+                with open('deribit_btc_fixed.png', 'wb') as f:
                     f.write(img.read())
-                print("✅ Saved: deribit_btc_test.png")
+                print("✅ Saved: deribit_btc_fixed.png")
         
-        print("\n" + "=" * 60)
-        print("TESTING BINANCE")
-        print("=" * 60)
+        print("\n" + "="*60)
+        print("TESTING BINANCE (FIXED)")
+        print("="*60)
         binance = BinanceDashboard()
         chain, spot, exp = binance.get_chain_data('BTC')
         if chain is not None:
             print(f"Spot: ${spot:,.2f}, Expiry: {exp}")
-            print("\nSample data:")
-            print(chain.head())
+            print("\nFull chain data:")
+            print(chain)
             img = generate_dashboard('binance', chain, spot, exp, 'BTC')
             if img:
-                with open('binance_btc_test.png', 'wb') as f:
+                with open('binance_btc_fixed.png', 'wb') as f:
                     f.write(img.read())
-                print("✅ Saved: binance_btc_test.png")
+                print("✅ Saved: binance_btc_fixed.png")
     else:
         try:
             asyncio.run(main())

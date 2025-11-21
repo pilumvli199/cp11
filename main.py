@@ -1,704 +1,631 @@
+#!/usr/bin/env python3
+"""
+DERIBIT & BINANCE OPTIONS DASHBOARD
+====================================
+- Fetches option chain data from both exchanges
+- Uses PUBLIC endpoints (no API key needed)
+- Shows OI, Volume, IV, Greeks, etc.
+"""
+
 import os
-import asyncio
-import aiohttp
-from datetime import datetime
+import time
+import requests
 import pandas as pd
-import numpy as np
-from telegram import Bot
-from telegram.request import HTTPXRequest
-from telegram.error import TelegramError
 import matplotlib.pyplot as plt
-import matplotlib.patches as patches
+import mplfinance as mpf
+import asyncio
 from io import BytesIO
-import traceback
-from dotenv import load_dotenv
+from datetime import datetime
+from telegram import Bot
+import logging
 
-load_dotenv()
+# ==================== CONFIGURATION ====================
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-# Configuration
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
-DEEPSEEK_API_KEY = os.getenv('DEEPSEEK_API_KEY')
 
-COINS = ['BTC', 'ETH', 'BNB', 'XRP', 'SOL', 'DOGE', 'TRX', 'ADA', 'AVAX', 'LINK']
-TIMEFRAMES = ['4h', '1h']  # 4H for trend/setup, 1H for entry timing
-SCAN_INTERVAL = 3600  # 1 hour
+# Base URLs
+DERIBIT_URL = "https://www.deribit.com/api/v2"
+BINANCE_URL = "https://eapi.binance.com"
 
-class BinanceAPI:
-    """Binance Futures API"""
-    BASE_URL = "https://fapi.binance.com/fapi/v1"
-    
-    @staticmethod
-    async def get_candlestick_data(session, symbol, timeframe, limit=1000):
-        """Fetch candlestick data from Binance Futures"""
-        url = f"{BinanceAPI.BASE_URL}/klines"
-        
-        params = {
-            'symbol': f"{symbol}USDT",
-            'interval': timeframe,
-            'limit': min(limit, 1500)
-        }
-        
-        try:
-            async with session.get(url, params=params, timeout=15) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    
-                    if len(data) > 0:
-                        df = pd.DataFrame(data, columns=[
-                            'timestamp', 'open', 'high', 'low', 'close', 'volume',
-                            'close_time', 'quote_volume', 'trades', 
-                            'taker_buy_base', 'taker_buy_quote', 'ignore'
-                        ])
-                        
-                        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-                        df['open'] = df['open'].astype(float)
-                        df['high'] = df['high'].astype(float)
-                        df['low'] = df['low'].astype(float)
-                        df['close'] = df['close'].astype(float)
-                        df['volume'] = df['volume'].astype(float)
-                        
-                        df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
-                        return df
-                    
-        except Exception as e:
-            print(f"❌ Error fetching {symbol} {timeframe}: {str(e)}")
-        
-        return None
+plt.style.use('dark_background')
 
-class SMCAnalyzer:
-    """Smart Money Concepts Analyzer"""
-    
-    @staticmethod
-    def find_order_blocks(df, lookback=20):
-        """Identify order blocks - institutional buy/sell zones"""
-        order_blocks = {'bullish': [], 'bearish': []}
-        
-        for i in range(lookback, len(df) - 1):
-            # Bullish Order Block (strong buying candle)
-            if df['close'].iloc[i] > df['open'].iloc[i]:
-                body_size = df['close'].iloc[i] - df['open'].iloc[i]
-                avg_body = abs(df['close'].iloc[i-lookback:i] - df['open'].iloc[i-lookback:i]).mean()
-                
-                if body_size > avg_body * 1.5:
-                    order_blocks['bullish'].append({
-                        'price': float(df['low'].iloc[i]),
-                        'high': float(df['high'].iloc[i]),
-                        'strength': float(body_size),
-                        'timestamp': str(df['timestamp'].iloc[i])
-                    })
-            
-            # Bearish Order Block (strong selling candle)
-            elif df['close'].iloc[i] < df['open'].iloc[i]:
-                body_size = df['open'].iloc[i] - df['close'].iloc[i]
-                avg_body = abs(df['close'].iloc[i-lookback:i] - df['open'].iloc[i-lookback:i]).mean()
-                
-                if body_size > avg_body * 1.5:
-                    order_blocks['bearish'].append({
-                        'price': float(df['high'].iloc[i]),
-                        'low': float(df['low'].iloc[i]),
-                        'strength': float(body_size),
-                        'timestamp': str(df['timestamp'].iloc[i])
-                    })
-        
-        return order_blocks
-    
-    @staticmethod
-    def detect_bos_choch(df, swing_period=10):
-        """Detect Break of Structure (BOS) and Change of Character (ChoCH)"""
-        signals = []
-        highs = df['high'].rolling(window=swing_period).max()
-        lows = df['low'].rolling(window=swing_period).min()
-        
-        for i in range(swing_period, len(df) - 1):
-            # Bullish BOS - break above previous swing high
-            if df['close'].iloc[i] > highs.iloc[i-1]:
-                signals.append({
-                    'type': 'BOS_BULL',
-                    'price': float(df['close'].iloc[i]),
-                    'timestamp': str(df['timestamp'].iloc[i])
-                })
-            
-            # Bearish BOS - break below previous swing low
-            if df['close'].iloc[i] < lows.iloc[i-1]:
-                signals.append({
-                    'type': 'BOS_BEAR',
-                    'price': float(df['close'].iloc[i]),
-                    'timestamp': str(df['timestamp'].iloc[i])
-                })
-        
-        return signals
-    
-    @staticmethod
-    def find_fvg(df):
-        """Find Fair Value Gaps (imbalances in price)"""
-        fvgs = {'bullish': [], 'bearish': []}
-        
-        for i in range(2, len(df)):
-            # Bullish FVG - gap up indicating strong buying
-            if df['low'].iloc[i] > df['high'].iloc[i-2]:
-                gap_size = df['low'].iloc[i] - df['high'].iloc[i-2]
-                fvgs['bullish'].append({
-                    'top': float(df['low'].iloc[i]),
-                    'bottom': float(df['high'].iloc[i-2]),
-                    'size': float(gap_size),
-                    'timestamp': str(df['timestamp'].iloc[i])
-                })
-            
-            # Bearish FVG - gap down indicating strong selling
-            if df['high'].iloc[i] < df['low'].iloc[i-2]:
-                gap_size = df['low'].iloc[i-2] - df['high'].iloc[i]
-                fvgs['bearish'].append({
-                    'top': float(df['low'].iloc[i-2]),
-                    'bottom': float(df['high'].iloc[i]),
-                    'size': float(gap_size),
-                    'timestamp': str(df['timestamp'].iloc[i])
-                })
-        
-        return fvgs
-    
-    @staticmethod
-    def find_support_resistance(df, window=20):
-        """Find key support and resistance levels"""
-        highs = df['high'].rolling(window=window, center=True).max()
-        lows = df['low'].rolling(window=window, center=True).min()
-        
-        resistance_levels = []
-        support_levels = []
-        
-        for i in range(window, len(df) - window):
-            if df['high'].iloc[i] == highs.iloc[i]:
-                resistance_levels.append(float(df['high'].iloc[i]))
-            if df['low'].iloc[i] == lows.iloc[i]:
-                support_levels.append(float(df['low'].iloc[i]))
-        
-        # Get recent unique levels
-        resistance = sorted(list(set(resistance_levels)))[-5:] if resistance_levels else []
-        support = sorted(list(set(support_levels)))[-5:] if support_levels else []
-        
-        return {'resistance': resistance, 'support': support}
-    
-    @staticmethod
-    def analyze_trend(df):
-        """Determine trend using moving averages"""
-        df['ema20'] = df['close'].ewm(span=20, adjust=False).mean()
-        df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
-        
-        current_price = df['close'].iloc[-1]
-        ema20 = df['ema20'].iloc[-1]
-        ema50 = df['ema50'].iloc[-1]
-        
-        # Strong uptrend
-        if current_price > ema20 > ema50:
-            return 'STRONG_BULLISH'
-        # Moderate uptrend
-        elif current_price > ema20 and ema20 < ema50:
-            return 'BULLISH'
-        # Strong downtrend
-        elif current_price < ema20 < ema50:
-            return 'STRONG_BEARISH'
-        # Moderate downtrend
-        elif current_price < ema20 and ema20 > ema50:
-            return 'BEARISH'
-        else:
-            return 'NEUTRAL'
-    
-    @staticmethod
-    def detect_candlestick_patterns(df):
-        """Detect key candlestick patterns"""
-        patterns = []
-        
-        for i in range(2, len(df)):
-            # Bullish Engulfing
-            if (df['close'].iloc[i] > df['open'].iloc[i] and
-                df['close'].iloc[i-1] < df['open'].iloc[i-1] and
-                df['open'].iloc[i] < df['close'].iloc[i-1] and
-                df['close'].iloc[i] > df['open'].iloc[i-1]):
-                patterns.append({'type': 'Bullish_Engulfing', 'index': i})
-            
-            # Bearish Engulfing
-            if (df['close'].iloc[i] < df['open'].iloc[i] and
-                df['close'].iloc[i-1] > df['open'].iloc[i-1] and
-                df['open'].iloc[i] > df['close'].iloc[i-1] and
-                df['close'].iloc[i] < df['open'].iloc[i-1]):
-                patterns.append({'type': 'Bearish_Engulfing', 'index': i})
-            
-            # Hammer (bullish reversal)
-            body = abs(df['close'].iloc[i] - df['open'].iloc[i])
-            lower_shadow = min(df['close'].iloc[i], df['open'].iloc[i]) - df['low'].iloc[i]
-            upper_shadow = df['high'].iloc[i] - max(df['close'].iloc[i], df['open'].iloc[i])
-            
-            if lower_shadow > body * 2 and upper_shadow < body * 0.3:
-                patterns.append({'type': 'Hammer', 'index': i})
-            
-            # Shooting Star (bearish reversal)
-            if upper_shadow > body * 2 and lower_shadow < body * 0.3:
-                patterns.append({'type': 'Shooting_Star', 'index': i})
-        
-        return patterns
 
-class DeepSeekAnalyzer:
-    """DeepSeek V3 AI for 4H + 1H Combined Analysis"""
-    
-    API_URL = "https://api.deepseek.com/v1/chat/completions"
-    
-    @staticmethod
-    async def analyze_4h_1h_strategy(session, coin, tf_data):
-        """
-        4H + 1H Strategy:
-        - 4H: Trend direction, entry zones, key S/R levels
-        - 1H: Precise entry timing, confirmation signals
-        """
-        
-        prompt = f"""You are a professional crypto trader using 4H + 1H timeframe strategy with Smart Money Concepts.
-
-**TRADING STRATEGY:**
-- **4H Chart (Higher TF):** Identifies overall trend, entry zones, key support/resistance, and order blocks
-- **1H Chart (Lower TF):** Provides precise entry timing, confirms 4H setup, fine-tunes targets
-
-**{coin}/USDT ANALYSIS:**
-
-📊 **4-HOUR TIMEFRAME (Trend & Setup):**
-- Current Price: ${tf_data['4h']['current_price']:,.2f}
-- Trend: {tf_data['4h']['trend']}
-- Support Levels: {tf_data['4h']['support']}
-- Resistance Levels: {tf_data['4h']['resistance']}
-- Bullish Order Blocks: {len(tf_data['4h']['order_blocks']['bullish'])} zones
-- Bearish Order Blocks: {len(tf_data['4h']['order_blocks']['bearish'])} zones
-- Bullish FVG: {len(tf_data['4h']['fvg']['bullish'])}
-- Bearish FVG: {len(tf_data['4h']['fvg']['bearish'])}
-- BOS Signals: {len([s for s in tf_data['4h']['bos_signals'] if 'BULL' in s['type']])} bullish, {len([s for s in tf_data['4h']['bos_signals'] if 'BEAR' in s['type']])} bearish
-- Recent Patterns: {[p['type'] for p in tf_data['4h']['patterns'][-3:]]}
-
-⏱️ **1-HOUR TIMEFRAME (Entry Timing):**
-- Current Price: ${tf_data['1h']['current_price']:,.2f}
-- Trend: {tf_data['1h']['trend']}
-- 24H High: ${tf_data['1h']['high_24h']:,.2f}
-- 24H Low: ${tf_data['1h']['low_24h']:,.2f}
-- Support Levels: {tf_data['1h']['support'][:3]}
-- Resistance Levels: {tf_data['1h']['resistance'][:3]}
-- Volume Trend: {tf_data['1h']['volume_trend']}
-- Recent Patterns: {[p['type'] for p in tf_data['1h']['patterns'][-3:]]}
-- Order Blocks: Bull={len(tf_data['1h']['order_blocks']['bullish'])}, Bear={len(tf_data['1h']['order_blocks']['bearish'])}
-
-**SIGNAL GENERATION RULES:**
-
-✅ **BUY Signal Requirements:**
-1. 4H must show BULLISH or STRONG_BULLISH trend
-2. 4H must have bullish order block or FVG near current price
-3. 1H must confirm with bullish pattern or break above resistance
-4. 1H volume must be increasing on bullish candles
-5. Risk:Reward must be at least 1:2
-
-✅ **SELL Signal Requirements:**
-1. 4H must show BEARISH or STRONG_BEARISH trend
-2. 4H must have bearish order block or FVG near current price
-3. 1H must confirm with bearish pattern or break below support
-4. 1H volume must be increasing on bearish candles
-5. Risk:Reward must be at least 1:2
-
-⏸️ **WAIT Signal:**
-- If 4H and 1H trends conflict
-- If no clear setup on 4H
-- If 1H doesn't confirm 4H bias
-- If risk:reward is poor (<1:2)
-
-**OUTPUT FORMAT (JSON):**
-{{
-    "signal": "BUY/SELL/WAIT",
-    "confidence": 0-100,
-    "4h_bias": "BULLISH/BEARISH/NEUTRAL",
-    "1h_confirmation": "CONFIRMED/PENDING/REJECTED",
-    "timeframe_sync": "ALIGNED/PARTIAL/CONFLICT",
-    "entry_strategy": "aggressive/conservative",
-    "entry_range": [lower, upper],
-    "stop_loss": price,
-    "take_profits": [tp1, tp2, tp3],
-    "risk_reward": "1:X",
-    "key_levels": {{
-        "4h_support": [s1, s2],
-        "4h_resistance": [r1, r2],
-        "1h_entry_zone": [lower, upper]
-    }},
-    "reasoning": "Brief 2-3 sentence explanation of why 4H setup + 1H timing creates this signal"
-}}
-
-**IMPORTANT:** Be conservative. Only give BUY/SELL when 4H clearly defines the setup and 1H confirms entry timing."""
-
-        headers = {
-            'Authorization': f'Bearer {DEEPSEEK_API_KEY}',
-            'Content-Type': 'application/json'
-        }
-        
-        payload = {
-            'model': 'deepseek-chat',
-            'messages': [
-                {'role': 'system', 'content': 'You are an expert trader specializing in 4H + 1H timeframe strategy with Smart Money Concepts.'},
-                {'role': 'user', 'content': prompt}
-            ],
-            'temperature': 0.2,
-            'max_tokens': 1500
-        }
-        
-        try:
-            async with session.post(DeepSeekAnalyzer.API_URL, json=payload, headers=headers, timeout=30) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    content = data['choices'][0]['message']['content']
-                    
-                    import json
-                    import re
-                    json_match = re.search(r'\{.*\}', content, re.DOTALL)
-                    if json_match:
-                        return json.loads(json_match.group())
-                else:
-                    print(f"⚠️ DeepSeek API error: {response.status}")
-                    
-        except asyncio.TimeoutError:
-            print(f"⚠️ DeepSeek timeout for {coin}")
-        except Exception as e:
-            print(f"❌ DeepSeek error for {coin}: {str(e)}")
-        
-        return None
-
-class ChartGenerator:
-    """Generate 4H + 1H dual timeframe charts"""
-    
-    @staticmethod
-    def create_dual_tf_chart(coin, tf_data, analysis):
-        """Create 2-panel chart: 4H top, 1H bottom with clear trade levels"""
-        
-        fig = plt.figure(figsize=(18, 11), facecolor='#0a0e27')
-        gs = fig.add_gridspec(2, 1, height_ratios=[1, 1], hspace=0.25)
-        
-        timeframes = ['4h', '1h']
-        titles = [
-            '4-HOUR CHART - Trend & Setup Zone',
-            '1-HOUR CHART - Entry Timing'
-        ]
-        
-        axes = []
-        for idx, (tf, title) in enumerate(zip(timeframes, titles)):
-            ax = fig.add_subplot(gs[idx])
-            ax.set_facecolor('#0f1429')
-            df = tf_data[tf]['dataframe'].tail(100).reset_index(drop=True)
-            
-            # Plot candlesticks
-            for i in range(len(df)):
-                o, h, l, c = df['open'].iloc[i], df['high'].iloc[i], df['low'].iloc[i], df['close'].iloc[i]
-                color = '#00ff88' if c >= o else '#ff3366'
-                
-                body_height = abs(c - o)
-                body_bottom = min(o, c)
-                
-                # Candle body
-                ax.add_patch(patches.Rectangle(
-                    (i - 0.4, body_bottom), 0.8, body_height,
-                    facecolor=color, edgecolor=color, linewidth=1, alpha=0.9
-                ))
-                
-                # Wicks
-                ax.plot([i, i], [l, h], color=color, linewidth=1.2, alpha=0.7)
-            
-            # Support/Resistance
-            if tf_data[tf]['support']:
-                for level in tf_data[tf]['support'][-2:]:
-                    ax.axhline(y=level, color='#00ff88', linestyle='--', 
-                              alpha=0.4, linewidth=1.5)
-            
-            if tf_data[tf]['resistance']:
-                for level in tf_data[tf]['resistance'][-2:]:
-                    ax.axhline(y=level, color='#ff3366', linestyle='--', 
-                              alpha=0.4, linewidth=1.5)
-            
-            # Order blocks on 4H
-            if tf == '4h':
-                obs = tf_data[tf]['order_blocks']
-                if obs['bullish']:
-                    latest_bull_ob = obs['bullish'][-1]
-                    ax.axhspan(latest_bull_ob['price'], latest_bull_ob['high'],
-                              alpha=0.12, color='#00ff88')
-                if obs['bearish']:
-                    latest_bear_ob = obs['bearish'][-1]
-                    ax.axhspan(latest_bear_ob['low'], latest_bear_ob['price'],
-                              alpha=0.12, color='#ff3366')
-            
-            ax.set_title(f'{title} | Trend: {tf_data[tf]["trend"]}', 
-                        fontsize=13, fontweight='bold', color='white', pad=12)
-            ax.set_ylabel('Price (USDT)', fontsize=11, color='white')
-            ax.tick_params(colors='white', labelsize=9)
-            ax.grid(True, alpha=0.15, linestyle=':', color='white')
-            ax.spines['top'].set_visible(False)
-            ax.spines['right'].set_visible(False)
-            ax.spines['left'].set_color('white')
-            ax.spines['bottom'].set_color('white')
-            axes.append(ax)
-        
-        # MARK ENTRY, SL, TPs on BOTH charts
-        if analysis and analysis['signal'] in ['BUY', 'SELL']:
-            signal_color = '#00ff88' if analysis['signal'] == 'BUY' else '#ff3366'
-            entry_lower, entry_upper = analysis['entry_range']
-            stop_loss = analysis['stop_loss']
-            tp1, tp2, tp3 = analysis['take_profits']
-            
-            for ax_idx, ax in enumerate(axes):
-                # Entry Zone (shaded box)
-                ax.axhspan(entry_lower, entry_upper, 
-                          alpha=0.25, color=signal_color, zorder=1)
-                ax.axhline(y=entry_lower, color=signal_color, linestyle='-', 
-                          linewidth=2.5, alpha=0.9, label='Entry Zone')
-                ax.axhline(y=entry_upper, color=signal_color, linestyle='-', 
-                          linewidth=2.5, alpha=0.9)
-                
-                # Add ENTRY text
-                ax.text(len(tf_data[timeframes[ax_idx]]['dataframe'].tail(100)) - 5, 
-                       (entry_lower + entry_upper) / 2, 
-                       f'  ENTRY\n  ${entry_lower:,.0f}-${entry_upper:,.0f}',
-                       color=signal_color, fontsize=9, fontweight='bold',
-                       bbox=dict(boxstyle='round,pad=0.5', facecolor='black', 
-                                edgecolor=signal_color, linewidth=2, alpha=0.8),
-                       verticalalignment='center')
-                
-                # Stop Loss (red line)
-                ax.axhline(y=stop_loss, color='#ff0000', linestyle='--', 
-                          linewidth=2.5, alpha=0.9, label='Stop Loss')
-                ax.text(len(tf_data[timeframes[ax_idx]]['dataframe'].tail(100)) - 5, 
-                       stop_loss, 
-                       f'  STOP LOSS: ${stop_loss:,.0f}',
-                       color='#ff0000', fontsize=9, fontweight='bold',
-                       bbox=dict(boxstyle='round,pad=0.4', facecolor='black', 
-                                edgecolor='#ff0000', linewidth=2, alpha=0.8),
-                       verticalalignment='center')
-                
-                # Take Profits
-                for tp_num, tp_val in enumerate([tp1, tp2, tp3], 1):
-                    ax.axhline(y=tp_val, color='#ffdd00', linestyle='-.', 
-                              linewidth=2, alpha=0.85)
-                    ax.text(len(tf_data[timeframes[ax_idx]]['dataframe'].tail(100)) - 5, 
-                           tp_val, 
-                           f'  TP{tp_num}: ${tp_val:,.0f}',
-                           color='#ffdd00', fontsize=8, fontweight='bold',
-                           bbox=dict(boxstyle='round,pad=0.3', facecolor='black', 
-                                    edgecolor='#ffdd00', linewidth=1.5, alpha=0.8),
-                           verticalalignment='center')
-            
-            # Signal Info Box
-            signal_text = f"""
-╔═══════════════════════╗
-║  {analysis['signal']} SIGNAL  ║
-╚═══════════════════════╝
-
-Confidence: {analysis['confidence']}%
-4H Bias: {analysis['4h_bias']}
-1H Confirm: {analysis['1h_confirmation']}
-TF Sync: {analysis['timeframe_sync']}
-
-ENTRY: ${entry_lower:,.0f} - ${entry_upper:,.0f}
-STOP LOSS: ${stop_loss:,.0f}
-
-TARGETS:
-  TP1: ${tp1:,.0f}
-  TP2: ${tp2:,.0f}
-  TP3: ${tp3:,.0f}
-
-Risk:Reward: {analysis['risk_reward']}
-"""
-            fig.text(0.985, 0.5, signal_text,
-                    transform=fig.transFigure,
-                    fontsize=9.5, fontweight='bold',
-                    family='monospace',
-                    color=signal_color,
-                    bbox=dict(boxstyle='round,pad=0.8', facecolor='#0a0e27', 
-                             edgecolor=signal_color, linewidth=2.5, alpha=0.95),
-                    verticalalignment='center',
-                    horizontalalignment='right')
-        
-        plt.suptitle(f'{coin}/USDT - 4H + 1H Strategy Analysis', 
-                    fontsize=17, fontweight='bold', color='white', y=0.985)
-        
-        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')
-        fig.text(0.99, 0.01, f'Generated: {timestamp}', 
-                ha='right', fontsize=8, color='gray')
-        
-        buf = BytesIO()
-        plt.savefig(buf, format='png', dpi=160, facecolor='#0a0e27', bbox_inches='tight')
-        buf.seek(0)
-        plt.close()
-        
-        return buf
-
-class TradingBot:
-    """Main Bot with 4H + 1H Strategy"""
+class DeribitDashboard:
+    """Deribit Options Chain - Public API"""
     
     def __init__(self):
-        request = HTTPXRequest(
-            connection_pool_size=20,
-            connect_timeout=30,
-            read_timeout=30,
-            write_timeout=30,
-            pool_timeout=30
-        )
-        self.telegram_bot = Bot(token=TELEGRAM_BOT_TOKEN, request=request)
-        self.is_running = False
-        self.alert_semaphore = asyncio.Semaphore(3)
-    
-    async def send_telegram_alert(self, coin, analysis, chart_buffer):
-        """Send alert with rate limiting"""
-        async with self.alert_semaphore:
-            try:
-                if analysis['signal'] == 'WAIT':
-                    return
-                
-                signal_emoji = "🟢" if analysis['signal'] == 'BUY' else "🔴"
-                
-                message = f"""
-{signal_emoji} **{analysis['signal']} SIGNAL** {signal_emoji}
+        self.session = requests.Session()
+        self.session.headers.update({
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+        })
 
-**{coin}/USDT**
-**Confidence:** {analysis['confidence']}%
-**Strategy:** 4H + 1H Combined
-
-📊 **Timeframe Analysis:**
-• 4H Bias: {analysis['4h_bias']}
-• 1H Confirmation: {analysis['1h_confirmation']}
-• Sync Status: {analysis['timeframe_sync']}
-• Entry Style: {analysis['entry_strategy'].title()}
-
-💰 **Trade Setup:**
-**Entry Zone:** ${analysis['entry_range'][0]:,.2f} - ${analysis['entry_range'][1]:,.2f}
-**Stop Loss:** ${analysis['stop_loss']:,.2f}
-**Targets:**
-  TP1: ${analysis['take_profits'][0]:,.2f}
-  TP2: ${analysis['take_profits'][1]:,.2f}
-  TP3: ${analysis['take_profits'][2]:,.2f}
-
-**Risk:Reward:** {analysis['risk_reward']}
-
-📈 **Key Levels:**
-4H Support: {', '.join([f'${s:,.0f}' for s in analysis['key_levels']['4h_support'][:2]])}
-4H Resistance: {', '.join([f'${r:,.0f}' for r in analysis['key_levels']['4h_resistance'][:2]])}
-1H Entry Zone: ${analysis['key_levels']['1h_entry_zone'][0]:,.0f} - ${analysis['key_levels']['1h_entry_zone'][1]:,.0f}
-
-💡 **Analysis:**
-{analysis['reasoning']}
-
-⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}
-                """
-                
-                chart_buffer.seek(0)
-                await self.telegram_bot.send_photo(
-                    chat_id=TELEGRAM_CHAT_ID,
-                    photo=chart_buffer,
-                    caption=message,
-                    parse_mode='Markdown'
-                )
-                
-                print(f"✅ {coin}: {analysis['signal']} ({analysis['confidence']}%) | 4H: {analysis['4h_bias']} | 1H: {analysis['1h_confirmation']}")
-                await asyncio.sleep(1)
-                
-            except TelegramError as e:
-                print(f"⚠️ Telegram error for {coin}: {str(e)}")
-            except Exception as e:
-                print(f"❌ Error sending alert for {coin}: {str(e)}")
-    
-    async def analyze_coin_4h_1h(self, session, coin):
-        """Analyze coin using 4H + 1H strategy"""
+    def safe_float(self, val, default=0.0):
+        if val is None:
+            return default
         try:
-            print(f"\n📊 {coin} | Fetching 4H + 1H data...")
+            return float(val)
+        except:
+            return default
+
+    def get_spot_price(self, currency='BTC'):
+        """Get BTC/ETH spot price"""
+        try:
+            url = f"{DERIBIT_URL}/public/get_index_price"
+            params = {'index_name': f"{currency.lower()}_usd"}
+            res = self.session.get(url, params=params, timeout=10)
             
-            tf_data = {}
+            if res.status_code == 200:
+                data = res.json()
+                return self.safe_float(data.get('result', {}).get('index_price'))
+            return 0
+        except Exception as e:
+            logger.error(f"Deribit Spot Error: {e}")
+            return 0
+
+    def get_expiries(self, currency='BTC'):
+        """Get available expiry dates"""
+        try:
+            url = f"{DERIBIT_URL}/public/get_instruments"
+            params = {
+                'currency': currency,
+                'kind': 'option',
+                'expired': 'false'
+            }
+            res = self.session.get(url, params=params, timeout=10)
             
-            # Fetch both timeframes
-            for tf in TIMEFRAMES:
-                df = await BinanceAPI.get_candlestick_data(session, coin, tf, limit=1000)
+            if res.status_code == 200:
+                instruments = res.json().get('result', [])
+                expiries = {}
+                now = datetime.utcnow()
                 
-                if df is None or len(df) < 100:
-                    print(f"  ⚠️ Insufficient data for {tf}")
-                    return
+                for inst in instruments:
+                    exp_ts = inst.get('expiration_timestamp', 0) / 1000
+                    exp_dt = datetime.utcfromtimestamp(exp_ts)
+                    if exp_dt > now:
+                        date_str = exp_dt.strftime('%d%b%y').upper()
+                        expiries[date_str] = exp_dt
                 
-                # SMC Analysis
-                order_blocks = SMCAnalyzer.find_order_blocks(df)
-                bos_signals = SMCAnalyzer.detect_bos_choch(df)
-                fvg = SMCAnalyzer.find_fvg(df)
-                sr_levels = SMCAnalyzer.find_support_resistance(df)
-                trend = SMCAnalyzer.analyze_trend(df)
-                patterns = SMCAnalyzer.detect_candlestick_patterns(df)
-                
-                tf_data[tf] = {
-                    'dataframe': df,
-                    'current_price': float(df['close'].iloc[-1]),
-                    'high_24h': float(df['high'].tail(24 if tf == '1h' else 6).max()),
-                    'low_24h': float(df['low'].tail(24 if tf == '1h' else 6).min()),
-                    'volume_trend': 'Increasing' if df['volume'].tail(10).mean() > df['volume'].tail(30).mean() else 'Decreasing',
-                    'trend': trend,
-                    'order_blocks': order_blocks,
-                    'bos_signals': bos_signals,
-                    'fvg': fvg,
-                    'support': sr_levels['support'],
-                    'resistance': sr_levels['resistance'],
-                    'patterns': patterns
-                }
-                
-                print(f"  ✓ {tf}: Trend={trend} | OB: {len(order_blocks['bullish'])}B/{len(order_blocks['bearish'])}S")
-                await asyncio.sleep(0.3)
+                return sorted(expiries.items(), key=lambda x: x[1])
+            return []
+        except Exception as e:
+            logger.error(f"Deribit Expiries Error: {e}")
+            return []
+
+    def get_chain_data(self, currency='BTC'):
+        """Fetch Deribit option chain"""
+        try:
+            # 1. Get spot
+            spot = self.get_spot_price(currency)
+            if spot == 0:
+                return None, 0, ""
             
-            # Get AI analysis
-            print(f"  🤖 Getting 4H+1H combined analysis...")
-            analysis = await DeepSeekAnalyzer.analyze_4h_1h_strategy(session, coin, tf_data)
+            logger.info(f"💰 Deribit {currency} Spot: ${spot:,.2f}")
+
+            # 2. Get nearest expiry
+            expiries = self.get_expiries(currency)
+            if not expiries:
+                return None, 0, ""
             
-            if analysis and analysis['signal'] in ['BUY', 'SELL']:
-                print(f"  🎯 SIGNAL: {analysis['signal']} | Confidence: {analysis['confidence']}%")
+            exp_str, exp_dt = expiries[0]
+            logger.info(f"📅 Deribit Using expiry: {exp_str}")
+
+            # 3. Get instruments for this expiry
+            url = f"{DERIBIT_URL}/public/get_instruments"
+            params = {
+                'currency': currency,
+                'kind': 'option',
+                'expired': 'false'
+            }
+            res = self.session.get(url, params=params, timeout=15)
+            
+            if res.status_code != 200:
+                return None, 0, ""
+            
+            instruments = res.json().get('result', [])
+            
+            # Filter by expiry
+            target_instruments = []
+            for inst in instruments:
+                exp_ts = inst.get('expiration_timestamp', 0) / 1000
+                exp_date = datetime.utcfromtimestamp(exp_ts).strftime('%d%b%y').upper()
+                if exp_date == exp_str:
+                    target_instruments.append(inst['instrument_name'])
+            
+            logger.info(f"📊 Found {len(target_instruments)} instruments")
+
+            # 4. Get ticker data for all instruments
+            calls_data = {}
+            puts_data = {}
+            
+            for inst_name in target_instruments[:50]:  # Limit to avoid rate limits
+                try:
+                    ticker_url = f"{DERIBIT_URL}/public/ticker"
+                    ticker_res = self.session.get(ticker_url, 
+                                                params={'instrument_name': inst_name},
+                                                timeout=5)
+                    
+                    if ticker_res.status_code != 200:
+                        continue
+                    
+                    ticker = ticker_res.json().get('result', {})
+                    
+                    # Parse instrument name: BTC-27DEC24-95000-C
+                    parts = inst_name.split('-')
+                    if len(parts) != 4:
+                        continue
+                    
+                    strike = self.safe_float(parts[2])
+                    opt_type = parts[3]  # C or P
+                    
+                    # Extract data
+                    data = {
+                        'ltp': self.safe_float(ticker.get('mark_price')),
+                        'oi': self.safe_float(ticker.get('open_interest')),  # In contracts
+                        'vol': self.safe_float(ticker.get('stats', {}).get('volume_usd')),
+                        'iv': self.safe_float(ticker.get('mark_iv')) * 100,  # Convert to %
+                        'delta': self.safe_float(ticker.get('greeks', {}).get('delta')),
+                        'gamma': self.safe_float(ticker.get('greeks', {}).get('gamma')),
+                        'theta': self.safe_float(ticker.get('greeks', {}).get('theta')),
+                        'vega': self.safe_float(ticker.get('greeks', {}).get('vega'))
+                    }
+                    
+                    if opt_type == 'C':
+                        calls_data[strike] = data
+                    else:
+                        puts_data[strike] = data
+                    
+                    time.sleep(0.05)  # Rate limit protection
+                    
+                except Exception as e:
+                    continue
+            
+            logger.info(f"✅ Parsed: {len(calls_data)} calls, {len(puts_data)} puts")
+            
+            # 5. Build DataFrame
+            all_strikes = sorted(set(list(calls_data.keys()) + list(puts_data.keys())))
+            
+            rows = []
+            for strike in all_strikes:
+                c = calls_data.get(strike, {})
+                p = puts_data.get(strike, {})
                 
-                # Generate chart
-                chart_buffer = ChartGenerator.create_dual_tf_chart(coin, tf_data, analysis)
-                
-                # Send alert
-                await self.send_telegram_alert(coin, analysis, chart_buffer)
-            else:
-                print(f"  ⏸️ {coin}: WAIT (No clear 4H+1H alignment)")
+                rows.append({
+                    'strike': strike,
+                    'c_vol': c.get('vol', 0),
+                    'c_oi': c.get('oi', 0),
+                    'c_iv': c.get('iv', 0),
+                    'c_ltp': c.get('ltp', 0),
+                    'p_ltp': p.get('ltp', 0),
+                    'p_iv': p.get('iv', 0),
+                    'p_oi': p.get('oi', 0),
+                    'p_vol': p.get('vol', 0)
+                })
+            
+            chain = pd.DataFrame(rows).set_index('strike')
+            
+            # 6. Filter ATM
+            atm_strike = min(all_strikes, key=lambda x: abs(x - spot))
+            atm_idx = all_strikes.index(atm_strike)
+            start_idx = max(0, atm_idx - 8)
+            end_idx = min(len(all_strikes), atm_idx + 9)
+            filtered_strikes = all_strikes[start_idx:end_idx]
+            
+            chain = chain.loc[filtered_strikes]
+            
+            return chain, spot, exp_dt.strftime('%d-%b')
             
         except Exception as e:
-            print(f"❌ Error analyzing {coin}: {str(e)}")
+            logger.error(f"Deribit Chain Error: {e}")
+            import traceback
             traceback.print_exc()
+            return None, 0, ""
+
+
+class BinanceDashboard:
+    """Binance Options Chain - Public API"""
     
-    async def scan_all_coins(self):
-        """Scan all coins"""
-        connector = aiohttp.TCPConnector(limit=30, limit_per_host=10)
-        timeout = aiohttp.ClientTimeout(total=60, connect=15, sock_read=30)
-        
-        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-            for coin in COINS:
-                await self.analyze_coin_4h_1h(session, coin)
-                await asyncio.sleep(2)  # Rate limiting between coins
-    
-    async def run(self):
-        """Main bot loop"""
-        self.is_running = True
-        print("🚀 4H + 1H Trading Bot Started!")
-        print(f"📊 Strategy: 4H for trend/setup, 1H for entry timing")
-        print(f"💰 Coins: {', '.join(COINS)}")
-        print(f"🔄 Scan Interval: {SCAN_INTERVAL}s (1 hour)\n")
-        
-        while self.is_running:
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update({
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+        })
+
+    def safe_float(self, val, default=0.0):
+        if val is None:
+            return default
+        try:
+            return float(val)
+        except:
+            return default
+
+    def get_spot_price(self, symbol='BTCUSDT'):
+        """Get spot price"""
+        try:
+            url = f"{BINANCE_URL}/eapi/v1/index"
+            params = {'underlying': symbol.replace('USDT', '')}
+            res = self.session.get(url, params=params, timeout=10)
+            
+            if res.status_code == 200:
+                data = res.json()
+                return self.safe_float(data.get('indexPrice'))
+            return 0
+        except Exception as e:
+            logger.error(f"Binance Spot Error: {e}")
+            return 0
+
+    def get_chain_data(self, underlying='BTC'):
+        """Fetch Binance option chain"""
+        try:
+            # 1. Get spot
+            spot = self.get_spot_price(f"{underlying}USDT")
+            if spot == 0:
+                return None, 0, ""
+            
+            logger.info(f"💰 Binance {underlying} Spot: ${spot:,.2f}")
+
+            # 2. Get exchange info for expiries
+            info_url = f"{BINANCE_URL}/eapi/v1/exchangeInfo"
+            info_res = self.session.get(info_url, timeout=10)
+            
+            if info_res.status_code != 200:
+                return None, 0, ""
+            
+            info_data = info_res.json()
+            symbols = info_data.get('optionSymbols', [])
+            
+            # Find nearest expiry
+            expiries = {}
+            now = datetime.utcnow()
+            
+            for sym in symbols:
+                symbol = sym.get('symbol', '')
+                if not symbol.startswith(underlying):
+                    continue
+                
+                exp_date = sym.get('expiryDate')
+                if exp_date:
+                    try:
+                        exp_ts = int(exp_date) / 1000
+                        exp_dt = datetime.utcfromtimestamp(exp_ts)
+                        if exp_dt > now:
+                            date_str = exp_dt.strftime('%d%b%y').upper()
+                            expiries[date_str] = exp_dt
+                    except:
+                        continue
+            
+            if not expiries:
+                return None, 0, ""
+            
+            exp_str, exp_dt = sorted(expiries.items(), key=lambda x: x[1])[0]
+            logger.info(f"📅 Binance Using expiry: {exp_str}")
+
+            # 3. Get mark prices and OI
+            mark_url = f"{BINANCE_URL}/eapi/v1/mark"
+            mark_res = self.session.get(mark_url, timeout=15)
+            
+            if mark_res.status_code != 200:
+                return None, 0, ""
+            
+            marks = mark_res.json()
+            
+            # 4. Get open interest
+            oi_data = {}
             try:
-                print(f"\n{'='*70}")
-                print(f"🔍 4H + 1H Scan Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-                print(f"{'='*70}")
+                oi_url = f"{BINANCE_URL}/eapi/v1/openInterest"
+                oi_params = {
+                    'underlyingAsset': underlying,
+                    'expirationDate': exp_str
+                }
+                oi_res = self.session.get(oi_url, params=oi_params, timeout=10)
+                if oi_res.status_code == 200:
+                    oi_list = oi_res.json()
+                    for item in oi_list:
+                        symbol = item.get('symbol', '')
+                        oi_data[symbol] = self.safe_float(item.get('sumOpenInterest'))
+            except:
+                pass
+
+            # 5. Parse data
+            calls_data = {}
+            puts_data = {}
+            
+            for mark in marks:
+                symbol = mark.get('symbol', '')
                 
-                await self.scan_all_coins()
+                # Filter by underlying and expiry
+                if not symbol.startswith(underlying):
+                    continue
                 
-                print(f"\n✅ Scan completed. Next scan in {SCAN_INTERVAL}s ({SCAN_INTERVAL//60} min)")
-                await asyncio.sleep(SCAN_INTERVAL)
+                # Parse: BTC-241227-90000-C
+                parts = symbol.split('-')
+                if len(parts) != 4:
+                    continue
                 
-            except KeyboardInterrupt:
-                print("\n🛑 Bot stopped by user")
-                self.is_running = False
-                break
-            except Exception as e:
-                print(f"\n❌ Critical error: {str(e)}")
-                traceback.print_exc()
-                await asyncio.sleep(60)
+                exp_part = parts[1]
+                strike = self.safe_float(parts[2])
+                opt_type = parts[3]
+                
+                # Check expiry match
+                try:
+                    exp_check = datetime.strptime(exp_part, '%y%m%d').strftime('%d%b%y').upper()
+                    if exp_check != exp_str:
+                        continue
+                except:
+                    continue
+                
+                # Extract data
+                data = {
+                    'ltp': self.safe_float(mark.get('markPrice')),
+                    'oi': oi_data.get(symbol, 0),
+                    'vol': 0,  # Binance doesn't provide 24h volume easily
+                    'iv': self.safe_float(mark.get('markIV')) * 100,  # Convert to %
+                    'delta': self.safe_float(mark.get('delta')),
+                    'gamma': self.safe_float(mark.get('gamma')),
+                    'theta': self.safe_float(mark.get('theta')),
+                    'vega': self.safe_float(mark.get('vega'))
+                }
+                
+                if opt_type == 'C':
+                    calls_data[strike] = data
+                else:
+                    puts_data[strike] = data
+            
+            logger.info(f"✅ Parsed: {len(calls_data)} calls, {len(puts_data)} puts")
+            
+            # 6. Build DataFrame
+            all_strikes = sorted(set(list(calls_data.keys()) + list(puts_data.keys())))
+            
+            rows = []
+            for strike in all_strikes:
+                c = calls_data.get(strike, {})
+                p = puts_data.get(strike, {})
+                
+                rows.append({
+                    'strike': strike,
+                    'c_vol': c.get('vol', 0),
+                    'c_oi': c.get('oi', 0),
+                    'c_iv': c.get('iv', 0),
+                    'c_ltp': c.get('ltp', 0),
+                    'p_ltp': p.get('ltp', 0),
+                    'p_iv': p.get('iv', 0),
+                    'p_oi': p.get('oi', 0),
+                    'p_vol': p.get('vol', 0)
+                })
+            
+            chain = pd.DataFrame(rows).set_index('strike')
+            
+            # 7. Filter ATM
+            atm_strike = min(all_strikes, key=lambda x: abs(x - spot))
+            atm_idx = all_strikes.index(atm_strike)
+            start_idx = max(0, atm_idx - 8)
+            end_idx = min(len(all_strikes), atm_idx + 9)
+            filtered_strikes = all_strikes[start_idx:end_idx]
+            
+            chain = chain.loc[filtered_strikes]
+            
+            return chain, spot, exp_dt.strftime('%d-%b')
+            
+        except Exception as e:
+            logger.error(f"Binance Chain Error: {e}")
+            import traceback
+            traceback.print_exc()
+            return None, 0, ""
+
+
+def format_value(val, is_price=False, is_iv=False):
+    """Format values"""
+    if val == 0 or pd.isna(val):
+        return "-"
+    
+    if is_iv:
+        return f"{val:.1f}"
+    
+    if is_price:
+        if val >= 1000:
+            return f"{val:,.0f}"
+        elif val >= 1:
+            return f"{val:.2f}"
+        else:
+            return f"{val:.4f}"
+    
+    # OI/Volume
+    if val >= 1_000_000:
+        return f"{val/1_000_000:.2f}M"
+    elif val >= 1_000:
+        return f"{val/1_000:.1f}K"
+    else:
+        return f"{val:.0f}"
+
+
+def generate_dashboard(exchange, chain_df, spot, exp, underlying='BTC'):
+    """Generate option chain table image"""
+    
+    if chain_df is None or chain_df.empty:
+        return None
+    
+    fig = plt.figure(figsize=(14, 10))
+    ax = fig.add_subplot(111)
+    ax.axis('off')
+    
+    title = f"{exchange.upper()} - {underlying} OPTION CHAIN (Exp: {exp}) | Spot: ${spot:,.2f}"
+    ax.set_title(title, color='yellow', fontsize=16, pad=10)
+
+    table_data = []
+    col_labels = ['Vol', 'OI', 'IV%', 'LTP', 'STRIKE', 'LTP', 'IV%', 'OI', 'Vol']
+
+    for strike in chain_df.index:
+        row = chain_df.loc[strike]
+        
+        r = [
+            format_value(row['c_vol']),
+            format_value(row['c_oi']),
+            format_value(row['c_iv'], is_iv=True),
+            format_value(row['c_ltp'], is_price=True),
+            f"{int(strike):,}",
+            format_value(row['p_ltp'], is_price=True),
+            format_value(row['p_iv'], is_iv=True),
+            format_value(row['p_oi']),
+            format_value(row['p_vol'])
+        ]
+        table_data.append(r)
+
+    if not table_data:
+        return None
+
+    table = ax.table(cellText=table_data, colLabels=col_labels, 
+                     loc='center', cellLoc='center')
+    table.auto_set_font_size(False)
+    table.set_fontsize(10)
+    table.scale(1.2, 2.5)
+
+    # Style
+    for (row, col), cell in table.get_celld().items():
+        if row == 0:
+            cell.set_text_props(weight='bold', color='white')
+            cell.set_facecolor('#333333')
+        else:
+            cell.set_edgecolor('#555555')
+            cell.set_facecolor('black')
+            cell.set_text_props(color='white')
+
+            # Highlight ATM
+            try:
+                stk_str = table_data[row-1][4].replace(',', '')
+                stk = float(stk_str)
+                if abs(stk - spot) < (spot * 0.01):
+                    cell.set_facecolor('#2A2A4A')
+                    cell.set_text_props(color='#00FFFF', weight='bold')
+            except:
+                pass
+
+            # Colors
+            if col < 4:
+                cell.set_text_props(color='#00FF00')
+            elif col > 4:
+                cell.set_text_props(color='#FF5555')
+            elif col == 4:
+                cell.set_text_props(color='yellow', weight='bold')
+
+    buf = BytesIO()
+    plt.tight_layout()
+    plt.savefig(buf, format='png', dpi=120, bbox_inches='tight',
+               facecolor='black', edgecolor='none')
+    buf.seek(0)
+    plt.close(fig)
+    return buf
+
+
+# ==================== MAIN ====================
+async def main():
+    if not TELEGRAM_BOT_TOKEN:
+        logger.error("❌ TELEGRAM_BOT_TOKEN missing!")
+        return
+
+    bot = Bot(token=TELEGRAM_BOT_TOKEN)
+    deribit = DeribitDashboard()
+    binance = BinanceDashboard()
+    
+    logger.info("🚀 Multi-Exchange Dashboard Started...")
+
+    while True:
+        try:
+            # DERIBIT BTC
+            logger.info("\n" + "="*50)
+            logger.info("Fetching DERIBIT BTC...")
+            chain, spot, exp = deribit.get_chain_data('BTC')
+            if chain is not None:
+                img = generate_dashboard('deribit', chain, spot, exp, 'BTC')
+                if img:
+                    await bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=img,
+                        caption="📊 #DERIBIT #BTC Option Chain")
+                    logger.info("✅ Deribit BTC Sent")
+            
+            await asyncio.sleep(15)
+
+            # BINANCE BTC
+            logger.info("\n" + "="*50)
+            logger.info("Fetching BINANCE BTC...")
+            chain, spot, exp = binance.get_chain_data('BTC')
+            if chain is not None:
+                img = generate_dashboard('binance', chain, spot, exp, 'BTC')
+                if img:
+                    await bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=img,
+                        caption="📊 #BINANCE #BTC Option Chain")
+                    logger.info("✅ Binance BTC Sent")
+            
+            await asyncio.sleep(15)
+
+            # DERIBIT ETH
+            logger.info("\n" + "="*50)
+            logger.info("Fetching DERIBIT ETH...")
+            chain, spot, exp = deribit.get_chain_data('ETH')
+            if chain is not None:
+                img = generate_dashboard('deribit', chain, spot, exp, 'ETH')
+                if img:
+                    await bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=img,
+                        caption="📊 #DERIBIT #ETH Option Chain")
+                    logger.info("✅ Deribit ETH Sent")
+            
+            await asyncio.sleep(15)
+
+            # BINANCE ETH
+            logger.info("\n" + "="*50)
+            logger.info("Fetching BINANCE ETH...")
+            chain, spot, exp = binance.get_chain_data('ETH')
+            if chain is not None:
+                img = generate_dashboard('binance', chain, spot, exp, 'ETH')
+                if img:
+                    await bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=img,
+                        caption="📊 #BINANCE #ETH Option Chain")
+                    logger.info("✅ Binance ETH Sent")
+
+            logger.info("\n💤 Waiting 5 minutes...")
+            await asyncio.sleep(300)
+
+        except Exception as e:
+            logger.error(f"Main Loop Error: {e}")
+            await asyncio.sleep(60)
+
 
 if __name__ == "__main__":
-    bot = TradingBot()
-    asyncio.run(bot.run())
+    # Test mode
+    if os.getenv('TEST_MODE'):
+        print("=" * 60)
+        print("TESTING DERIBIT")
+        print("=" * 60)
+        deribit = DeribitDashboard()
+        chain, spot, exp = deribit.get_chain_data('BTC')
+        if chain is not None:
+            print(f"Spot: ${spot:,.2f}, Expiry: {exp}")
+            print("\nSample data:")
+            print(chain.head())
+            img = generate_dashboard('deribit', chain, spot, exp, 'BTC')
+            if img:
+                with open('deribit_btc_test.png', 'wb') as f:
+                    f.write(img.read())
+                print("✅ Saved: deribit_btc_test.png")
+        
+        print("\n" + "=" * 60)
+        print("TESTING BINANCE")
+        print("=" * 60)
+        binance = BinanceDashboard()
+        chain, spot, exp = binance.get_chain_data('BTC')
+        if chain is not None:
+            print(f"Spot: ${spot:,.2f}, Expiry: {exp}")
+            print("\nSample data:")
+            print(chain.head())
+            img = generate_dashboard('binance', chain, spot, exp, 'BTC')
+            if img:
+                with open('binance_btc_test.png', 'wb') as f:
+                    f.write(img.read())
+                print("✅ Saved: binance_btc_test.png")
+    else:
+        try:
+            asyncio.run(main())
+        except KeyboardInterrupt:
+            logger.info("Stopped by user")
